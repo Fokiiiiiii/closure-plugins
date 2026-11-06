@@ -1,0 +1,16 @@
+[package]
+name = "plugin-kit"
+description = "What the plugins of closure share: quoting a message as an embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+twilight-model.workspace = true
+twilight-util.workspace = true
+
+[lints]
+workspace = true
