@@ -39,3 +39,7 @@ leveling-position = 順位
 leveling-leaderboard = ランキング
 leveling-empty = まだ経験値を持っている人がいません。
 leveling-set = { $user } の経験値は { $xp }、レベル { $level } になりました。
+config-leveling-voice_xp_per_minute = ボイスチャンネルにいた1分ごとの経験値（退出したときに付与）。0なら付与しない。
+config-leveling-role_multipliers = 経験値の倍率を変えるロール（％、100で等倍）。持っているロールのうち最も高いものが使われる。
+config-leveling-channel_multipliers = 経験値の倍率を変えるチャンネル（％、100で等倍）。
+config-leveling-replace_rewards = 報酬ロールを付けるとき、前のレベルの報酬ロールを外す。

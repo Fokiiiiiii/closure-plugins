@@ -243,27 +243,38 @@ fn extension_of(url: &str) -> &str {
 }
 
 /// The pictures and the video of a unit as files, and a player link when the video does not fit.
-async fn attachments(fetch: &dyn Get, unit: &Unit) -> (Vec<FileUpload>, Option<String>) {
+///
+/// `room` is what a message can still carry in files, and is used up by what is attached.
+async fn attachments(
+    fetch: &dyn Get,
+    unit: &Unit,
+    room: &mut usize,
+) -> (Vec<FileUpload>, Option<String>) {
     let mut files = Vec::new();
-    let mut room = MAX_FILES_BYTES;
     for (at, url) in unit.photos.iter().enumerate() {
-        if let Ok(data) = fetch.get_large(url, room).await {
-            room -= data.len();
-            files.push(FileUpload {
-                filename: format!("photo-{}.{}", at + 1, extension_of(url)),
-                data,
-            });
+        match fetch.get_large(url, *room).await {
+            Ok(data) => {
+                *room -= data.len();
+                files.push(FileUpload {
+                    filename: format!("photo-{}.{}", at + 1, extension_of(url)),
+                    data,
+                });
+            }
+            Err(error) => tracing::warn!(%error, "a picture is not attached"),
         }
     }
     let mut player = None;
     if let Some(url) = &unit.video {
-        match fetch.get_large(url, room).await {
-            Ok(data) => files.push(FileUpload {
-                filename: format!("video.{}", extension_of(url)),
-                data,
-            }),
+        match fetch.get_large(url, *room).await {
+            Ok(data) => {
+                *room -= data.len();
+                files.push(FileUpload {
+                    filename: format!("video.{}", extension_of(url)),
+                    data,
+                });
+            }
             Err(error) => {
-                tracing::debug!(%error, "a video is not attached");
+                tracing::warn!(%error, "a video is not attached, a player link stands in");
                 player = unit.link.as_deref().map(x::player_link);
             }
         }
@@ -669,24 +680,32 @@ async fn send_embeds(
     open: Option<&str>,
 ) -> Result<(), ModuleError> {
     let mut files = Vec::new();
-    let mut player = None;
+    let mut room = MAX_FILES_BYTES;
+    // The players of the videos that are not attached; Discord shows them from the links.
+    let mut players: Vec<String> = Vec::new();
     let mut embeds = Vec::new();
     for mut unit in units {
         if unit.main {
-            let (more, link) = attachments(fetch, &unit).await;
+            let (more, link) = attachments(fetch, &unit, &mut room).await;
             files.extend(more);
-            player = player.or(link);
-        } else if let Some(url) = unit
-            .photos
-            .first()
-            .filter(|url| url.starts_with("https://"))
-        {
-            unit.embed.image = Some(EmbedImage {
-                url: url.clone(),
-                proxy_url: None,
-                height: None,
-                width: None,
-            });
+            players.extend(link);
+        } else {
+            // The video of a post shown for the sake of another is not attached: its player is.
+            if unit.video.is_some() {
+                players.extend(unit.link.as_deref().map(x::player_link));
+            }
+            if let Some(url) = unit
+                .photos
+                .first()
+                .filter(|url| url.starts_with("https://"))
+            {
+                unit.embed.image = Some(EmbedImage {
+                    url: url.clone(),
+                    proxy_url: None,
+                    height: None,
+                    width: None,
+                });
+            }
         }
         embeds.push(unit.embed);
     }
@@ -695,7 +714,7 @@ async fn send_embeds(
             channel_id: message.channel_id,
             message_id: None,
             reply_to: Some(message.id),
-            content: player,
+            content: (!players.is_empty()).then(|| players.join("\n")),
             embeds,
             components: buttons(ctx, config, message.author.id, translate, open, &[]),
             files,
@@ -718,7 +737,7 @@ async fn send_chain(
     let mut previous = message.id;
     let mut sent: Vec<MessageId> = Vec::new();
     for (at, unit) in units.iter().enumerate() {
-        let (files, player) = attachments(fetch, unit).await;
+        let (files, player) = attachments(fetch, unit, &mut MAX_FILES_BYTES.clone()).await;
         let components = if at + 1 == units.len() {
             buttons(ctx, config, message.author.id, translate, open, &sent)
         } else {

@@ -39,3 +39,7 @@ leveling-position = Rank
 leveling-leaderboard = Leaderboard
 leveling-empty = Nobody has any experience yet.
 leveling-set = { $user } now has { $xp } experience, level { $level }.
+config-leveling-voice_xp_per_minute = Experience for each minute in a voice channel, given when the member leaves it; 0 gives none.
+config-leveling-role_multipliers = Roles that make experience worth more or less, in percent (100 is as it is). The best of a member's roles counts.
+config-leveling-channel_multipliers = Channels where experience is worth more or less, in percent (100 is as it is).
+config-leveling-replace_rewards = A reward role takes the reward roles of the earlier levels away.

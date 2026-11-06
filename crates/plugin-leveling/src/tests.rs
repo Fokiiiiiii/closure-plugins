@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use closure_core::action::Action;
-use closure_core::event::GuildId;
+use closure_core::event::{ChannelId, Event, GuildId, UserId, UserInfo};
 use closure_sdk::testing::{Harness, Invocation, Message};
 use closure_sdk::{CommandOptionValue, Level};
 use serde_json::json;
@@ -65,6 +65,155 @@ fn rewarded(harness: &Harness, user: u64) -> bool {
         matches!(a, Action::AddRole { user_id, role_id, .. }
             if user_id.get() == user && role_id.get() == REWARD_ROLE)
     })
+}
+
+fn voice(user: u64, before: Option<u64>, after: Option<u64>) -> Event {
+    Event::VoiceStateChanged {
+        guild_id: Id::new(1),
+        user: UserInfo {
+            id: UserId::new(user),
+            name: "member".into(),
+            bot: false,
+        },
+        before: before.map(ChannelId::new),
+        after: after.map(ChannelId::new),
+    }
+}
+
+/// `user` is in `channel` for `minutes`.
+async fn sit(harness: &Harness, user: u64, channel: u64, minutes: u64) {
+    harness
+        .emit(voice(user, None, Some(channel)))
+        .await
+        .unwrap();
+    harness.advance(Duration::from_mins(minutes));
+    harness
+        .emit(voice(user, Some(channel), None))
+        .await
+        .unwrap();
+}
+
+fn member(user: u64, roles: &[u64]) -> twilight_model::guild::Member {
+    serde_json::from_value(json!({
+        "user": {"id": user.to_string(), "username": "member", "discriminator": "0",
+                 "avatar": null, "bot": false},
+        "roles": roles.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "joined_at": "2020-01-01T00:00:00.000000+00:00",
+        "deaf": false, "mute": false, "flags": 0,
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn time_in_voice_gives_experience_by_the_minute_when_the_member_leaves() {
+    let harness = harness(&json!({"voice_xp_per_minute": 4}));
+    harness.emit(voice(50, None, Some(5))).await.unwrap();
+    harness.advance(Duration::from_secs(620));
+    assert_eq!(xp(&harness, 50).await, 0, "nothing until they leave");
+    harness.emit(voice(50, Some(5), None)).await.unwrap();
+    assert_eq!(xp(&harness, 50).await, 40, "ten whole minutes");
+    // A member who is left there for days is rewarded for half a day.
+    sit(&harness, 51, 5, 3 * 24 * 60).await;
+    assert_eq!(xp(&harness, 51).await, 12 * 60 * 4);
+}
+
+#[tokio::test]
+async fn voice_can_be_off_and_its_ignored_channels_and_bots_give_nothing() {
+    let off = harness(&json!({"voice_xp_per_minute": 0}));
+    sit(&off, 50, 5, 30).await;
+    assert_eq!(xp(&off, 50).await, 0);
+    let ignored = harness(&json!({"ignored_channels": ["6"]}));
+    sit(&ignored, 50, 6, 30).await;
+    assert_eq!(xp(&ignored, 50).await, 0);
+    let bots = harness(&json!({}));
+    bots.emit(Event::VoiceStateChanged {
+        guild_id: Id::new(1),
+        user: UserInfo {
+            id: UserId::new(52),
+            name: "beep".into(),
+            bot: true,
+        },
+        before: None,
+        after: Some(ChannelId::new(5)),
+    })
+    .await
+    .unwrap();
+    bots.advance(Duration::from_mins(10));
+    bots.emit(voice(52, Some(5), None)).await.unwrap();
+    assert_eq!(xp(&bots, 52).await, 0);
+}
+
+#[tokio::test]
+async fn moving_between_channels_counts_each_stay_in_its_own_channel() {
+    let harness = harness(&json!({
+        "voice_xp_per_minute": 2, "ignored_channels": ["6"],
+    }));
+    harness.emit(voice(50, None, Some(5))).await.unwrap();
+    harness.advance(Duration::from_mins(10));
+    harness.emit(voice(50, Some(5), Some(6))).await.unwrap();
+    harness.advance(Duration::from_mins(10));
+    harness.emit(voice(50, Some(6), None)).await.unwrap();
+    assert_eq!(xp(&harness, 50).await, 20, "only the stay in channel 5");
+}
+
+#[tokio::test]
+async fn roles_and_channels_make_experience_worth_more_or_less() {
+    let harness = harness(&json!({
+        "xp_per_message": 20, "cooldown_seconds": 0, "voice_xp_per_minute": 10,
+        "role_multipliers": [
+            {"role": "70", "percent": 200},
+            {"role": "71", "percent": 150},
+        ],
+        "channel_multipliers": [{"channel": "6", "percent": 50}],
+    }));
+    let say_as = |user: u64, channel: u64, roles: Vec<u64>| {
+        harness.message(Message::new(user, channel).content("hi").roles(roles))
+    };
+    say_as(50, 5, vec![]).await.unwrap();
+    say_as(51, 5, vec![70, 71]).await.unwrap();
+    say_as(52, 6, vec![70]).await.unwrap();
+    assert_eq!(xp(&harness, 50).await, 20);
+    assert_eq!(
+        xp(&harness, 51).await,
+        40,
+        "the best role counts, they do not add up"
+    );
+    assert_eq!(xp(&harness, 52).await, 20, "twice, then half");
+    // In voice the roles are asked for.
+    harness.api().set_member(Id::new(1), member(53, &[70]));
+    sit(&harness, 53, 5, 3).await;
+    assert_eq!(xp(&harness, 53).await, 60);
+}
+
+#[tokio::test]
+async fn a_reward_can_take_the_rewards_before_it_away() {
+    let rewards = json!([
+        {"level": 1, "role": "9"}, {"level": 2, "role": "10"},
+    ]);
+    let harness = harness(&json!({
+        "xp_per_message": 1000, "cooldown_seconds": 0, "announce": false,
+        "rewards": rewards, "replace_rewards": true,
+    }));
+    say(&harness, 50, 5).await;
+    let gone: Vec<u64> = harness
+        .actions()
+        .iter()
+        .filter_map(|a| match a {
+            Action::RemoveRole { role_id, .. } => Some(role_id.get()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gone, [9], "level 2 and 1 were reached at once: 1 goes");
+    let keeps = self::harness(&json!({
+        "xp_per_message": 1000, "cooldown_seconds": 0, "announce": false, "rewards": rewards,
+    }));
+    say(&keeps, 50, 5).await;
+    assert!(
+        !keeps
+            .actions()
+            .iter()
+            .any(|a| matches!(a, Action::RemoveRole { .. }))
+    );
 }
 
 #[tokio::test]

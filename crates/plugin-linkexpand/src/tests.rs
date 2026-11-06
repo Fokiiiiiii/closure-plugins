@@ -81,7 +81,8 @@ const PARENT: &str = r#"{"tweet":{"url":"https://x.com/ev/status/19","text":"the
 
 const QUOTED: &str = r#"{"tweet":{"url":"https://x.com/dom/status/5","text":"quoted words",
     "author":{"name":"dom","screen_name":"dom"},"likes":7,"retweets":8,"replies":9,
-    "media":{"photos":[{"url":"https://p.example/q.jpg"}]}}}"#;
+    "media":{"photos":[{"url":"https://p.example/q.jpg"}],
+                "videos":[{"url":"https://v.example/q.mp4"}]}}}"#;
 
 const TRANSLATED: &str =
     r#"[[["a translated post","just setting up my twttr",null,null,10]],null,"ja"]"#;
@@ -328,6 +329,11 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     assert_eq!(one.footers[2].as_deref(), Some("💬 9  🔁 8  ❤ 7"));
     // What was linked has its picture attached; the others show theirs small.
     assert_eq!(one.files, ["photo-1.jpg"]);
+    assert_eq!(
+        one.content.as_deref(),
+        Some("https://fixupx.com/dom/status/5"),
+        "the video of the quoted post is a player link, it is not attached"
+    );
     assert_eq!(one.images, 1, "the quoted post has a picture");
     assert_eq!(
         one.fields, 3,
