@@ -22,8 +22,10 @@ plugin-linkexpand = { path = "crates/plugin-linkexpand" }
 plugin-starboard = { path = "crates/plugin-starboard" }
 plugin-leveling = { path = "crates/plugin-leveling" }
 plugin-translate = { path = "crates/plugin-translate" }
+plugin-giveaway = { path = "crates/plugin-giveaway" }
 
 anyhow = "1"
+fastrand = "2"
 async-trait = "0.1"
 http-body-util = "0.1"
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }

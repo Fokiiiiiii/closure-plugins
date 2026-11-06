@@ -1,0 +1,24 @@
+[package]
+name = "plugin-giveaway"
+description = "A closure module that runs giveaways: a button to enter, winners drawn when the time is up"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+closure-core.workspace = true
+closure-sdk.workspace = true
+fastrand.workspace = true
+serde.workspace = true
+tracing.workspace = true
+twilight-model.workspace = true
+
+[dev-dependencies]
+closure-i18n.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
