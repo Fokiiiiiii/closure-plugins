@@ -84,7 +84,7 @@ const QUOTED: &str = r#"{"tweet":{"url":"https://x.com/dom/status/5","text":"quo
     "media":{"photos":[{"url":"https://p.example/q.jpg"}]}}}"#;
 
 const TRANSLATED: &str =
-    r#"[[["a translated post","just setting up my twttr",null,null,10]],null,"en"]"#;
+    r#"[[["a translated post","just setting up my twttr",null,null,10]],null,"ja"]"#;
 
 fn thread(url: &str) -> Option<&'static str> {
     if url.contains("translate_a") {
@@ -147,6 +147,7 @@ struct Posted {
     titles: Vec<Option<String>>,
     footers: Vec<Option<String>>,
     images: usize,
+    fields: usize,
     reply_to: Option<u64>,
     files: Vec<String>,
     components: Vec<Component>,
@@ -173,6 +174,7 @@ fn posted(harness: &Harness) -> Vec<Posted> {
                     .map(|e| e.footer.as_ref().map(|f| f.text.clone()))
                     .collect(),
                 images: embeds.iter().filter(|e| e.image.is_some()).count(),
+                fields: embeds.iter().map(|e| e.fields.len()).sum(),
                 reply_to: reply_to.map(twilight_model::id::Id::get),
                 files: files.into_iter().map(|f| f.filename).collect(),
                 components,
@@ -327,9 +329,21 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     // What was linked has its picture attached; the others show theirs small.
     assert_eq!(one.files, ["photo-1.jpg"]);
     assert_eq!(one.images, 1, "the quoted post has a picture");
+    assert_eq!(
+        one.fields, 3,
+        "each post has its translation, as it is not in English"
+    );
     assert!(one.reply_to.is_some());
     assert_eq!(buttons(one).len(), 3);
     assert!(hid_the_original(&harness));
+}
+
+#[tokio::test]
+async fn the_translation_can_be_left_out() {
+    let harness = harness(Fake(thread));
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://x.com/jack/status/20").await;
+    assert_eq!(posted(&harness)[0].fields, 0);
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ use plugin_kit::{Quoted, quote_embed};
 use serde::Deserialize;
 use serde_json::json;
 use twilight_model::channel::message::component::ButtonStyle;
-use twilight_model::channel::message::embed::EmbedImage;
+use twilight_model::channel::message::embed::{EmbedField, EmbedImage};
 use twilight_model::channel::message::{Component, Embed};
 use twilight_model::channel::{Channel, Message};
 use twilight_model::guild::Permissions;
@@ -47,6 +47,8 @@ const JA: &str = include_str!("../locales/ja.ftl");
 const QUOTE_CHARS: usize = 1200;
 /// What is told of each post translated: the embeds of an answer are at most 6000 characters.
 const TRANSLATED_CHARS: usize = 1300;
+/// The text of a post and its translation both stand in the answer: half of the room for each.
+const SHARED_CHARS: usize = 550;
 const VIEW: Permissions = Permissions::VIEW_CHANNEL.union(Permissions::READ_MESSAGE_HISTORY);
 
 /// How the posts of a thread are laid out in Discord.
@@ -77,6 +79,8 @@ struct Config {
     translate_button: bool,
     /// Hide the preview Discord made of the link, which the answer repeats.
     hide_original: bool,
+    /// Add the post in the language of the server under it, when it is in another one.
+    auto_translate: bool,
     layout: Layout,
 }
 
@@ -89,6 +93,7 @@ impl Default for Config {
             quoted_post: true,
             translate_button: true,
             hide_original: true,
+            auto_translate: true,
             layout: Layout::Embeds,
         }
     }
@@ -370,7 +375,12 @@ async fn on_message(
             } else {
                 None
             };
-            let mut shown = x::pieces(&tweet, parent.as_ref(), quoted, &words, QUOTE_CHARS);
+            let limit = if config.auto_translate {
+                SHARED_CHARS
+            } else {
+                QUOTE_CHARS
+            };
+            let mut shown = x::pieces(&tweet, parent.as_ref(), quoted, &words, limit);
             // What does not fit goes: the post that was linked stays.
             while units.len() + shown.len() > MAX_UNITS {
                 if let Some(at) = shown.iter().position(|p| !p.main) {
@@ -383,8 +393,13 @@ async fn on_message(
                 if piece.main {
                     open.get_or_insert_with(|| piece.link.clone());
                 }
+                let embed = if config.auto_translate {
+                    with_translation(&*fetch, &ctx, piece.embed).await
+                } else {
+                    piece.embed
+                };
                 units.push(Unit {
-                    embed: piece.embed,
+                    embed,
                     photos: piece.photos,
                     video: piece.video,
                     link: Some(piece.link),
@@ -446,6 +461,28 @@ async fn on_message(
         }
     }
     Ok(Flow::Continue)
+}
+
+/// The embed of a post with its translation under it, when the post is in another language than
+/// the server's; a service that does not answer leaves the embed as it is.
+async fn with_translation(fetch: &dyn Get, ctx: &EventContext, mut embed: Embed) -> Embed {
+    let to = ctx.locale.tag();
+    let Some(text) = embed.description.clone() else {
+        return embed;
+    };
+    let Ok(done) = translate::translate(fetch, &text, to).await else {
+        return embed;
+    };
+    if done.from.split('-').next() == to.split('-').next() || done.text.trim() == text.trim() {
+        return embed;
+    }
+    let label = ctx.t_in(ctx.locale, "linkexpand-translated", &Args::new());
+    embed.fields.push(EmbedField {
+        inline: false,
+        name: format!("{label} ({} → {to})", done.from),
+        value: plugin_kit::truncate(&done.text, SHARED_CHARS),
+    });
+    embed
 }
 
 /// The number at the end of the address of a post.
@@ -568,6 +605,7 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
             "quoted_post": switch("quoted_post"),
             "translate_button": switch("translate_button"),
             "hide_original": switch("hide_original"),
+            "auto_translate": switch("auto_translate"),
             "layout": {
                 "type": "string",
                 "enum": ["embeds", "chain"],
@@ -590,6 +628,7 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
                 json!({
                     "message_links": true, "x_links": true, "replied_post": true,
                     "quoted_post": true, "translate_button": true, "hide_original": true,
+                    "auto_translate": true,
                     "layout": "embeds"
                 }),
             )
