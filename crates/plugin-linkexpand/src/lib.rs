@@ -708,9 +708,59 @@ pub fn module() -> Result<SdkModule, CoreError> {
 
 #[cfg(test)]
 mod tests;
-/// All of the answer in one message: an embed for each post, and the pictures of
-/// what was linked attached. A post shown for the sake of another has its first picture as the picture
-/// in its embed, under its text, so that it is clear whose it is.
+/// Posts one message of the answer, as a reply to `reply_to`, and tells its id.
+async fn post(
+    ctx: &EventContext,
+    channel_id: ChannelId,
+    reply_to: MessageId,
+    content: Option<String>,
+    embeds: Vec<Embed>,
+    components: Vec<Component>,
+    files: Vec<FileUpload>,
+) -> Result<Option<MessageId>, ModuleError> {
+    let posted = ctx
+        .api
+        .execute(Action::PostMessage {
+            channel_id,
+            message_id: None,
+            reply_to: Some(reply_to),
+            content,
+            embeds,
+            components,
+            files,
+        })
+        .await?;
+    Ok(match posted {
+        Outcome::Message(posted) => Some(posted.id),
+        _ => None,
+    })
+}
+
+/// The videos of the answer, as a message of their own that has nothing but their links: Discord
+/// makes no player of a link in a message that has embeds, but it does of one that has not.
+async fn post_videos(
+    ctx: &EventContext,
+    message: &MessageInfo,
+    after: MessageId,
+    videos: Vec<String>,
+    components: Vec<Component>,
+) -> Result<(), ModuleError> {
+    post(
+        ctx,
+        message.channel_id,
+        after,
+        Some(videos.join("\n")),
+        Vec::new(),
+        components,
+        Vec::new(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// All of the answer in one message: an embed for each post, and the pictures of what was linked
+/// attached. A post shown for the sake of another has its first picture in its embed, under its
+/// text, so that it is clear whose it is. The videos follow as a message of their own.
 async fn send_embeds(
     ctx: &EventContext,
     fetch: &dyn Get,
@@ -722,16 +772,15 @@ async fn send_embeds(
 ) -> Result<(), ModuleError> {
     let mut files = Vec::new();
     let mut room = MAX_FILES_BYTES;
-    // The videos, as links: Discord plays them.
-    let mut players: Vec<String> = Vec::new();
+    let mut videos: Vec<String> = Vec::new();
     let mut embeds = Vec::new();
     for mut unit in units {
         if unit.main {
-            let (more, link) = attachments(fetch, &unit, &mut room).await;
+            let (more, video) = attachments(fetch, &unit, &mut room).await;
             files.extend(more);
-            players.extend(link);
+            videos.extend(video);
         } else {
-            players.extend(unit.video.clone());
+            videos.extend(unit.video.clone());
             if let Some(url) = unit
                 .photos
                 .first()
@@ -747,22 +796,32 @@ async fn send_embeds(
         }
         embeds.push(unit.embed);
     }
-    ctx.api
-        .execute(Action::PostMessage {
-            channel_id: message.channel_id,
-            message_id: None,
-            reply_to: Some(message.id),
-            content: (!players.is_empty()).then(|| players.join("\n")),
-            embeds,
-            components: buttons(ctx, config, message.author.id, translate, open, &[]),
-            files,
-        })
-        .await?;
+    let by = message.author.id;
+    let components = |earlier: &[MessageId]| buttons(ctx, config, by, translate, open, earlier);
+    let first = post(
+        ctx,
+        message.channel_id,
+        message.id,
+        None,
+        embeds,
+        if videos.is_empty() {
+            components(&[])
+        } else {
+            Vec::new()
+        },
+        files,
+    )
+    .await?;
+    if !videos.is_empty() {
+        let earlier: Vec<MessageId> = first.into_iter().collect();
+        let after = first.unwrap_or(message.id);
+        post_videos(ctx, message, after, videos, components(&earlier)).await?;
+    }
     Ok(())
 }
 
-/// The answer as a message for each post, each answering the one before it; the buttons are under
-/// the last one and take them all away.
+/// The answer as a message for each post, each answering the one before it, and the videos in a
+/// message of their own at the end; the buttons are under the last one and take them all away.
 async fn send_chain(
     ctx: &EventContext,
     fetch: &dyn Get,
@@ -772,31 +831,43 @@ async fn send_chain(
     translate: &[u64],
     open: Option<&str>,
 ) -> Result<(), ModuleError> {
+    let by = message.author.id;
     let mut previous = message.id;
     let mut sent: Vec<MessageId> = Vec::new();
+    let mut videos: Vec<String> = Vec::new();
+    // The message of the videos is one of the messages the button names.
+    let units = if units.iter().any(|unit| unit.video.is_some()) {
+        &units[..units.len().min(MAX_UNITS - 1)]
+    } else {
+        units
+    };
     for (at, unit) in units.iter().enumerate() {
-        let (files, player) = attachments(fetch, unit, &mut MAX_FILES_BYTES.clone()).await;
-        let components = if at + 1 == units.len() {
-            buttons(ctx, config, message.author.id, translate, open, &sent)
+        let (files, video) = attachments(fetch, unit, &mut MAX_FILES_BYTES.clone()).await;
+        videos.extend(video);
+        let last = at + 1 == units.len() && units.iter().all(|u| u.video.is_none());
+        let components = if last {
+            buttons(ctx, config, by, translate, open, &sent)
         } else {
             Vec::new()
         };
-        let posted = ctx
-            .api
-            .execute(Action::PostMessage {
-                channel_id: message.channel_id,
-                message_id: None,
-                reply_to: Some(previous),
-                content: player,
-                embeds: vec![unit.embed.clone()],
-                components,
-                files,
-            })
-            .await?;
-        if let Outcome::Message(posted) = posted {
-            previous = posted.id;
-            sent.push(posted.id);
+        let posted = post(
+            ctx,
+            message.channel_id,
+            previous,
+            None,
+            vec![unit.embed.clone()],
+            components,
+            files,
+        )
+        .await?;
+        if let Some(id) = posted {
+            previous = id;
+            sent.push(id);
         }
+    }
+    if !videos.is_empty() {
+        let components = buttons(ctx, config, by, translate, open, &sent);
+        post_videos(ctx, message, previous, videos, components).await?;
     }
     Ok(())
 }
