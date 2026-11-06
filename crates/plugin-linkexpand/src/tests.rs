@@ -282,13 +282,14 @@ async fn a_post_on_x_has_its_pictures_attached_its_video_linked_and_its_preview_
     let harness = harness(Fake(plain));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
-    assert_eq!(all.len(), 2, "the post, and its video alone");
-    assert_eq!(all[0].embeds, 1);
-    assert_eq!(all[0].files, ["photo-1.jpg", "photo-2.jpg"]);
-    assert_eq!(all[0].content, None);
-    // Only a message without embeds gets a player from its link.
-    assert_eq!(all[1].embeds, 0);
-    assert_eq!(all[1].content.as_deref(), Some("https://v.example/v.mp4"));
+    assert_eq!(all.len(), 2, "the video alone, then the post");
+    // Only a message without embeds gets a player from its link; it has no buttons.
+    assert_eq!(all[0].embeds, 0);
+    assert_eq!(all[0].content.as_deref(), Some("https://v.example/v.mp4"));
+    assert!(all[0].components.is_empty());
+    assert_eq!(all[1].embeds, 1);
+    assert_eq!(all[1].files, ["photo-1.jpg", "photo-2.jpg"]);
+    assert_eq!(all[1].content, None);
     assert!(hid_the_original(&harness));
     harness.set_config(json!({"hide_original": false}));
     let before = harness.actions().len();
@@ -304,9 +305,9 @@ async fn a_video_is_the_link_to_the_video_servers_of_x_however_large_it_is() {
     let harness = harness(Fake(huge));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
-    assert!(all[0].files.is_empty());
+    assert!(all[1].files.is_empty());
     assert_eq!(
-        all[1].content.as_deref(),
+        all[0].content.as_deref(),
         Some("https://v.example/huge.mp4")
     );
 }
@@ -320,11 +321,11 @@ async fn a_reply_and_a_quote_are_messages_of_their_own_each_answering_the_one_be
     assert_eq!(
         all.len(),
         4,
-        "the first post, the reply, the quoted post, the video of the quoted post"
+        "the video of the quoted post, the first post, the reply, the quoted post"
     );
-    assert!(all[..3].iter().all(|p| p.embeds == 1));
-    assert_eq!(all[3].content.as_deref(), Some("https://v.example/q.mp4"));
-    assert_eq!(all[1].files, ["photo-1.jpg"]);
+    assert!(all[1..].iter().all(|p| p.embeds == 1));
+    assert_eq!(all[0].content.as_deref(), Some("https://v.example/q.mp4"));
+    assert_eq!(all[2].files, ["photo-1.jpg"]);
     // Each answers the one before: the first the link, the others a message of the bot.
     assert!(all[0].reply_to.is_some() && all[1].reply_to.is_some() && all[2].reply_to.is_some());
     // The buttons are under the last one, and take all of them away.
@@ -349,9 +350,9 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     assert_eq!(
         all.len(),
         2,
-        "one message and the video of the quoted post alone"
+        "the video of the quoted post alone, then one message"
     );
-    let one = &all[0];
+    let one = &all[1];
     assert_eq!(one.embeds, 3);
     assert!(one.titles[0].is_some());
     assert!(
@@ -365,7 +366,7 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     // What was linked has its picture attached; the others show theirs small.
     assert_eq!(one.files, ["photo-1.jpg"]);
     assert_eq!(
-        all[1].content.as_deref(),
+        all[0].content.as_deref(),
         Some("https://v.example/q.mp4"),
         "the video of the quoted post is a link too"
     );
@@ -374,12 +375,9 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
         one.fields, 3,
         "each post has its translation, as it is not in English"
     );
-    assert!(one.reply_to.is_some() && all[1].reply_to.is_some());
-    assert!(
-        buttons(one).is_empty(),
-        "the buttons are under the last message"
-    );
-    assert_eq!(buttons(&all[1]).len(), 3);
+    assert!(one.reply_to.is_some() && all[0].reply_to.is_some());
+    assert!(buttons(&all[0]).is_empty(), "the video has no buttons");
+    assert_eq!(buttons(one).len(), 3);
     assert!(hid_the_original(&harness));
 }
 

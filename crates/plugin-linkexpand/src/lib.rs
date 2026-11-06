@@ -744,7 +744,7 @@ async fn post_videos(
     after: MessageId,
     videos: Vec<String>,
     components: Vec<Component>,
-) -> Result<(), ModuleError> {
+) -> Result<Option<MessageId>, ModuleError> {
     post(
         ctx,
         message.channel_id,
@@ -754,13 +754,12 @@ async fn post_videos(
         components,
         Vec::new(),
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// All of the answer in one message: an embed for each post, and the pictures of what was linked
 /// attached. A post shown for the sake of another has its first picture in its embed, under its
-/// text, so that it is clear whose it is. The videos follow as a message of their own.
+/// text, so that it is clear whose it is. The videos come first, as a message of their own.
 async fn send_embeds(
     ctx: &EventContext,
     fetch: &dyn Get,
@@ -797,31 +796,30 @@ async fn send_embeds(
         embeds.push(unit.embed);
     }
     let by = message.author.id;
-    let components = |earlier: &[MessageId]| buttons(ctx, config, by, translate, open, earlier);
-    let first = post(
+    // The videos come first, as a message of their own; the message with the buttons names it.
+    let mut earlier: Vec<MessageId> = Vec::new();
+    let mut after = message.id;
+    if !videos.is_empty()
+        && let Some(id) = post_videos(ctx, message, after, videos, Vec::new()).await?
+    {
+        earlier.push(id);
+        after = id;
+    }
+    post(
         ctx,
         message.channel_id,
-        message.id,
+        after,
         None,
         embeds,
-        if videos.is_empty() {
-            components(&[])
-        } else {
-            Vec::new()
-        },
+        buttons(ctx, config, by, translate, open, &earlier),
         files,
     )
     .await?;
-    if !videos.is_empty() {
-        let earlier: Vec<MessageId> = first.into_iter().collect();
-        let after = first.unwrap_or(message.id);
-        post_videos(ctx, message, after, videos, components(&earlier)).await?;
-    }
     Ok(())
 }
 
-/// The answer as a message for each post, each answering the one before it, and the videos in a
-/// message of their own at the end; the buttons are under the last one and take them all away.
+/// The answer as the videos in a message of their own, then a message for each post, each
+/// answering the one before it; the buttons are under the last one and take them all away.
 async fn send_chain(
     ctx: &EventContext,
     fetch: &dyn Get,
@@ -832,20 +830,30 @@ async fn send_chain(
     open: Option<&str>,
 ) -> Result<(), ModuleError> {
     let by = message.author.id;
-    let mut previous = message.id;
-    let mut sent: Vec<MessageId> = Vec::new();
-    let mut videos: Vec<String> = Vec::new();
     // The message of the videos is one of the messages the button names.
     let units = if units.iter().any(|unit| unit.video.is_some()) {
         &units[..units.len().min(MAX_UNITS - 1)]
     } else {
         units
     };
-    for (at, unit) in units.iter().enumerate() {
+    let mut posts = Vec::new();
+    let mut videos: Vec<String> = Vec::new();
+    for unit in units {
         let (files, video) = attachments(fetch, unit, &mut MAX_FILES_BYTES.clone()).await;
         videos.extend(video);
-        let last = at + 1 == units.len() && units.iter().all(|u| u.video.is_none());
-        let components = if last {
+        posts.push((unit, files));
+    }
+    let mut previous = message.id;
+    let mut sent: Vec<MessageId> = Vec::new();
+    if !videos.is_empty()
+        && let Some(id) = post_videos(ctx, message, previous, videos, Vec::new()).await?
+    {
+        previous = id;
+        sent.push(id);
+    }
+    let count = posts.len();
+    for (at, (unit, files)) in posts.into_iter().enumerate() {
+        let components = if at + 1 == count {
             buttons(ctx, config, by, translate, open, &sent)
         } else {
             Vec::new()
@@ -864,10 +872,6 @@ async fn send_chain(
             previous = id;
             sent.push(id);
         }
-    }
-    if !videos.is_empty() {
-        let components = buttons(ctx, config, by, translate, open, &sent);
-        post_videos(ctx, message, previous, videos, components).await?;
     }
     Ok(())
 }
