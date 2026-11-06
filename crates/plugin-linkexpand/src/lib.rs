@@ -276,7 +276,7 @@ struct Unit {
     embed: Embed,
     photos: Vec<String>,
     video: Option<String>,
-    /// The link of the post, for a video that is too large to attach.
+    /// The link of the post.
     link: Option<String>,
     /// Whether this is what the writer linked, and not the post it answers or quotes.
     main: bool,
@@ -296,7 +296,7 @@ fn extension_of(url: &str) -> &str {
     }
 }
 
-/// The pictures and the video of a unit as files, and a player link when the video does not fit.
+/// The pictures of a unit as files, and the address of its video, which is posted as a link.
 ///
 /// `room` is what a message can still carry in files, and is used up by what is attached.
 async fn attachments(
@@ -317,22 +317,9 @@ async fn attachments(
             Err(error) => tracing::warn!(%error, "a picture is not attached"),
         }
     }
-    let mut player = None;
-    if let Some(url) = &unit.video {
-        match fetch.get_large(url, *room).await {
-            Ok(data) => {
-                *room -= data.len();
-                files.push(FileUpload {
-                    filename: format!("video.{}", extension_of(url)),
-                    data,
-                });
-            }
-            Err(error) => {
-                tracing::warn!(%error, "a video is not attached, a player link stands in");
-                player = unit.link.as_deref().map(x::player_link);
-            }
-        }
-    }
+    // A video is not downloaded: its address at the video servers of X is the link, and Discord
+    // plays that.
+    let player = unit.video.clone();
     (files, player)
 }
 
@@ -721,7 +708,7 @@ pub fn module() -> Result<SdkModule, CoreError> {
 
 #[cfg(test)]
 mod tests;
-/// All of the answer in one message: an embed for each post, and the pictures and the video of
+/// All of the answer in one message: an embed for each post, and the pictures of
 /// what was linked attached. A post shown for the sake of another has its first picture as the picture
 /// in its embed, under its text, so that it is clear whose it is.
 async fn send_embeds(
@@ -735,7 +722,7 @@ async fn send_embeds(
 ) -> Result<(), ModuleError> {
     let mut files = Vec::new();
     let mut room = MAX_FILES_BYTES;
-    // The players of the videos that are not attached; Discord shows them from the links.
+    // The videos, as links: Discord plays them.
     let mut players: Vec<String> = Vec::new();
     let mut embeds = Vec::new();
     for mut unit in units {
@@ -744,10 +731,7 @@ async fn send_embeds(
             files.extend(more);
             players.extend(link);
         } else {
-            // The video of a post shown for the sake of another is not attached: its player is.
-            if unit.video.is_some() {
-                players.extend(unit.link.as_deref().map(x::player_link));
-            }
+            players.extend(unit.video.clone());
             if let Some(url) = unit
                 .photos
                 .first()

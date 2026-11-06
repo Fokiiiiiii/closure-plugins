@@ -278,14 +278,14 @@ async fn other_servers_unwrapped_requests_and_bots_are_left_alone() {
 }
 
 #[tokio::test]
-async fn a_post_on_x_has_its_pictures_and_video_attached_and_its_preview_hidden() {
+async fn a_post_on_x_has_its_pictures_attached_its_video_linked_and_its_preview_hidden() {
     let harness = harness(Fake(plain));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].embeds, 1);
-    assert_eq!(all[0].files, ["photo-1.jpg", "photo-2.jpg", "video.mp4"]);
-    assert_eq!(all[0].content, None);
+    assert_eq!(all[0].files, ["photo-1.jpg", "photo-2.jpg"]);
+    assert_eq!(all[0].content.as_deref(), Some("https://v.example/v.mp4"));
     assert!(hid_the_original(&harness));
     harness.set_config(json!({"hide_original": false}));
     let before = harness.actions().len();
@@ -297,14 +297,14 @@ async fn a_post_on_x_has_its_pictures_and_video_attached_and_its_preview_hidden(
 }
 
 #[tokio::test]
-async fn a_video_too_large_to_attach_is_shown_through_a_player_link() {
+async fn a_video_is_the_link_to_the_video_servers_of_x_however_large_it_is() {
     let harness = harness(Fake(huge));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
     assert!(all[0].files.is_empty());
     assert_eq!(
         all[0].content.as_deref(),
-        Some("https://fixupx.com/jack/status/20")
+        Some("https://v.example/huge.mp4")
     );
 }
 
@@ -353,8 +353,8 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     assert_eq!(one.files, ["photo-1.jpg"]);
     assert_eq!(
         one.content.as_deref(),
-        Some("https://fixupx.com/dom/status/5"),
-        "the video of the quoted post is a player link, it is not attached"
+        Some("https://v.example/q.mp4"),
+        "the video of the quoted post is a link too"
     );
     assert_eq!(one.images, 1, "the quoted post has a picture");
     assert_eq!(

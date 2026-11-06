@@ -272,13 +272,6 @@ pub fn pieces(thread: &Thread, labels: &Labels, limit: usize) -> Vec<Piece> {
     all
 }
 
-/// The address of a post at a service that Discord shows with a player, for a video that is too
-/// large to attach.
-#[must_use]
-pub fn player_link(link: &str) -> String {
-    link.replacen("https://x.com/", "https://fixupx.com/", 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,14 +437,6 @@ mod tests {
         );
         assert_eq!(shown[0].photos.len(), MAX_PHOTOS);
         assert!(shown[0].video.is_none());
-    }
-
-    #[test]
-    fn a_video_too_large_to_attach_is_shown_through_a_player_link() {
-        assert_eq!(
-            player_link("https://x.com/jack/status/20"),
-            "https://fixupx.com/jack/status/20"
-        );
     }
 
     #[test]
