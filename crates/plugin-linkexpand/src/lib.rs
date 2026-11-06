@@ -45,6 +45,8 @@ const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
 /// The most characters of a quoted text: three quotes have to fit in one message.
 const QUOTE_CHARS: usize = 1200;
+/// What is told of each post translated: the embeds of an answer are at most 6000 characters.
+const TRANSLATED_CHARS: usize = 1300;
 const VIEW: Permissions = Permissions::VIEW_CHANNEL.union(Permissions::READ_MESSAGE_HISTORY);
 
 /// How the posts of a thread are laid out in Discord.
@@ -275,20 +277,15 @@ fn buttons(
 ) -> Vec<Component> {
     let say = |key: &str| ctx.t_in(ctx.locale, key, &Args::new());
     let mut row = Vec::new();
-    if config.translate_button {
-        for (at, id) in translate.iter().take(3).enumerate() {
-            let label = if translate.len() > 1 {
-                format!("{} {}", say("linkexpand-translate"), at + 1)
-            } else {
-                say("linkexpand-translate")
-            };
-            let custom = CustomId::new("translate").data(id.to_string());
-            row.push(ui::button(
-                ButtonStyle::Secondary,
-                label,
-                custom.encode(&ctx.module),
-            ));
-        }
+    if config.translate_button && !translate.is_empty() {
+        // One button for all of the posts, named in base 36 to fit what a button can carry.
+        let ids: Vec<String> = translate.iter().map(|id| to_base36(*id)).collect();
+        let custom = CustomId::new("translate").data(ids.join(","));
+        row.push(ui::button(
+            ButtonStyle::Secondary,
+            say("linkexpand-translate"),
+            custom.encode(&ctx.module),
+        ));
     }
     if let Some(link) = open {
         row.push(ui::link_button(say("linkexpand-open"), link));
@@ -323,7 +320,6 @@ async fn on_message(
     }
     let config: Config = ctx.parse_config()?;
     let mut units: Vec<Unit> = Vec::new();
-    let mut translate: Vec<u64> = Vec::new();
     let mut open: Option<String> = None;
     if config.message_links {
         for link in links::message_links(&message.content) {
@@ -359,7 +355,7 @@ async fn on_message(
             };
             // Only the first post brings the post it answers: three threads would not fit.
             let parent = match tweet.parent_id() {
-                Some(id) if config.replied_post && translate.is_empty() => {
+                Some(id) if config.replied_post && !expanded_post => {
                     fetch_post(&*fetch, id).await.ok()
                 }
                 _ => None,
@@ -395,12 +391,20 @@ async fn on_message(
                     main: piece.main,
                 });
             }
-            translate.push(link.id);
             expanded_post = true;
         }
     }
     if units.is_empty() {
         return Ok(Flow::Continue);
+    }
+    let mut translate: Vec<u64> = Vec::new();
+    for id in units
+        .iter()
+        .filter_map(|unit| unit.link.as_deref().and_then(status_id))
+    {
+        if !translate.contains(&id) {
+            translate.push(id);
+        }
     }
     match config.layout {
         Layout::Chain => {
@@ -444,27 +448,72 @@ async fn on_message(
     Ok(Flow::Continue)
 }
 
-/// Translates the post of the button into the language of whoever pressed it.
+/// The number at the end of the address of a post.
+fn status_id(link: &str) -> Option<u64> {
+    let (_, tail) = link.rsplit_once("/status/")?;
+    tail.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn to_base36(mut number: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(number % 36) as usize]);
+        number /= 36;
+        if number == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Translates the posts of the button, each into the language of whoever pressed it.
 async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), UserError> {
-    let Some(id) = cx.data().parse::<u64>().ok().filter(|id| *id > 0) else {
-        return Err(UserError::message("linkexpand-translate-failed"));
-    };
+    let failed = || UserError::message("linkexpand-translate-failed");
+    let ids: Vec<u64> = cx
+        .data()
+        .split(',')
+        .filter_map(|id| u64::from_str_radix(id, 36).ok())
+        .filter(|id| *id > 0)
+        .take(MAX_UNITS)
+        .collect();
+    if ids.is_empty() {
+        return Err(failed());
+    }
     cx.defer(true).await?;
     let to = cx.locale().tag();
-    let tweet = fetch_post(&*fetch, id)
-        .await
-        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
-    let done = translate::translate(&*fetch, &tweet.text, to)
-        .await
-        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
-    let embed = closure_sdk::EmbedBuilder::new()
-        .description(plugin_kit::truncate(&done.text, 3500))
-        .footer(format!("{} → {to}", done.from))
-        .build()
-        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+    let mut embeds = Vec::new();
+    for id in ids {
+        // A post that cannot be fetched or translated is left out; the others still are told.
+        let Ok(tweet) = fetch_post(&*fetch, id).await else {
+            continue;
+        };
+        let Ok(done) = translate::translate(&*fetch, &tweet.text, to).await else {
+            continue;
+        };
+        let text = format!(
+            "**{} (@{})**\n{}",
+            tweet.author.name,
+            tweet.author.screen_name,
+            plugin_kit::truncate(&done.text, TRANSLATED_CHARS)
+        );
+        let embed = closure_sdk::EmbedBuilder::new()
+            .description(text)
+            .footer(format!("{} → {to}", done.from))
+            .build()
+            .map_err(|_| failed())?;
+        embeds.push(embed);
+    }
+    if embeds.is_empty() {
+        return Err(failed());
+    }
     cx.reply_with(InteractionReply {
         content: None,
-        embeds: vec![embed],
+        embeds,
         ephemeral: true,
         components: Vec::new(),
     })

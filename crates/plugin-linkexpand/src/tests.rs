@@ -295,7 +295,10 @@ async fn a_reply_and_a_quote_are_messages_of_their_own_each_answering_the_one_be
     assert!(buttons(&all[0]).is_empty() && buttons(&all[1]).is_empty());
     let last = buttons(&all[2]);
     assert_eq!(last.len(), 3);
-    assert!(last[0].starts_with("linkexpand:translate:*:20"), "{last:?}");
+    assert!(
+        last[0].starts_with("linkexpand:translate:*:j,k,5"),
+        "{last:?}"
+    );
     assert_eq!(last[1], "https://x.com/jack/status/20");
     let delete = &last[2];
     assert!(
@@ -375,7 +378,7 @@ async fn the_last_message_has_buttons_to_translate_to_open_and_to_delete() {
     assert_eq!(
         buttons(&all[0]),
         [
-            "linkexpand:translate:*:20".to_owned(),
+            "linkexpand:translate:*:k".to_owned(),
             "https://x.com/jack/status/20".to_owned(),
             "linkexpand:delete:50:".to_owned(),
         ]
@@ -419,7 +422,7 @@ async fn only_the_one_who_posted_the_link_deletes_the_answer_all_of_it() {
 async fn the_translate_button_answers_with_the_post_in_another_language() {
     let harness = harness(Fake(thread));
     let replies = harness
-        .click(Click::new("linkexpand:translate:*:20"))
+        .click(Click::new("linkexpand:translate:*:j,k,5"))
         .await
         .unwrap();
     assert!(
@@ -430,7 +433,7 @@ async fn the_translate_button_answers_with_the_post_in_another_language() {
     );
     let down_harness = self::harness(Fake(down));
     let replies = down_harness
-        .click(Click::new("linkexpand:translate:*:20"))
+        .click(Click::new("linkexpand:translate:*:j,k,5"))
         .await
         .unwrap();
     assert!(
