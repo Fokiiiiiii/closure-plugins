@@ -10,30 +10,35 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-mod fetch;
 pub mod links;
 mod x;
 
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use closure_core::action::{Action, MentionPolicy, Outcome};
+use closure_core::action::{Action, Outcome, Reason};
 use closure_core::error::ModuleError;
 use closure_core::event::{ChannelId, Event, EventKind, MessageInfo, RoleId};
 use closure_core::module::EventContext;
 use closure_core::subscription::Flow;
-use closure_sdk::{CoreError, Intents, Locale, ModuleBuilder, SdkModule, Subscription};
+use closure_sdk::ui::{self, CustomId};
+use closure_sdk::{
+    Args, ComponentCx, CoreError, Intents, InteractionReply, Locale, ModuleBuilder, SdkModule,
+    Subscription, UserError,
+};
+use plugin_kit::translate;
 use plugin_kit::{Quoted, quote_embed};
 use serde::Deserialize;
 use serde_json::json;
 use twilight_model::channel::message::Embed;
+use twilight_model::channel::message::component::ButtonStyle;
 use twilight_model::channel::{Channel, Message};
 use twilight_model::guild::Permissions;
 use twilight_util::permission_calculator::PermissionCalculator;
 
 use crate::links::{MAX_PER_MESSAGE, MessageLink};
 
-pub use fetch::{Fetcher, Get};
+pub use plugin_kit::net::{Fetcher, Get};
 
 const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
@@ -41,11 +46,21 @@ const JA: &str = include_str!("../locales/ja.ftl");
 const QUOTE_CHARS: usize = 1200;
 const VIEW: Permissions = Permissions::VIEW_CHANNEL.union(Permissions::READ_MESSAGE_HISTORY);
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the settings, one switch each"
+)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct Config {
     message_links: bool,
     x_links: bool,
+    /// Show the post a post replies to.
+    replied_post: bool,
+    /// Show the post a post quotes.
+    quoted_post: bool,
+    /// A button that translates the post.
+    translate_button: bool,
 }
 
 impl Default for Config {
@@ -53,6 +68,9 @@ impl Default for Config {
         Self {
             message_links: true,
             x_links: true,
+            replied_post: true,
+            quoted_post: true,
+            translate_button: true,
         }
     }
 }
@@ -158,6 +176,27 @@ async fn quote_of(ctx: &EventContext, source: &MessageInfo, link: &MessageLink) 
     ))
 }
 
+/// The service, asked about the post `id`.
+async fn fetch_post(fetch: &dyn Get, id: u64) -> Result<x::Tweet> {
+    let bytes = fetch
+        .get(&format!("https://api.fxtwitter.com/status/{id}"))
+        .await?;
+    x::parse_tweet(&bytes)
+}
+
+fn labels(ctx: &EventContext) -> x::Labels {
+    let say = |key: &str| ctx.t_in(ctx.locale, key, &Args::new());
+    x::Labels {
+        replied_to: say("linkexpand-replied-to"),
+        quoted: say("linkexpand-quoted"),
+        reposted_by: say("linkexpand-reposted-by"),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flow: find the links, expand them, answer"
+)]
 async fn on_message(
     fetch: Arc<dyn Get>,
     ctx: EventContext,
@@ -172,6 +211,8 @@ async fn on_message(
     let config: Config = ctx.parse_config()?;
     let mut embeds: Vec<Embed> = Vec::new();
     let mut videos: Vec<String> = Vec::new();
+    let mut translate: Vec<u64> = Vec::new();
+    let mut open: Option<String> = None;
     let mut budget = MAX_PER_MESSAGE;
     if config.message_links {
         for link in links::message_links(&message.content) {
@@ -189,74 +230,171 @@ async fn on_message(
         }
     }
     if config.x_links {
+        let words = labels(&ctx);
         for link in links::post_links(&message.content) {
             if budget == 0 {
                 break;
             }
-            let url = format!("https://api.fxtwitter.com/{}/status/{}", link.user, link.id);
-            let post = match fetch.get(&url).await {
-                Ok(bytes) => x::parse_tweet(&bytes),
-                Err(error) => Err(error),
-            };
-            match post {
-                Ok(tweet) => {
-                    let shown = x::tweet_embeds(&tweet, QUOTE_CHARS);
-                    embeds.extend(shown.embeds);
-                    videos.extend(shown.video);
-                    budget -= 1;
+            let tweet = match fetch_post(&*fetch, link.id).await {
+                Ok(tweet) => tweet,
+                Err(error) => {
+                    tracing::debug!(%error, "a post is not expanded");
+                    continue;
                 }
-                Err(error) => tracing::debug!(%error, "a post is not expanded"),
-            }
+            };
+            // Only the first post brings the post it answers: three threads would not fit.
+            let parent = match tweet.parent_id() {
+                Some(id) if config.replied_post && translate.is_empty() => {
+                    fetch_post(&*fetch, id).await.ok()
+                }
+                _ => None,
+            };
+            let shown = x::expand(
+                &tweet,
+                parent.as_ref(),
+                config.quoted_post,
+                &words,
+                QUOTE_CHARS,
+            );
+            embeds.extend(shown.embeds);
+            videos.extend(shown.video);
+            open.get_or_insert(shown.link);
+            translate.push(link.id);
+            budget -= 1;
         }
     }
     embeds.truncate(10);
     if embeds.is_empty() && videos.is_empty() {
         return Ok(Flow::Continue);
     }
+    let say = |key: &str| ctx.t_in(ctx.locale, key, &Args::new());
+    let mut buttons = Vec::new();
+    if config.translate_button {
+        let several = translate.len() > 1;
+        for (at, id) in translate.iter().take(3).enumerate() {
+            let label = if several {
+                format!("{} {}", say("linkexpand-translate"), at + 1)
+            } else {
+                say("linkexpand-translate")
+            };
+            let custom = CustomId::new("translate").data(id.to_string());
+            buttons.push(ui::button(
+                ButtonStyle::Secondary,
+                label,
+                custom.encode(&ctx.module),
+            ));
+        }
+    }
+    if let Some(link) = open {
+        buttons.push(ui::link_button(say("linkexpand-open"), link));
+    }
+    // Whoever posted the link can take the answer away again.
+    let delete = CustomId::new("delete").only_for(message.author.id);
+    buttons.push(ui::button(
+        ButtonStyle::Danger,
+        say("linkexpand-delete"),
+        delete.encode(&ctx.module),
+    ));
     ctx.api
-        .execute(Action::SendMessage {
+        .execute(Action::PostMessage {
             channel_id: message.channel_id,
+            message_id: None,
+            reply_to: Some(message.id),
             content: (!videos.is_empty()).then(|| videos.join("\n")),
             embeds,
-            reply_to: Some(message.id),
-            mentions: MentionPolicy::None,
+            components: vec![ui::row(buttons)],
         })
         .await?;
     Ok(Flow::Continue)
 }
 
-/// The module, with the network it reaches the `FxTwitter` service through.
+/// Translates the post of the button into the language of whoever pressed it.
+async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), UserError> {
+    let Some(id) = cx.data().parse::<u64>().ok().filter(|id| *id > 0) else {
+        return Err(UserError::message("linkexpand-translate-failed"));
+    };
+    cx.defer(true).await?;
+    let to = cx.locale().tag();
+    let tweet = fetch_post(&*fetch, id)
+        .await
+        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+    let done = translate::translate(&*fetch, &tweet.text, to)
+        .await
+        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+    let embed = closure_sdk::EmbedBuilder::new()
+        .description(plugin_kit::truncate(&done.text, 3500))
+        .footer(format!("{} → {to}", done.from))
+        .build()
+        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+    cx.reply_with(InteractionReply {
+        content: None,
+        embeds: vec![embed],
+        ephemeral: true,
+        components: Vec::new(),
+    })
+    .await
+}
+
+/// Takes the answer away; only the one who posted the link gets this far.
+async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
+    cx.defer_update().await?;
+    let click = cx.click();
+    let reason = Reason::new(cx.t("linkexpand-delete-reason", &Args::new()))
+        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+    cx.api()
+        .delete_message(click.channel_id, click.message_id, reason)
+        .await
+        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+    Ok(())
+}
+
+/// The module, with the network it reaches the services through.
 ///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
+    let switch = |key: &str| {
+        json!({
+            "type": "boolean",
+            "description": format!("config-linkexpand-{key}"),
+            "x-ui": { "level": "basic" }
+        })
+    };
     let schema = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "message_links": {
-                "type": "boolean",
-                "description": "config-linkexpand-message_links",
-                "x-ui": { "level": "basic" }
-            },
-            "x_links": {
-                "type": "boolean",
-                "description": "config-linkexpand-x_links",
-                "x-ui": { "level": "basic" }
-            }
+            "message_links": switch("message_links"),
+            "x_links": switch("x_links"),
+            "replied_post": switch("replied_post"),
+            "quoted_post": switch("quoted_post"),
+            "translate_button": switch("translate_button")
         }
     });
+    let for_message = Arc::clone(&fetch);
     Ok(
         ModuleBuilder::new("linkexpand", "Link expansion", env!("CARGO_PKG_VERSION"))?
             .capability(closure_sdk::Capability::SendMessages)
             .capability(closure_sdk::Capability::ReadMessages)
             .capability(closure_sdk::Capability::ReadGuild)
+            .capability(closure_sdk::Capability::ManageMessages)
+            .capability(closure_sdk::Capability::RespondToInteractions)
             .intents(Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT)
-            .config(schema, json!({"message_links": true, "x_links": true}))
+            .config(
+                schema,
+                json!({
+                    "message_links": true, "x_links": true, "replied_post": true,
+                    "quoted_post": true, "translate_button": true
+                }),
+            )
             .on(
                 Subscription::new(EventKind::MessageCreated),
-                move |ctx, event| on_message(Arc::clone(&fetch), ctx, event),
+                move |ctx, event| on_message(Arc::clone(&for_message), ctx, event),
             )
+            .component("translate", move |cx| {
+                translate_click(Arc::clone(&fetch), cx)
+            })
+            .component("delete", delete_click)
             .catalog(Locale::En, EN)
             .catalog(Locale::Ja, JA)
             .enabled_by_default(),

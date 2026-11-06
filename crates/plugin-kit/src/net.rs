@@ -1,4 +1,4 @@
-//! Asks the `FxTwitter` service about a post on X, over HTTPS.
+//! Reading a page over HTTPS, for the services the plugins ask: `FxTwitter`, and the translator.
 
 use async_trait::async_trait;
 

@@ -1,0 +1,24 @@
+[package]
+name = "plugin-translate"
+description = "A closure module that translates a message from its context menu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+closure-core.workspace = true
+closure-sdk.workspace = true
+plugin-kit.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+closure-i18n.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

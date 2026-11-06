@@ -16,5 +16,7 @@ pub fn modules() -> Result<Vec<Arc<dyn Module>>> {
     Ok(vec![
         Arc::new(plugin_linkexpand::module()?),
         Arc::new(plugin_starboard::module()?),
+        Arc::new(plugin_leveling::module()?),
+        Arc::new(plugin_translate::module()?),
     ])
 }

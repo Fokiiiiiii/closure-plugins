@@ -20,6 +20,8 @@ closure-i18n = { git = "https://github.com/Fokiiiiiii/closure" }
 plugin-kit = { path = "crates/plugin-kit" }
 plugin-linkexpand = { path = "crates/plugin-linkexpand" }
 plugin-starboard = { path = "crates/plugin-starboard" }
+plugin-leveling = { path = "crates/plugin-leveling" }
+plugin-translate = { path = "crates/plugin-translate" }
 
 anyhow = "1"
 async-trait = "0.1"

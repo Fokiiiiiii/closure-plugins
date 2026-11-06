@@ -13,6 +13,8 @@ anyhow.workspace = true
 closure-core.workspace = true
 plugin-linkexpand.workspace = true
 plugin-starboard.workspace = true
+plugin-leveling.workspace = true
+plugin-translate.workspace = true
 
 [lints]
 workspace = true

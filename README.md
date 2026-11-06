@@ -7,6 +7,7 @@ the dashboard, a switch per server, permissions and capabilities checked by the 
 | Plugin | What it does |
 | --- | --- |
 | `plugin-linkexpand` | Answers a link to a message of the server (a quote) and a link to a post on X (text, pictures, counts, video) with a preview. A link in `<...>` is left alone, and a message is quoted only for someone who can read its channel. |
+| `plugin-leveling` | Experience for messages (once in a cooldown), levels that take more as they go up, role rewards, announcements, `/rank`, `/leaderboard` and `/xp add\|set\|reset` for moderators. |
 | `plugin-starboard` | Posts a message that gets enough of an emoji (⭐ by default) to a channel, and keeps its count up to date. Age-restricted and non-public channels are never posted. |
 
 `plugin-kit` holds what the plugins share, and `closure-plugins` lists them all in one function:

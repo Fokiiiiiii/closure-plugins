@@ -100,8 +100,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "closure-core",
+ "plugin-leveling",
  "plugin-linkexpand",
  "plugin-starboard",
+ "plugin-translate",
 ]
 
 [[package]]
@@ -523,8 +525,32 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "plugin-kit"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde_json",
+ "tokio",
  "twilight-model",
  "twilight-util",
+]
+
+[[package]]
+name = "plugin-leveling"
+version = "0.1.0"
+dependencies = [
+ "closure-core",
+ "closure-i18n",
+ "closure-sdk",
+ "plugin-kit",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "twilight-model",
 ]
 
 [[package]]
@@ -536,13 +562,8 @@ dependencies = [
  "closure-core",
  "closure-i18n",
  "closure-sdk",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
  "plugin-kit",
  "regex",
- "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -565,6 +586,20 @@ dependencies = [
  "tracing",
  "twilight-model",
  "twilight-util",
+]
+
+[[package]]
+name = "plugin-translate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "closure-core",
+ "closure-i18n",
+ "closure-sdk",
+ "plugin-kit",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

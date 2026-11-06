@@ -13,24 +13,17 @@ anyhow.workspace = true
 async-trait.workspace = true
 closure-core.workspace = true
 closure-sdk.workspace = true
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-rustls.workspace = true
-hyper-util.workspace = true
 plugin-kit.workspace = true
 regex.workspace = true
-# Not used in code: enabling its `ring` feature once makes rustls pick the crypto provider for
-# every TLS user in the process (Twilight, hyper-rustls) without a manual install step.
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 twilight-model.workspace = true
 twilight-util.workspace = true
 
 [dev-dependencies]
 closure-i18n.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

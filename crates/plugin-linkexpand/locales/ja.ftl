@@ -1,4 +1,15 @@
 module-description = このサーバーのメッセージへのリンクや X の投稿へのリンクに、中身のプレビューを返します。
 config-linkexpand-message_links = このサーバーのメッセージへのリンクに、そのメッセージを引用して返す。
 config-linkexpand-x_links = X の投稿へのリンクに、本文・画像・反応数を返す。
+config-linkexpand-replied_post = X の投稿が返信なら、返信先の投稿を前に出す。
+config-linkexpand-quoted_post = X の投稿が引用なら、引用元の投稿を後ろに出す。
+config-linkexpand-translate_button = X の投稿を翻訳するボタンを付ける。
 linkexpand-source = 元のメッセージ
+linkexpand-open = X で見る
+linkexpand-delete = 削除
+linkexpand-translate = 翻訳
+linkexpand-delete-reason = リンクを貼った人がプレビューを消した
+linkexpand-replied-to = 返信先の投稿
+linkexpand-quoted = 引用された投稿
+linkexpand-reposted-by = リポスト:
+linkexpand-translate-failed = いま翻訳できませんでした。少し待ってからもう一度お試しください。

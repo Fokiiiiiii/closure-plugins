@@ -2,6 +2,9 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod net;
+pub mod translate;
+
 use twilight_model::channel::message::Embed;
 use twilight_model::util::Timestamp;
 use twilight_util::builder::embed::{
@@ -24,6 +27,20 @@ pub fn truncate(text: &str, limit: usize) -> String {
 #[must_use]
 pub fn image(url: &str) -> Option<ImageSource> {
     ImageSource::url(url).ok()
+}
+
+/// A number with its thousands told apart: `12468` is `12,468`.
+#[must_use]
+pub fn grouped(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// A message of the server, as it is quoted.

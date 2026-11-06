@@ -1,6 +1,6 @@
 [package]
 name = "plugin-kit"
-description = "What the plugins of closure share: quoting a message as an embed"
+description = "What the plugins of closure share: quoting a message as an embed, reading pages, translating"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,22 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+# Not used in code: enabling its `ring` feature once makes rustls pick the crypto provider for
+# every TLS user in the process (Twilight, hyper-rustls) without a manual install step.
+rustls.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 twilight-model.workspace = true
 twilight-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true
