@@ -16,9 +16,9 @@ mod x;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use closure_core::action::{Action, Outcome, Reason};
+use closure_core::action::{Action, FileUpload, Outcome, Reason};
 use closure_core::error::ModuleError;
-use closure_core::event::{ChannelId, Event, EventKind, MessageInfo, RoleId};
+use closure_core::event::{ChannelId, Event, EventKind, MessageId, MessageInfo, RoleId};
 use closure_core::module::EventContext;
 use closure_core::subscription::Flow;
 use closure_sdk::ui::{self, CustomId};
@@ -30,13 +30,14 @@ use plugin_kit::translate;
 use plugin_kit::{Quoted, quote_embed};
 use serde::Deserialize;
 use serde_json::json;
-use twilight_model::channel::message::Embed;
 use twilight_model::channel::message::component::ButtonStyle;
+use twilight_model::channel::message::embed::EmbedThumbnail;
+use twilight_model::channel::message::{Component, Embed};
 use twilight_model::channel::{Channel, Message};
 use twilight_model::guild::Permissions;
 use twilight_util::permission_calculator::PermissionCalculator;
 
-use crate::links::{MAX_PER_MESSAGE, MessageLink};
+use crate::links::MessageLink;
 
 pub use plugin_kit::net::{Fetcher, Get};
 
@@ -45,6 +46,17 @@ const JA: &str = include_str!("../locales/ja.ftl");
 /// The most characters of a quoted text: three quotes have to fit in one message.
 const QUOTE_CHARS: usize = 1200;
 const VIEW: Permissions = Permissions::VIEW_CHANNEL.union(Permissions::READ_MESSAGE_HISTORY);
+
+/// How the posts of a thread are laid out in Discord.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Layout {
+    /// One message with an embed for each post.
+    #[default]
+    Embeds,
+    /// A message for each post, each answering the one before it.
+    Chain,
+}
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -61,6 +73,9 @@ struct Config {
     quoted_post: bool,
     /// A button that translates the post.
     translate_button: bool,
+    /// Hide the preview Discord made of the link, which the answer repeats.
+    hide_original: bool,
+    layout: Layout,
 }
 
 impl Default for Config {
@@ -71,6 +86,8 @@ impl Default for Config {
             replied_post: true,
             quoted_post: true,
             translate_button: true,
+            hide_original: true,
+            layout: Layout::Embeds,
         }
     }
 }
@@ -193,6 +210,102 @@ fn labels(ctx: &EventContext) -> x::Labels {
     }
 }
 
+/// One message of the answer: an embed, and what is attached to it.
+struct Unit {
+    embed: Embed,
+    photos: Vec<String>,
+    video: Option<String>,
+    /// The link of the post, for a video that is too large to attach.
+    link: Option<String>,
+    /// Whether this is what the writer linked, and not the post it answers or quotes.
+    main: bool,
+}
+
+/// The most messages one answer is made of. The button that takes the answer away names the others
+/// in its `custom_id`, which has room for three ids besides its own.
+const MAX_UNITS: usize = 4;
+/// The most bytes of files in one message: Discord's limit, with room to spare.
+const MAX_FILES_BYTES: usize = 9_000_000;
+
+fn extension_of(url: &str) -> &str {
+    let name = url.split('?').next().unwrap_or(url);
+    match name.rsplit('.').next() {
+        Some(ext @ ("jpg" | "jpeg" | "png" | "gif" | "webp" | "mp4")) => ext,
+        _ => "jpg",
+    }
+}
+
+/// The pictures and the video of a unit as files, and a player link when the video does not fit.
+async fn attachments(fetch: &dyn Get, unit: &Unit) -> (Vec<FileUpload>, Option<String>) {
+    let mut files = Vec::new();
+    let mut room = MAX_FILES_BYTES;
+    for (at, url) in unit.photos.iter().enumerate() {
+        if let Ok(data) = fetch.get_large(url, room).await {
+            room -= data.len();
+            files.push(FileUpload {
+                filename: format!("photo-{}.{}", at + 1, extension_of(url)),
+                data,
+            });
+        }
+    }
+    let mut player = None;
+    if let Some(url) = &unit.video {
+        match fetch.get_large(url, room).await {
+            Ok(data) => files.push(FileUpload {
+                filename: format!("video.{}", extension_of(url)),
+                data,
+            }),
+            Err(error) => {
+                tracing::debug!(%error, "a video is not attached");
+                player = unit.link.as_deref().map(x::player_link);
+            }
+        }
+    }
+    (files, player)
+}
+
+/// The buttons under the last message of the answer.
+fn buttons(
+    ctx: &EventContext,
+    config: &Config,
+    posted_by: closure_core::event::UserId,
+    translate: &[u64],
+    open: Option<&str>,
+    earlier: &[MessageId],
+) -> Vec<Component> {
+    let say = |key: &str| ctx.t_in(ctx.locale, key, &Args::new());
+    let mut row = Vec::new();
+    if config.translate_button {
+        for (at, id) in translate.iter().take(3).enumerate() {
+            let label = if translate.len() > 1 {
+                format!("{} {}", say("linkexpand-translate"), at + 1)
+            } else {
+                say("linkexpand-translate")
+            };
+            let custom = CustomId::new("translate").data(id.to_string());
+            row.push(ui::button(
+                ButtonStyle::Secondary,
+                label,
+                custom.encode(&ctx.module),
+            ));
+        }
+    }
+    if let Some(link) = open {
+        row.push(ui::link_button(say("linkexpand-open"), link));
+    }
+    // Whoever posted the link can take the whole answer away again.
+    let ids: Vec<String> = earlier.iter().map(ToString::to_string).collect();
+    let delete = CustomId::new("delete")
+        .only_for(posted_by)
+        .data(ids.join(","));
+    row.push(ui::button(
+        ButtonStyle::Danger,
+        say("linkexpand-delete"),
+        delete.encode(&ctx.module),
+    ));
+    vec![ui::row(row)]
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one flow: find the links, expand them, answer"
@@ -209,30 +322,32 @@ async fn on_message(
         return Ok(Flow::Continue);
     }
     let config: Config = ctx.parse_config()?;
-    let mut embeds: Vec<Embed> = Vec::new();
-    let mut videos: Vec<String> = Vec::new();
+    let mut units: Vec<Unit> = Vec::new();
     let mut translate: Vec<u64> = Vec::new();
     let mut open: Option<String> = None;
-    let mut budget = MAX_PER_MESSAGE;
     if config.message_links {
         for link in links::message_links(&message.content) {
             // Only the server the message is in: another server's messages are not for here.
-            if link.guild != ctx.guild_id.get() || budget == 0 {
+            if link.guild != ctx.guild_id.get() || units.len() >= MAX_UNITS {
                 continue;
             }
             match quote_of(&ctx, message, &link).await {
-                Ok(embed) => {
-                    embeds.push(embed);
-                    budget -= 1;
-                }
+                Ok(embed) => units.push(Unit {
+                    embed,
+                    photos: Vec::new(),
+                    video: None,
+                    link: None,
+                    main: true,
+                }),
                 Err(error) => tracing::debug!(%error, "a message link is not expanded"),
             }
         }
     }
+    let mut expanded_post = false;
     if config.x_links {
         let words = labels(&ctx);
         for link in links::post_links(&message.content) {
-            if budget == 0 {
+            if units.len() >= MAX_UNITS {
                 break;
             }
             let tweet = match fetch_post(&*fetch, link.id).await {
@@ -249,62 +364,83 @@ async fn on_message(
                 }
                 _ => None,
             };
-            let shown = x::expand(
-                &tweet,
-                parent.as_ref(),
-                config.quoted_post,
-                &words,
-                QUOTE_CHARS,
-            );
-            embeds.extend(shown.embeds);
-            videos.extend(shown.video);
-            open.get_or_insert(shown.link);
+            // The quoted post comes whole, so that it has its counts.
+            let full = match tweet.quote_id() {
+                Some(id) if config.quoted_post => fetch_post(&*fetch, id).await.ok(),
+                _ => None,
+            };
+            let quoted = if config.quoted_post {
+                full.as_ref().or(tweet.quote.as_deref())
+            } else {
+                None
+            };
+            let mut shown = x::pieces(&tweet, parent.as_ref(), quoted, &words, QUOTE_CHARS);
+            // What does not fit goes: the post that was linked stays.
+            while units.len() + shown.len() > MAX_UNITS {
+                if let Some(at) = shown.iter().position(|p| !p.main) {
+                    shown.remove(at);
+                } else {
+                    break;
+                }
+            }
+            for piece in shown {
+                if piece.main {
+                    open.get_or_insert_with(|| piece.link.clone());
+                }
+                units.push(Unit {
+                    embed: piece.embed,
+                    photos: piece.photos,
+                    video: piece.video,
+                    link: Some(piece.link),
+                    main: piece.main,
+                });
+            }
             translate.push(link.id);
-            budget -= 1;
+            expanded_post = true;
         }
     }
-    embeds.truncate(10);
-    if embeds.is_empty() && videos.is_empty() {
+    if units.is_empty() {
         return Ok(Flow::Continue);
     }
-    let say = |key: &str| ctx.t_in(ctx.locale, key, &Args::new());
-    let mut buttons = Vec::new();
-    if config.translate_button {
-        let several = translate.len() > 1;
-        for (at, id) in translate.iter().take(3).enumerate() {
-            let label = if several {
-                format!("{} {}", say("linkexpand-translate"), at + 1)
-            } else {
-                say("linkexpand-translate")
-            };
-            let custom = CustomId::new("translate").data(id.to_string());
-            buttons.push(ui::button(
-                ButtonStyle::Secondary,
-                label,
-                custom.encode(&ctx.module),
-            ));
+    match config.layout {
+        Layout::Chain => {
+            send_chain(
+                &ctx,
+                &*fetch,
+                message,
+                &units,
+                &config,
+                &translate,
+                open.as_deref(),
+            )
+            .await?;
+        }
+        Layout::Embeds => {
+            send_embeds(
+                &ctx,
+                &*fetch,
+                message,
+                units,
+                &config,
+                &translate,
+                open.as_deref(),
+            )
+            .await?;
         }
     }
-    if let Some(link) = open {
-        buttons.push(ui::link_button(say("linkexpand-open"), link));
+    if expanded_post && config.hide_original {
+        // Discord's own preview of the link would repeat the answer; this needs Manage Messages.
+        let hidden = ctx
+            .api
+            .execute(Action::SuppressEmbeds {
+                channel_id: message.channel_id,
+                message_id: message.id,
+            })
+            .await;
+        if let Err(error) = hidden {
+            tracing::debug!(?error, "the preview of the link stays");
+        }
     }
-    // Whoever posted the link can take the answer away again.
-    let delete = CustomId::new("delete").only_for(message.author.id);
-    buttons.push(ui::button(
-        ButtonStyle::Danger,
-        say("linkexpand-delete"),
-        delete.encode(&ctx.module),
-    ));
-    ctx.api
-        .execute(Action::PostMessage {
-            channel_id: message.channel_id,
-            message_id: None,
-            reply_to: Some(message.id),
-            content: (!videos.is_empty()).then(|| videos.join("\n")),
-            embeds,
-            components: vec![ui::row(buttons)],
-        })
-        .await?;
     Ok(Flow::Continue)
 }
 
@@ -335,12 +471,25 @@ async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), Use
     .await
 }
 
-/// Takes the answer away; only the one who posted the link gets this far.
+/// Takes the answer away, all of its messages; only the one who posted the link gets this far.
 async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
     cx.defer_update().await?;
     let click = cx.click();
     let reason = Reason::new(cx.t("linkexpand-delete-reason", &Args::new()))
         .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+    // The messages before this one are named in the button; they may be gone already.
+    for id in cx
+        .data()
+        .split(',')
+        .filter_map(|id| id.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+        .take(MAX_UNITS - 1)
+    {
+        let _ = cx
+            .api()
+            .delete_message(click.channel_id, MessageId::new(id), reason.clone())
+            .await;
+    }
     cx.api()
         .delete_message(click.channel_id, click.message_id, reason)
         .await
@@ -368,7 +517,14 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
             "x_links": switch("x_links"),
             "replied_post": switch("replied_post"),
             "quoted_post": switch("quoted_post"),
-            "translate_button": switch("translate_button")
+            "translate_button": switch("translate_button"),
+            "hide_original": switch("hide_original"),
+            "layout": {
+                "type": "string",
+                "enum": ["embeds", "chain"],
+                "description": "config-linkexpand-layout",
+                "x-ui": { "level": "basic" }
+            }
         }
     });
     let for_message = Arc::clone(&fetch);
@@ -384,7 +540,8 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
                 schema,
                 json!({
                     "message_links": true, "x_links": true, "replied_post": true,
-                    "quoted_post": true, "translate_button": true
+                    "quoted_post": true, "translate_button": true, "hide_original": true,
+                    "layout": "embeds"
                 }),
             )
             .on(
@@ -411,3 +568,90 @@ pub fn module() -> Result<SdkModule, CoreError> {
 
 #[cfg(test)]
 mod tests;
+/// All of the answer in one message: an embed for each post, and the pictures and the video of
+/// what was linked attached. A post shown for the sake of another has its first picture as a small
+/// one in its embed, so that it is clear whose it is.
+async fn send_embeds(
+    ctx: &EventContext,
+    fetch: &dyn Get,
+    message: &MessageInfo,
+    units: Vec<Unit>,
+    config: &Config,
+    translate: &[u64],
+    open: Option<&str>,
+) -> Result<(), ModuleError> {
+    let mut files = Vec::new();
+    let mut player = None;
+    let mut embeds = Vec::new();
+    for mut unit in units {
+        if unit.main {
+            let (more, link) = attachments(fetch, &unit).await;
+            files.extend(more);
+            player = player.or(link);
+        } else if let Some(url) = unit
+            .photos
+            .first()
+            .filter(|url| url.starts_with("https://"))
+        {
+            unit.embed.thumbnail = Some(EmbedThumbnail {
+                url: url.clone(),
+                proxy_url: None,
+                height: None,
+                width: None,
+            });
+        }
+        embeds.push(unit.embed);
+    }
+    ctx.api
+        .execute(Action::PostMessage {
+            channel_id: message.channel_id,
+            message_id: None,
+            reply_to: Some(message.id),
+            content: player,
+            embeds,
+            components: buttons(ctx, config, message.author.id, translate, open, &[]),
+            files,
+        })
+        .await?;
+    Ok(())
+}
+
+/// The answer as a message for each post, each answering the one before it; the buttons are under
+/// the last one and take them all away.
+async fn send_chain(
+    ctx: &EventContext,
+    fetch: &dyn Get,
+    message: &MessageInfo,
+    units: &[Unit],
+    config: &Config,
+    translate: &[u64],
+    open: Option<&str>,
+) -> Result<(), ModuleError> {
+    let mut previous = message.id;
+    let mut sent: Vec<MessageId> = Vec::new();
+    for (at, unit) in units.iter().enumerate() {
+        let (files, player) = attachments(fetch, unit).await;
+        let components = if at + 1 == units.len() {
+            buttons(ctx, config, message.author.id, translate, open, &sent)
+        } else {
+            Vec::new()
+        };
+        let posted = ctx
+            .api
+            .execute(Action::PostMessage {
+                channel_id: message.channel_id,
+                message_id: None,
+                reply_to: Some(previous),
+                content: player,
+                embeds: vec![unit.embed.clone()],
+                components,
+                files,
+            })
+            .await?;
+        if let Outcome::Message(posted) = posted {
+            previous = posted.id;
+            sent.push(posted.id);
+        }
+    }
+    Ok(())
+}

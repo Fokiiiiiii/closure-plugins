@@ -1,7 +1,8 @@
-//! A post on X, as the `FxTwitter` service gives it, and the embeds it becomes.
+//! A post on X, as the `FxTwitter` service gives it, and the messages it becomes.
 //!
 //! A post is shown with what it answers or quotes: the post it replies to comes before it, the
-//! post it quotes after it, each as a small embed of its own.
+//! post it quotes after it, each as a message of its own (the caller chains them as replies). Its
+//! pictures and video are not in the embed: the caller attaches them as files.
 
 use anyhow::{Context as _, Result};
 use plugin_kit::{grouped, image, truncate};
@@ -11,12 +12,8 @@ use twilight_model::util::Timestamp;
 use twilight_util::builder::embed::{EmbedAuthorBuilder, EmbedBuilder, EmbedFooterBuilder};
 
 const X_COLOR: u32 = 0x1D_9BF0;
-/// The colour of a post that is shown for the sake of another.
-const RELATED_COLOR: u32 = 0x53_5C_65;
 /// Discord shows at most four pictures of one post together.
 const MAX_PHOTOS: usize = 4;
-/// The most characters of a post that is shown for the sake of another.
-const RELATED_CHARS: usize = 500;
 
 #[derive(Debug, Deserialize)]
 struct FxResponse {
@@ -32,12 +29,13 @@ pub struct Tweet {
     pub author: TweetAuthor,
     #[serde(default)]
     pub media: Media,
+    /// The counts, when the service gave them: a quoted post inside another may come without.
     #[serde(default)]
-    pub likes: u64,
+    pub likes: Option<u64>,
     #[serde(default)]
-    pub retweets: u64,
+    pub retweets: Option<u64>,
     #[serde(default)]
-    pub replies: u64,
+    pub replies: Option<u64>,
     pub created_timestamp: Option<i64>,
     /// The post this one quotes.
     #[serde(default)]
@@ -80,6 +78,19 @@ pub fn parse_tweet(bytes: &[u8]) -> Result<Tweet> {
 }
 
 impl Tweet {
+    /// The id of the post this one quotes.
+    #[must_use]
+    pub fn quote_id(&self) -> Option<u64> {
+        let url = &self.quote.as_ref()?.url;
+        url.split('?')
+            .next()?
+            .rsplit('/')
+            .next()?
+            .parse()
+            .ok()
+            .filter(|id| *id > 0)
+    }
+
     /// The id of the post this one replies to, when it is one.
     #[must_use]
     pub fn parent_id(&self) -> Option<u64> {
@@ -101,13 +112,17 @@ pub struct Labels {
     pub reposted_by: String,
 }
 
-/// What a post becomes in Discord: its embeds, the link of its video (posted as plain text, which
-/// Discord plays), and its own link.
+/// A post as one message: its embed, its pictures and video to attach, and its own link.
 #[derive(Debug)]
-pub struct Expanded {
-    pub embeds: Vec<Embed>,
+pub struct Piece {
+    pub embed: Embed,
+    /// The pictures, at most four.
+    pub photos: Vec<String>,
+    /// The video, or the animation.
     pub video: Option<String>,
     pub link: String,
+    /// Whether this is the post that was linked, and not the one it answers or quotes.
+    pub main: bool,
 }
 
 fn author_line(author: &TweetAuthor) -> EmbedAuthorBuilder {
@@ -122,89 +137,113 @@ fn author_line(author: &TweetAuthor) -> EmbedAuthorBuilder {
     line
 }
 
-/// A post shown for the sake of another: who, what, a picture, and why it is there.
-fn related(tweet: &Tweet, label: &str) -> Embed {
+/// The counts under a post, such as `💬 32  🔁 1,628  ❤ 12,468`; the ones the service did not give
+/// are left out.
+fn counts(tweet: &Tweet) -> Option<String> {
+    let parts: Vec<String> = [
+        ("💬", tweet.replies),
+        ("🔁", tweet.retweets),
+        ("❤", tweet.likes),
+    ]
+    .into_iter()
+    .filter_map(|(mark, count)| Some(format!("{mark} {}", grouped(count?))))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join("  "))
+}
+
+/// The colour of the bar of a post that is shown for the sake of another: what a reader needs to
+/// tell it from the post that was linked.
+const REPLIED_COLOR: u32 = 0x8E_95_9E;
+const QUOTED_COLOR: u32 = 0xA3_6C_F5;
+const REPOST_COLOR: u32 = 0x00_BA_7C;
+
+/// One post as a message. `title` says what the post is to the one that was linked (the post it
+/// answers, the post it quotes, or a repost) and `color` is its bar.
+fn piece(tweet: &Tweet, title: Option<String>, color: u32, limit: usize, main: bool) -> Piece {
     let mut embed = EmbedBuilder::new()
-        .color(RELATED_COLOR)
+        .color(color)
         .author(author_line(&tweet.author))
-        .footer(EmbedFooterBuilder::new(label))
         .url(&tweet.url);
+    if let Some(counts) = counts(tweet) {
+        embed = embed.footer(EmbedFooterBuilder::new(counts));
+    }
+    if let Some(title) = title {
+        embed = embed.title(title);
+    }
     if !tweet.text.trim().is_empty() {
-        embed = embed.description(truncate(&tweet.text, RELATED_CHARS));
-    }
-    if let Some(picture) = tweet
-        .media
-        .photos
-        .first()
-        .and_then(|photo| image(&photo.url))
-    {
-        embed = embed.image(picture);
-    }
-    embed.build()
-}
-
-/// The counts under a post, such as `💬 32  🔁 1,628  ❤ 12,468`.
-fn counts(tweet: &Tweet) -> String {
-    format!(
-        "💬 {}  🔁 {}  ❤ {}",
-        grouped(tweet.replies),
-        grouped(tweet.retweets),
-        grouped(tweet.likes)
-    )
-}
-
-/// Expands `tweet`, with the post it replies to (`parent`, fetched by the caller) before it and
-/// the post it quotes after it, when asked.
-#[must_use]
-pub fn expand(
-    tweet: &Tweet,
-    parent: Option<&Tweet>,
-    show_quote: bool,
-    labels: &Labels,
-    limit: usize,
-) -> Expanded {
-    let mut footer_text = counts(tweet);
-    if let Some(reposter) = &tweet.reposted_by {
-        footer_text = format!("{} {}  ·  {footer_text}", labels.reposted_by, reposter.name);
-    }
-    let mut first = EmbedBuilder::new()
-        .color(X_COLOR)
-        .author(author_line(&tweet.author))
-        .footer(EmbedFooterBuilder::new(footer_text))
-        .url(&tweet.url);
-    if !tweet.text.trim().is_empty() {
-        first = first.description(truncate(&tweet.text, limit));
+        embed = embed.description(truncate(&tweet.text, limit));
     }
     if let Some(at) = tweet
         .created_timestamp
         .and_then(|s| Timestamp::from_secs(s).ok())
     {
-        first = first.timestamp(at);
+        embed = embed.timestamp(at);
     }
-    let mut photos = tweet
-        .media
-        .photos
-        .iter()
-        .take(MAX_PHOTOS)
-        .filter_map(|p| image(&p.url));
-    if let Some(picture) = photos.next() {
-        first = first.image(picture);
-    }
-    let mut embeds: Vec<Embed> = parent
-        .into_iter()
-        .map(|parent| related(parent, &labels.replied_to))
-        .collect();
-    embeds.push(first.build());
-    // Embeds with the same link are shown as one gallery.
-    embeds.extend(photos.map(|picture| EmbedBuilder::new().url(&tweet.url).image(picture).build()));
-    if show_quote && let Some(quoted) = &tweet.quote {
-        embeds.push(related(quoted, &labels.quoted));
-    }
-    Expanded {
-        embeds,
+    Piece {
+        embed: embed.build(),
+        photos: tweet
+            .media
+            .photos
+            .iter()
+            .take(MAX_PHOTOS)
+            .map(|p| p.url.clone())
+            .collect(),
         video: tweet.media.videos.first().map(|v| v.url.clone()),
         link: tweet.url.clone(),
+        main,
     }
+}
+
+/// The messages of `tweet`: the post it replies to (`parent`, fetched by the caller) first, then
+/// the post itself, then the post it quotes (`quoted`: the nested one is enough, but the caller can
+/// give the whole post, which has the counts).
+#[must_use]
+pub fn pieces(
+    tweet: &Tweet,
+    parent: Option<&Tweet>,
+    quoted: Option<&Tweet>,
+    labels: &Labels,
+    limit: usize,
+) -> Vec<Piece> {
+    let mut all: Vec<Piece> = parent
+        .into_iter()
+        .map(|parent| {
+            piece(
+                parent,
+                Some(labels.replied_to.clone()),
+                REPLIED_COLOR,
+                limit,
+                false,
+            )
+        })
+        .collect();
+    match &tweet.reposted_by {
+        Some(who) => all.push(piece(
+            tweet,
+            Some(format!("{} {}", labels.reposted_by, who.name)),
+            REPOST_COLOR,
+            limit,
+            true,
+        )),
+        None => all.push(piece(tweet, None, X_COLOR, limit, true)),
+    }
+    if let Some(quoted) = quoted {
+        all.push(piece(
+            quoted,
+            Some(labels.quoted.clone()),
+            QUOTED_COLOR,
+            limit,
+            false,
+        ));
+    }
+    all
+}
+
+/// The address of a post at a service that Discord shows with a player, for a video that is too
+/// large to attach.
+#[must_use]
+pub fn player_link(link: &str) -> String {
+    link.replacen("https://x.com/", "https://fixupx.com/", 1)
 }
 
 #[cfg(test)]
@@ -234,22 +273,31 @@ mod tests {
     }
 
     #[test]
-    fn a_post_becomes_a_gallery_a_video_link_and_counts() {
+    fn a_post_is_one_message_with_its_pictures_and_video_to_attach() {
         let tweet = parse_tweet(POST.as_bytes()).unwrap();
-        let shown = expand(&tweet, None, false, &labels(), 1000);
-        assert_eq!(shown.embeds.len(), 2, "one embed per picture");
-        let first = &shown.embeds[0];
-        assert_eq!(first.author.as_ref().unwrap().name, "jack (@jack)");
+        let shown = pieces(&tweet, None, None, &labels(), 1000);
+        assert_eq!(shown.len(), 1);
+        let first = &shown[0];
+        assert!(first.main);
+        assert_eq!(first.embed.author.as_ref().unwrap().name, "jack (@jack)");
         assert_eq!(
-            first.description.as_deref(),
+            first.embed.description.as_deref(),
             Some("just setting up my twttr")
         );
-        assert_eq!(first.url.as_deref(), Some("https://x.com/jack/status/20"));
-        assert_eq!(shown.embeds[1].url, first.url);
-        let footer = &first.footer.as_ref().unwrap().text;
-        assert_eq!(footer, "💬 32  🔁 1,628  ❤ 12,468");
-        assert_eq!(shown.video.as_deref(), Some("https://video.example/v.mp4"));
-        assert_eq!(shown.link, "https://x.com/jack/status/20");
+        assert!(
+            first.embed.image.is_none(),
+            "the pictures are attached, not embedded"
+        );
+        assert_eq!(
+            first.embed.footer.as_ref().unwrap().text,
+            "💬 32  🔁 1,628  ❤ 12,468"
+        );
+        assert_eq!(
+            first.photos,
+            ["https://pbs.example/1.jpg", "https://pbs.example/2.jpg"]
+        );
+        assert_eq!(first.video.as_deref(), Some("https://video.example/v.mp4"));
+        assert_eq!(first.link, "https://x.com/jack/status/20");
     }
 
     #[test]
@@ -257,28 +305,33 @@ mod tests {
         let tweet = parse_tweet(POST.as_bytes()).unwrap();
         assert_eq!(tweet.parent_id(), Some(19));
         let parent = parse_tweet(PARENT.as_bytes()).unwrap();
-        let shown = expand(&tweet, Some(&parent), true, &labels(), 1000);
+        let shown = pieces(
+            &tweet,
+            Some(&parent),
+            tweet.quote.as_deref(),
+            &labels(),
+            1000,
+        );
         let texts: Vec<Option<&str>> = shown
-            .embeds
             .iter()
-            .map(|e| e.description.as_deref())
+            .map(|p| p.embed.description.as_deref())
             .collect();
         assert_eq!(
             texts,
             [
                 Some("the first post"),
                 Some("just setting up my twttr"),
-                None,
                 Some("quoted words")
             ]
         );
-        assert_eq!(shown.embeds[0].footer.as_ref().unwrap().text, "In reply to");
-        let last = shown.embeds.last().unwrap();
-        assert_eq!(last.footer.as_ref().unwrap().text, "Quoted");
         assert_eq!(
-            last.image.as_ref().unwrap().url,
-            "https://pbs.example/q.jpg"
+            shown.iter().map(|p| p.main).collect::<Vec<_>>(),
+            [false, true, false]
         );
+        assert_eq!(shown[0].embed.title.as_deref(), Some("In reply to"));
+        assert_eq!(shown[2].embed.title.as_deref(), Some("Quoted"));
+        assert_ne!(shown[0].embed.color, shown[2].embed.color);
+        assert_eq!(shown[2].photos, ["https://pbs.example/q.jpg"]);
     }
 
     #[test]
@@ -289,14 +342,18 @@ mod tests {
         );
         let tweet = parse_tweet(json.as_bytes()).unwrap();
         assert_eq!(tweet.parent_id(), None);
-        let shown = expand(&tweet, None, false, &labels(), 1000);
-        assert_eq!(shown.embeds.len(), 2);
-        let footer = &shown.embeds[0].footer.as_ref().unwrap().text;
-        assert!(footer.starts_with("Reposted by kit  ·  💬 32"), "{footer}");
+        let shown = pieces(&tweet, None, None, &labels(), 1000);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].embed.title.as_deref(), Some("Reposted by kit"));
+        assert_eq!(shown[0].embed.color, Some(REPOST_COLOR));
+        assert_eq!(
+            shown[0].embed.footer.as_ref().unwrap().text,
+            "💬 32  🔁 1,628  ❤ 12,468"
+        );
     }
 
     #[test]
-    fn at_most_four_pictures_are_shown() {
+    fn at_most_four_pictures_are_taken() {
         let photos: Vec<String> = (0..6)
             .map(|n| format!(r#"{{"url":"https://p.example/{n}.jpg"}}"#))
             .collect();
@@ -305,15 +362,23 @@ mod tests {
             "media":{{"photos":[{}]}}}}}}"#,
             photos.join(",")
         );
-        let shown = expand(
+        let shown = pieces(
             &parse_tweet(json.as_bytes()).unwrap(),
             None,
-            true,
+            None,
             &labels(),
             100,
         );
-        assert_eq!(shown.embeds.len(), MAX_PHOTOS);
-        assert!(shown.video.is_none());
+        assert_eq!(shown[0].photos.len(), MAX_PHOTOS);
+        assert!(shown[0].video.is_none());
+    }
+
+    #[test]
+    fn a_video_too_large_to_attach_is_shown_through_a_player_link() {
+        assert_eq!(
+            player_link("https://x.com/jack/status/20"),
+            "https://fixupx.com/jack/status/20"
+        );
     }
 
     #[test]

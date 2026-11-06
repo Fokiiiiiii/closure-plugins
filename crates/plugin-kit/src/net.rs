@@ -15,7 +15,9 @@ use hyper_util::rt::TokioExecutor;
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// A post's answer is a few kilobytes; more than this is not one.
 const MAX_BYTES: usize = 256 * 1024;
-const AGENT: &str = "unfurl (https://github.com/Fokiiiiiii/unfurl)";
+/// How long a picture or a video may take.
+const LARGE_TIMEOUT: Duration = Duration::from_secs(20);
+const AGENT: &str = "closure-plugins (https://github.com/Fokiiiiiii/closure-plugins)";
 
 /// Where the module reads a page from; a test puts its own in place of the network.
 #[async_trait]
@@ -25,6 +27,18 @@ pub trait Get: Send + Sync {
     /// # Errors
     /// The service is out of reach, slow, or answers with something else than a small success.
     async fn get(&self, url: &str) -> Result<Vec<u8>>;
+
+    /// The body of `url`, a picture or a video, of at most `max` bytes.
+    ///
+    /// # Errors
+    /// The file is out of reach, slow, or larger than `max`.
+    async fn get_large(&self, url: &str, max: usize) -> Result<Vec<u8>> {
+        let body = self.get(url).await?;
+        if body.len() > max {
+            bail!("the file is larger than the limit");
+        }
+        Ok(body)
+    }
 }
 
 pub struct Fetcher {
@@ -45,12 +59,12 @@ impl Fetcher {
     }
 
     /// The body of `url`. A redirect, an error status and a body past the limit are errors.
-    async fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+    async fn fetch(&self, url: &str, max: usize, within: Duration) -> Result<Vec<u8>> {
         let request = hyper::Request::get(url)
             .header("user-agent", AGENT)
-            .header("accept", "application/json")
+            .header("accept", "*/*")
             .body(Empty::<Bytes>::new())?;
-        tokio::time::timeout(TIMEOUT, async {
+        tokio::time::timeout(within, async {
             let response = self.client.request(request).await.context("asking")?;
             if !response.status().is_success() {
                 bail!("status {}", response.status());
@@ -59,7 +73,7 @@ impl Fetcher {
             let mut data = Vec::new();
             while let Some(frame) = body.frame().await {
                 if let Some(chunk) = frame.context("reading")?.data_ref() {
-                    if data.len() + chunk.len() > MAX_BYTES {
+                    if data.len() + chunk.len() > max {
                         bail!("the answer is larger than the limit");
                     }
                     data.extend_from_slice(chunk);
@@ -75,7 +89,11 @@ impl Fetcher {
 #[async_trait]
 impl Get for Fetcher {
     async fn get(&self, url: &str) -> Result<Vec<u8>> {
-        self.fetch(url).await
+        self.fetch(url, MAX_BYTES, TIMEOUT).await
+    }
+
+    async fn get_large(&self, url: &str, max: usize) -> Result<Vec<u8>> {
+        self.fetch(url, max, LARGE_TIMEOUT).await
     }
 }
 
