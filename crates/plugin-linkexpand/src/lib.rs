@@ -191,6 +191,13 @@ async fn quote_of(ctx: &EventContext, source: &MessageInfo, link: &MessageLink) 
     if !can_read(ctx, source.author.id, &source.author_roles, &channel).await? {
         bail!("the author cannot read that channel");
     }
+    // What the bot posts is read by everybody who reads where it is posted: a message of a channel
+    // that not everybody may read is quoted only in that same channel.
+    if channel_id != source.channel_id
+        && !can_read(ctx, closure_core::event::UserId::new(1), &[], &channel).await?
+    {
+        bail!("the channel is not one everybody may read");
+    }
     let target = ctx
         .api
         .get_message(

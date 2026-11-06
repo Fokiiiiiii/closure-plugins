@@ -261,6 +261,48 @@ async fn a_channel_the_author_cannot_read_is_not_quoted() {
     assert!(posted(&harness).is_empty());
 }
 
+fn role_with(id: u64, permissions: &str) -> Role {
+    serde_json::from_value(json!({
+        "id": id.to_string(), "name": format!("role-{id}"), "color": 0,
+        "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
+        "hoist": false, "managed": false, "mentionable": false,
+        "permissions": permissions, "position": 1, "flags": 0,
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_message_of_a_channel_not_everybody_reads_is_quoted_only_in_that_channel() {
+    // Channel 9 is hidden from `@everyone` and open to the role 77, which the author has.
+    let harness = harness(Fake(down));
+    let guild: GuildId = Id::new(GUILD);
+    harness.api().set_channels(
+        guild,
+        vec![channel(
+            9,
+            &json!([
+                {"id": GUILD.to_string(), "type": 0, "allow": "0", "deny": "1024"},
+                {"id": "77", "type": 0, "allow": "1024", "deny": "0"},
+            ]),
+        )],
+    );
+    harness
+        .api()
+        .set_roles(guild, vec![everyone(), role_with(77, "0")]);
+    let in_channel = |channel: u64| {
+        Message::new(50, channel)
+            .content("https://discord.com/channels/1/9/42")
+            .roles([77])
+    };
+    harness.message(in_channel(5)).await.unwrap();
+    assert!(
+        posted(&harness).is_empty(),
+        "the others in channel 5 may not read it"
+    );
+    harness.message(in_channel(9)).await.unwrap();
+    assert_eq!(posted(&harness).len(), 1, "in channel 9 they all may");
+}
+
 #[tokio::test]
 async fn other_servers_unwrapped_requests_and_bots_are_left_alone() {
     let harness = harness(Fake(down));
