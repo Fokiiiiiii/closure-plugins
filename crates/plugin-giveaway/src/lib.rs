@@ -15,6 +15,7 @@ use closure_core::action::{Action, MentionPolicy, Outcome};
 use closure_core::error::ModuleError;
 use closure_core::event::{ChannelId, MessageId};
 use closure_core::module::EventContext;
+use closure_core::storage::{Expect, StorageError};
 use closure_sdk::ui::{self, CustomId};
 use closure_sdk::{
     Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, EmbedBuilder, InteractionReply,
@@ -45,6 +46,10 @@ struct Giveaway {
     host: u64,
     #[serde(default)]
     ended: bool,
+    /// The result was told on the message; an end that stopped before that is finished by the
+    /// next run of the job.
+    #[serde(default)]
+    announced: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -142,21 +147,41 @@ enum Finish {
 }
 
 /// Ends the giveaway on `message` and draws its winners, or draws again when `redraw`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flow: claim the end, draw, edit the message, tell the winners"
+)]
 async fn finish(
     ctx: &EventContext,
     message: MessageId,
     redraw: bool,
 ) -> Result<Finish, ModuleError> {
-    let Some(mut giveaway) = ctx
-        .store()
-        .get::<Giveaway>(&giveaway_key(message))
-        .await
-        .map_err(|e| stored(&e))?
-    else {
+    let key = giveaway_key(message);
+    let Some(entry) = ctx.store().entry(&key).await.map_err(|e| stored(&e))? else {
         return Ok(Finish::Unknown);
     };
-    if giveaway.ended != redraw {
+    let mut giveaway: Giveaway = serde_json::from_value(entry.value)
+        .map_err(|error| ModuleError::other(error.to_string()))?;
+    let proceed = if redraw {
+        giveaway.ended
+    } else {
+        !giveaway.ended || !giveaway.announced
+    };
+    if !proceed {
         return Ok(Finish::WrongState);
+    }
+    if !redraw && !giveaway.ended {
+        // Whoever writes the end first draws: the one who loses the race finds it ended.
+        giveaway.ended = true;
+        match ctx
+            .store()
+            .replace(&key, &giveaway, Expect::Revision(entry.revision), None)
+            .await
+        {
+            Ok(_) => {}
+            Err(StorageError::Conflict) => return Ok(Finish::WrongState),
+            Err(error) => return Err(stored(&error)),
+        }
     }
     let winners = ctx
         .store()
@@ -166,11 +191,6 @@ async fn finish(
     let channel = ChannelId::new(giveaway.channel);
     let host = format!("<@{}>", giveaway.host);
     if !redraw {
-        giveaway.ended = true;
-        ctx.store()
-            .set(&giveaway_key(message), &giveaway)
-            .await
-            .map_err(|e| stored(&e))?;
         let text = if winners.is_empty() {
             ctx.t_in(
                 ctx.locale,
@@ -202,6 +222,13 @@ async fn finish(
         if let Err(error) = edited {
             tracing::debug!(?error, "the message of a giveaway was not edited");
         }
+    }
+    if !redraw {
+        giveaway.announced = true;
+        ctx.store()
+            .set(&key, &giveaway)
+            .await
+            .map_err(|e| stored(&e))?;
     }
     if winners.is_empty() {
         return Ok(Finish::NoEntries);
@@ -291,6 +318,7 @@ async fn start(cx: CommandCx, args: Start) -> Result<(), UserError> {
         ends: cx.now() + seconds,
         host: cx.user().id.get(),
         ended: false,
+        announced: false,
     };
     let text = ctx.t_in(
         ctx.locale,
@@ -406,7 +434,8 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
     else {
         return say_privately(&cx, cx.t("giveaway-not-found", &Args::new())).await;
     };
-    if giveaway.ended {
+    // The end is a job, which may run late: an entry after the time is too late all the same.
+    if giveaway.ended || cx.now() >= giveaway.ends {
         return say_privately(&cx, cx.t("giveaway-over", &Args::new())).await;
     }
     let name = entries_of(message);

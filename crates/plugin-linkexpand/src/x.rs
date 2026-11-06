@@ -125,6 +125,25 @@ pub struct Piece {
     pub main: bool,
 }
 
+/// Whether `url` is a file at the media servers of X. The service names the files of a post, and
+/// what it names is what the bot fetches or links, so a name that points anywhere else is not
+/// taken: not another host, not an address with a user name in it, not a plain `http` one.
+#[must_use]
+pub fn is_media(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains(['@', '\\', ':']) {
+        return false;
+    }
+    let host = authority.to_ascii_lowercase();
+    host == "twimg.com"
+        || host
+            .strip_suffix(".twimg.com")
+            .is_some_and(|name| !name.is_empty())
+}
+
 fn author_line(author: &TweetAuthor) -> EmbedAuthorBuilder {
     let mut line = EmbedAuthorBuilder::new(truncate(
         &format!("{} (@{})", author.name, author.screen_name),
@@ -185,10 +204,16 @@ fn piece(tweet: &Tweet, title: Option<String>, color: u32, limit: usize, main: b
             .media
             .photos
             .iter()
-            .take(MAX_PHOTOS)
             .map(|p| p.url.clone())
+            .filter(|url| is_media(url))
+            .take(MAX_PHOTOS)
             .collect(),
-        video: tweet.media.videos.first().map(|v| v.url.clone()),
+        video: tweet
+            .media
+            .videos
+            .first()
+            .map(|v| v.url.clone())
+            .filter(|url| is_media(url)),
         link: tweet.url.clone(),
         main,
     }
@@ -278,14 +303,14 @@ mod tests {
 
     const POST: &str = r#"{"code":200,"message":"OK","tweet":{
         "url":"https://x.com/jack/status/20","text":"just setting up my twttr",
-        "author":{"name":"jack","screen_name":"jack","avatar_url":"https://pbs.example/a.jpg"},
+        "author":{"name":"jack","screen_name":"jack","avatar_url":"https://pbs.twimg.com/a.jpg"},
         "likes":12468,"retweets":1628,"replies":32,"created_timestamp":1142974214,
         "replying_to_status":"19",
         "quote":{"url":"https://x.com/dom/status/5","text":"quoted words",
                  "author":{"name":"dom","screen_name":"dom"},
-                 "media":{"photos":[{"url":"https://pbs.example/q.jpg"}]}},
-        "media":{"photos":[{"url":"https://pbs.example/1.jpg"},{"url":"https://pbs.example/2.jpg"}],
-                 "videos":[{"url":"https://video.example/v.mp4"}]}}}"#;
+                 "media":{"photos":[{"url":"https://pbs.twimg.com/q.jpg"}]}},
+        "media":{"photos":[{"url":"https://pbs.twimg.com/1.jpg"},{"url":"https://pbs.twimg.com/2.jpg"}],
+                 "videos":[{"url":"https://video.twimg.com/v.mp4"}]}}}"#;
 
     const PARENT: &str = r#"{"tweet":{"url":"https://x.com/ev/status/19","text":"the first post",
         "author":{"name":"ev","screen_name":"ev"}}}"#;
@@ -320,9 +345,12 @@ mod tests {
         );
         assert_eq!(
             first.photos,
-            ["https://pbs.example/1.jpg", "https://pbs.example/2.jpg"]
+            ["https://pbs.twimg.com/1.jpg", "https://pbs.twimg.com/2.jpg"]
         );
-        assert_eq!(first.video.as_deref(), Some("https://video.example/v.mp4"));
+        assert_eq!(
+            first.video.as_deref(),
+            Some("https://video.twimg.com/v.mp4")
+        );
         assert_eq!(first.link, "https://x.com/jack/status/20");
     }
 
@@ -356,7 +384,7 @@ mod tests {
         assert_eq!(shown[0].embed.title.as_deref(), Some("In reply to"));
         assert_eq!(shown[2].embed.title.as_deref(), Some("Quoted"));
         assert_ne!(shown[0].embed.color, shown[2].embed.color);
-        assert_eq!(shown[2].photos, ["https://pbs.example/q.jpg"]);
+        assert_eq!(shown[2].photos, ["https://pbs.twimg.com/q.jpg"]);
     }
 
     #[test]
@@ -421,9 +449,33 @@ mod tests {
     }
 
     #[test]
+    fn only_files_at_the_media_servers_of_x_are_taken() {
+        for good in [
+            "https://pbs.twimg.com/media/a.jpg",
+            "https://video.twimg.com/amplify_video/1/vid/avc1/1920x1080/a.mp4?tag=29",
+            "https://TWIMG.com/a",
+        ] {
+            assert!(is_media(good), "{good}");
+        }
+        for bad in [
+            "http://pbs.twimg.com/a.jpg",
+            "https://twimg.com.evil.example/a.jpg",
+            "https://evil.example/pbs.twimg.com/a.jpg",
+            "https://pbs.twimg.com@evil.example/a.jpg",
+            "https://pbs.twimg.com:8080/a.jpg",
+            "https://127.0.0.1/a.jpg",
+            "https://nottwimg.com/a.jpg",
+            "https://pbs.twimg.com.example/a",
+            "",
+        ] {
+            assert!(!is_media(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn at_most_four_pictures_are_taken() {
         let photos: Vec<String> = (0..6)
-            .map(|n| format!(r#"{{"url":"https://p.example/{n}.jpg"}}"#))
+            .map(|n| format!(r#"{{"url":"https://pbs.twimg.com/{n}.jpg"}}"#))
             .collect();
         let json = format!(
             r#"{{"tweet":{{"url":"https://x.com/a/status/1","author":{{"name":"a","screen_name":"a"}},

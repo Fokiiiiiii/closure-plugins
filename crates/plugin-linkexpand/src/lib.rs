@@ -16,7 +16,7 @@ mod x;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use closure_core::action::{Action, FileUpload, Outcome, Reason};
+use closure_core::action::{Action, FileUpload, MAX_FILES, Outcome, Reason};
 use closure_core::error::ModuleError;
 use closure_core::event::{ChannelId, Event, EventKind, MessageId, MessageInfo, RoleId};
 use closure_core::module::EventContext;
@@ -708,11 +708,13 @@ pub fn module() -> Result<SdkModule, CoreError> {
 
 #[cfg(test)]
 mod tests;
-/// Posts one message of the answer, as a reply to `reply_to`, and tells its id.
+/// Posts one message of the answer, as a reply to `reply_to` when there is one, and tells its id.
+/// Only the first message of an answer replies, to the message that had the link: the messages of
+/// the answer do not reply to one another.
 async fn post(
     ctx: &EventContext,
     channel_id: ChannelId,
-    reply_to: MessageId,
+    reply_to: Option<MessageId>,
     content: Option<String>,
     embeds: Vec<Embed>,
     components: Vec<Component>,
@@ -723,7 +725,7 @@ async fn post(
         .execute(Action::PostMessage {
             channel_id,
             message_id: None,
-            reply_to: Some(reply_to),
+            reply_to,
             content,
             embeds,
             components,
@@ -741,14 +743,14 @@ async fn post(
 async fn post_videos(
     ctx: &EventContext,
     message: &MessageInfo,
-    after: MessageId,
+    reply_to: Option<MessageId>,
     videos: Vec<String>,
     components: Vec<Component>,
 ) -> Result<Option<MessageId>, ModuleError> {
     post(
         ctx,
         message.channel_id,
-        after,
+        reply_to,
         Some(videos.join("\n")),
         Vec::new(),
         components,
@@ -798,17 +800,20 @@ async fn send_embeds(
     let by = message.author.id;
     // The videos come first, as a message of their own; the message with the buttons names it.
     let mut earlier: Vec<MessageId> = Vec::new();
-    let mut after = message.id;
+    // The first message of the answer replies to the link; the others do not reply at all.
+    let mut reply_to = Some(message.id);
     if !videos.is_empty()
-        && let Some(id) = post_videos(ctx, message, after, videos, Vec::new()).await?
+        && let Some(id) = post_videos(ctx, message, reply_to, videos, Vec::new()).await?
     {
         earlier.push(id);
-        after = id;
+        reply_to = None;
     }
+    // Discord takes ten files in a message: what is over is left out, not the whole answer.
+    files.truncate(MAX_FILES);
     post(
         ctx,
         message.channel_id,
-        after,
+        reply_to,
         None,
         embeds,
         buttons(ctx, config, by, translate, open, &earlier),
@@ -818,8 +823,8 @@ async fn send_embeds(
     Ok(())
 }
 
-/// The answer as the videos in a message of their own, then a message for each post, each
-/// answering the one before it; the buttons are under the last one and take them all away.
+/// The answer as the videos in a message of their own, then a message for each post; the buttons
+/// are under the last one and take them all away.
 async fn send_chain(
     ctx: &EventContext,
     fetch: &dyn Get,
@@ -843,12 +848,12 @@ async fn send_chain(
         videos.extend(video);
         posts.push((unit, files));
     }
-    let mut previous = message.id;
+    let mut reply_to = Some(message.id);
     let mut sent: Vec<MessageId> = Vec::new();
     if !videos.is_empty()
-        && let Some(id) = post_videos(ctx, message, previous, videos, Vec::new()).await?
+        && let Some(id) = post_videos(ctx, message, reply_to, videos, Vec::new()).await?
     {
-        previous = id;
+        reply_to = None;
         sent.push(id);
     }
     let count = posts.len();
@@ -861,15 +866,15 @@ async fn send_chain(
         let posted = post(
             ctx,
             message.channel_id,
-            previous,
+            reply_to,
             None,
             vec![unit.embed.clone()],
             components,
             files,
         )
         .await?;
+        reply_to = None;
         if let Some(id) = posted {
-            previous = id;
             sent.push(id);
         }
     }

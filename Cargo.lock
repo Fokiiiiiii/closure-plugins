@@ -530,6 +530,7 @@ dependencies = [
  "closure-i18n",
  "closure-sdk",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "twilight-model",

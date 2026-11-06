@@ -11,7 +11,7 @@ pub mod rules;
 use std::sync::Arc;
 
 use closure_core::action::{Action, Emoji, MentionPolicy, Outcome, Reason};
-use closure_core::error::ModuleError;
+use closure_core::error::{DiscordError, ModuleError};
 use closure_core::event::{ChannelId, Event, EventKind, GuildId, MessageId, UserId};
 use closure_core::locale::Args;
 use closure_core::module::EventContext;
@@ -331,9 +331,13 @@ async fn on_reaction(
                         embeds: None,
                     })
                     .await;
-                if edited.is_err() {
+                match edited {
+                    Ok(_) => {}
                     // The post was deleted by hand: forget it, so that the next star posts it again.
-                    forget(&ctx, source.id).await?;
+                    Err(DiscordError::NotFound) => forget(&ctx, source.id).await?,
+                    // Anything else (a busy Discord, a missing permission) may pass: the post is
+                    // still there, and posting it a second time would be worse.
+                    Err(error) => return Err(error.into()),
                 }
             }
         }

@@ -124,6 +124,7 @@ async fn the_button_enters_and_a_second_press_leaves() {
         ends: 9_999_999_999,
         host: 1,
         ended: false,
+        announced: false,
     };
     harness.store().set("g:900", &record).await.unwrap();
     let click = |user: u64| Click::new("giveaway:join:*").user(user);

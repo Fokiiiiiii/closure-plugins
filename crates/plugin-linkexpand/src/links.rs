@@ -51,7 +51,8 @@ pub fn message_links(text: &str) -> Vec<MessageLink> {
         if wrapped(&captures) {
             continue;
         }
-        let number = |name: &str| captures[name].parse::<u64>().ok();
+        // An id is never 0: a link that says so names nothing, and must not reach an `Id::new`.
+        let number = |name: &str| captures[name].parse::<u64>().ok().filter(|id| *id > 0);
         let (Some(guild), Some(channel), Some(message)) =
             (number("guild"), number("channel"), number("message"))
         else {
@@ -80,7 +81,7 @@ pub fn post_links(text: &str) -> Vec<PostLink> {
         if wrapped(&captures) {
             continue;
         }
-        let Ok(id) = captures["id"].parse::<u64>() else {
+        let Some(id) = captures["id"].parse::<u64>().ok().filter(|id| *id > 0) else {
             continue;
         };
         let link = PostLink {
@@ -100,6 +101,13 @@ pub fn post_links(text: &str) -> Vec<PostLink> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_with_an_id_of_zero_names_nothing() {
+        assert!(message_links("https://discord.com/channels/1/0/3").is_empty());
+        assert!(message_links("https://discord.com/channels/0/2/3").is_empty());
+        assert!(post_links("https://x.com/jack/status/0").is_empty());
+    }
 
     #[test]
     fn message_links_of_every_discord_host_are_found_once_each() {

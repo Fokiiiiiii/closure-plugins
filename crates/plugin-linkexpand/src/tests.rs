@@ -19,8 +19,8 @@ const VIEW: u64 = (1 << 10) | (1 << 16);
 const POST: &str = r#"{"code":200,"tweet":{
     "url":"https://x.com/jack/status/20","text":"just setting up my twttr",
     "author":{"name":"jack","screen_name":"jack"},"likes":10,"retweets":3,"replies":1,
-    "media":{"photos":[{"url":"https://p.example/1.jpg"},{"url":"https://p.example/2.jpg"}],
-             "videos":[{"url":"https://v.example/v.mp4"}]}}}"#;
+    "media":{"photos":[{"url":"https://pbs.twimg.com/1.jpg"},{"url":"https://pbs.twimg.com/2.jpg"}],
+             "videos":[{"url":"https://video.twimg.com/v.mp4"}]}}}"#;
 
 /// The services, answering what `answer` says for an address, or failing when it says nothing. A
 /// file whose address says `huge` is too large to fetch.
@@ -58,7 +58,7 @@ fn plain(_: &str) -> Option<&'static str> {
 const HUGE: &str = r#"{"code":200,"tweet":{
     "url":"https://x.com/jack/status/20","text":"a long video",
     "author":{"name":"jack","screen_name":"jack"},
-    "media":{"videos":[{"url":"https://v.example/huge.mp4"}]}}}"#;
+    "media":{"videos":[{"url":"https://video.twimg.com/huge.mp4"}]}}}"#;
 
 #[allow(
     clippy::unnecessary_wraps,
@@ -74,15 +74,15 @@ const REPLY: &str = r#"{"code":200,"tweet":{
     "replying_to_status":"19",
     "quote":{"url":"https://x.com/dom/status/5","text":"quoted words",
              "author":{"name":"dom","screen_name":"dom"}},
-    "media":{"photos":[{"url":"https://p.example/1.jpg"}]}}}"#;
+    "media":{"photos":[{"url":"https://pbs.twimg.com/1.jpg"}]}}}"#;
 
 const PARENT: &str = r#"{"tweet":{"url":"https://x.com/ev/status/19","text":"the first post",
     "author":{"name":"ev","screen_name":"ev"}}}"#;
 
 const QUOTED: &str = r#"{"tweet":{"url":"https://x.com/dom/status/5","text":"quoted words",
     "author":{"name":"dom","screen_name":"dom"},"likes":7,"retweets":8,"replies":9,
-    "media":{"photos":[{"url":"https://p.example/q.jpg"}],
-                "videos":[{"url":"https://v.example/q.mp4"}]}}}"#;
+    "media":{"photos":[{"url":"https://pbs.twimg.com/q.jpg"}],
+                "videos":[{"url":"https://video.twimg.com/q.mp4"}]}}}"#;
 
 const TRANSLATED: &str =
     r#"[[["a translated post","just setting up my twttr",null,null,10]],null,"ja"]"#;
@@ -90,7 +90,7 @@ const TRANSLATED: &str =
 fn thread(url: &str) -> Option<&'static str> {
     if url.contains("translate_a") {
         Some(TRANSLATED)
-    } else if url.contains("p.example") {
+    } else if url.contains("pbs.twimg.com") {
         Some("picture")
     } else if url.contains("/status/19") {
         Some(PARENT)
@@ -285,7 +285,10 @@ async fn a_post_on_x_has_its_pictures_attached_its_video_linked_and_its_preview_
     assert_eq!(all.len(), 2, "the video alone, then the post");
     // Only a message without embeds gets a player from its link; it has no buttons.
     assert_eq!(all[0].embeds, 0);
-    assert_eq!(all[0].content.as_deref(), Some("https://v.example/v.mp4"));
+    assert_eq!(
+        all[0].content.as_deref(),
+        Some("https://video.twimg.com/v.mp4")
+    );
     assert!(all[0].components.is_empty());
     assert_eq!(all[1].embeds, 1);
     assert_eq!(all[1].files, ["photo-1.jpg", "photo-2.jpg"]);
@@ -308,7 +311,7 @@ async fn a_video_is_the_link_to_the_video_servers_of_x_however_large_it_is() {
     assert!(all[1].files.is_empty());
     assert_eq!(
         all[0].content.as_deref(),
-        Some("https://v.example/huge.mp4")
+        Some("https://video.twimg.com/huge.mp4")
     );
 }
 
@@ -324,10 +327,14 @@ async fn a_reply_and_a_quote_are_messages_of_their_own_each_answering_the_one_be
         "the video of the quoted post, the first post, the reply, the quoted post"
     );
     assert!(all[1..].iter().all(|p| p.embeds == 1));
-    assert_eq!(all[0].content.as_deref(), Some("https://v.example/q.mp4"));
+    assert_eq!(
+        all[0].content.as_deref(),
+        Some("https://video.twimg.com/q.mp4")
+    );
     assert_eq!(all[2].files, ["photo-1.jpg"]);
-    // Each answers the one before: the first the link, the others a message of the bot.
-    assert!(all[0].reply_to.is_some() && all[1].reply_to.is_some() && all[2].reply_to.is_some());
+    // Only the first answers the link; the messages of the answer do not reply to one another.
+    assert!(all[0].reply_to.is_some());
+    assert!(all[1..].iter().all(|p| p.reply_to.is_none()));
     // The buttons are under the last one, and take all of them away.
     assert!(buttons(&all[0]).is_empty() && buttons(&all[1]).is_empty());
     assert!(buttons(&all[2]).is_empty());
@@ -367,7 +374,7 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     assert_eq!(one.files, ["photo-1.jpg"]);
     assert_eq!(
         all[0].content.as_deref(),
-        Some("https://v.example/q.mp4"),
+        Some("https://video.twimg.com/q.mp4"),
         "the video of the quoted post is a link too"
     );
     assert_eq!(one.images, 1, "the quoted post has a picture");
@@ -375,7 +382,11 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
         one.fields, 3,
         "each post has its translation, as it is not in English"
     );
-    assert!(one.reply_to.is_some() && all[0].reply_to.is_some());
+    assert!(
+        all[0].reply_to.is_some(),
+        "the first message answers the link"
+    );
+    assert!(one.reply_to.is_none(), "the next one does not reply");
     assert!(buttons(&all[0]).is_empty(), "the video has no buttons");
     assert_eq!(buttons(one).len(), 3);
     assert!(hid_the_original(&harness));

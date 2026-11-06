@@ -240,6 +240,14 @@ async fn the_place_and_the_board_are_right_beyond_a_thousand_members() {
 }
 
 #[tokio::test]
+async fn a_setting_the_sdk_keeps_for_every_module_does_not_stop_the_events() {
+    // The module refuses settings it does not know, and `replies` is the SDK's, not its own.
+    let harness = harness(&json!({"xp_per_message": 20, "replies": "public"}));
+    say(&harness, 50, 5).await;
+    assert_eq!(xp(&harness, 50).await, 20);
+}
+
+#[tokio::test]
 async fn a_message_gives_experience_once_in_a_cooldown() {
     let harness = harness(&json!({"xp_per_message": 20, "cooldown_seconds": 60}));
     say(&harness, 50, 5).await;
