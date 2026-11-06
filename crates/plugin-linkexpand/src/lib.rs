@@ -43,12 +43,22 @@ pub use plugin_kit::net::{Fetcher, Get};
 
 const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
-/// The most characters of a quoted text: three quotes have to fit in one message.
+/// The most characters of the text of one post.
 const QUOTE_CHARS: usize = 1200;
-/// What is told of each post translated: the embeds of an answer are at most 6000 characters.
-const TRANSLATED_CHARS: usize = 1300;
-/// The text of a post and its translation both stand in the answer: half of the room for each.
-const SHARED_CHARS: usize = 550;
+/// The text that all the embeds of an answer may hold together: Discord allows 6000 characters in
+/// all, with the names, titles and footers among them.
+const TEXT_BUDGET: usize = 4400;
+/// The most embeds in a message, Discord's limit.
+const MAX_EMBEDS: usize = 10;
+/// How far up a conversation is followed, and how many quotes inside quotes.
+const MAX_ANCESTORS: usize = 8;
+const MAX_QUOTES: usize = 5;
+
+/// The characters of text for each of `posts`; a translation under a post takes half of them.
+fn text_limit(posts: usize, shared: bool) -> usize {
+    let each = (TEXT_BUDGET / posts.max(1)).clamp(120, QUOTE_CHARS);
+    if shared { each / 2 } else { each }
+}
 const VIEW: Permissions = Permissions::VIEW_CHANNEL.union(Permissions::READ_MESSAGE_HISTORY);
 
 /// How the posts of a thread are laid out in Discord.
@@ -200,6 +210,50 @@ async fn quote_of(ctx: &EventContext, source: &MessageInfo, link: &MessageLink) 
     ))
 }
 
+/// `post` with the posts it answers, up to the first of the conversation, and the posts it quotes,
+/// one inside the other. What cannot be had (a post that is gone, or private) ends the chain.
+async fn walk(fetch: &dyn Get, post: x::Tweet, replied: bool, quoted: bool) -> x::Thread {
+    let mut thread = x::Thread::new(post);
+    let mut seen: Vec<u64> = status_id(&thread.post.url).into_iter().collect();
+    if replied {
+        let mut next = thread.post.parent_id();
+        while let Some(id) = next {
+            if seen.contains(&id) || thread.ancestors.len() >= MAX_ANCESTORS {
+                break;
+            }
+            let Ok(parent) = fetch_post(fetch, id).await else {
+                break;
+            };
+            seen.push(id);
+            next = parent.parent_id();
+            thread.ancestors.insert(0, parent);
+        }
+    }
+    if quoted {
+        let mut from = thread.post.clone();
+        while thread.quotes.len() < MAX_QUOTES {
+            let Some(id) = from.quote_id() else {
+                break;
+            };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+            // The post whole, so that it has its counts; what the one before it holds will do.
+            let whole = match fetch_post(fetch, id).await {
+                Ok(whole) => whole,
+                Err(_) => match from.quote.as_deref() {
+                    Some(inside) => inside.clone(),
+                    None => break,
+                },
+            };
+            thread.quotes.push(whole.clone());
+            from = whole;
+        }
+    }
+    thread
+}
+
 /// The service, asked about the post `id`.
 async fn fetch_post(fetch: &dyn Get, id: u64) -> Result<x::Tweet> {
     let bytes = fetch
@@ -337,10 +391,15 @@ async fn on_message(
     let config: Config = ctx.parse_config()?;
     let mut units: Vec<Unit> = Vec::new();
     let mut open: Option<String> = None;
+    // One message holds ten embeds; an answer of messages is as long as its button can name.
+    let cap = match config.layout {
+        Layout::Chain => MAX_UNITS,
+        Layout::Embeds => MAX_EMBEDS,
+    };
     if config.message_links {
         for link in links::message_links(&message.content) {
             // Only the server the message is in: another server's messages are not for here.
-            if link.guild != ctx.guild_id.get() || units.len() >= MAX_UNITS {
+            if link.guild != ctx.guild_id.get() || units.len() >= cap {
                 continue;
             }
             match quote_of(&ctx, message, &link).await {
@@ -355,11 +414,11 @@ async fn on_message(
             }
         }
     }
-    let mut expanded_post = false;
+    let mut threads: Vec<x::Thread> = Vec::new();
+    let mut planned = units.len();
     if config.x_links {
-        let words = labels(&ctx);
         for link in links::post_links(&message.content) {
-            if units.len() >= MAX_UNITS {
+            if planned >= cap {
                 break;
             }
             let tweet = match fetch_post(&*fetch, link.id).await {
@@ -369,63 +428,43 @@ async fn on_message(
                     continue;
                 }
             };
-            // Only the first post brings the post it answers: three threads would not fit.
-            let parent = match tweet.parent_id() {
-                Some(id) if config.replied_post && !expanded_post => {
-                    fetch_post(&*fetch, id).await.ok()
-                }
-                _ => None,
-            };
-            // The quoted post comes whole, so that it has its counts.
-            let full = match tweet.quote_id() {
-                Some(id) if config.quoted_post => fetch_post(&*fetch, id).await.ok(),
-                _ => None,
-            };
-            let quoted = if config.quoted_post {
-                full.as_ref().or(tweet.quote.as_deref())
-            } else {
-                None
-            };
-            let limit = if config.auto_translate {
-                SHARED_CHARS
-            } else {
-                QUOTE_CHARS
-            };
-            let mut shown = x::pieces(&tweet, parent.as_ref(), quoted, &words, limit);
-            // What does not fit goes: the post that was linked stays.
-            while units.len() + shown.len() > MAX_UNITS {
-                if let Some(at) = shown.iter().position(|p| !p.main) {
-                    shown.remove(at);
-                } else {
-                    break;
-                }
+            let mut thread = walk(&*fetch, tweet, config.replied_post, config.quoted_post).await;
+            // What does not fit goes, from the far ends: the post that was linked stays.
+            thread.fit(cap - planned);
+            planned += thread.size();
+            threads.push(thread);
+        }
+    }
+    let expanded_post = !threads.is_empty();
+    let limit = text_limit(planned, config.auto_translate);
+    let words = labels(&ctx);
+    for thread in &threads {
+        for piece in x::pieces(thread, &words, limit) {
+            if piece.main {
+                open.get_or_insert_with(|| piece.link.clone());
             }
-            for piece in shown {
-                if piece.main {
-                    open.get_or_insert_with(|| piece.link.clone());
-                }
-                let embed = if config.auto_translate {
-                    with_translation(&*fetch, &ctx, piece.embed).await
-                } else {
-                    piece.embed
-                };
-                units.push(Unit {
-                    embed,
-                    photos: piece.photos,
-                    video: piece.video,
-                    link: Some(piece.link),
-                    main: piece.main,
-                });
-            }
-            expanded_post = true;
+            let embed = if config.auto_translate {
+                with_translation(&*fetch, &ctx, piece.embed, limit).await
+            } else {
+                piece.embed
+            };
+            units.push(Unit {
+                embed,
+                photos: piece.photos,
+                video: piece.video,
+                link: Some(piece.link),
+                main: piece.main,
+            });
         }
     }
     if units.is_empty() {
         return Ok(Flow::Continue);
     }
     let mut translate: Vec<u64> = Vec::new();
+    // The button translates what was linked, with what is around it as the click finds it.
     for id in units
         .iter()
+        .filter(|unit| unit.main)
         .filter_map(|unit| unit.link.as_deref().and_then(status_id))
     {
         if !translate.contains(&id) {
@@ -476,7 +515,12 @@ async fn on_message(
 
 /// The embed of a post with its translation under it, when the post is in another language than
 /// the server's; a service that does not answer leaves the embed as it is.
-async fn with_translation(fetch: &dyn Get, ctx: &EventContext, mut embed: Embed) -> Embed {
+async fn with_translation(
+    fetch: &dyn Get,
+    ctx: &EventContext,
+    mut embed: Embed,
+    limit: usize,
+) -> Embed {
     let to = ctx.locale.tag();
     let Some(text) = embed.description.clone() else {
         return embed;
@@ -491,7 +535,7 @@ async fn with_translation(fetch: &dyn Get, ctx: &EventContext, mut embed: Embed)
     embed.fields.push(EmbedField {
         inline: false,
         name: format!("{label} ({} → {to})", done.from),
-        value: plugin_kit::truncate(&done.text, SHARED_CHARS),
+        value: plugin_kit::truncate(&done.text, limit),
     });
     embed
 }
@@ -519,7 +563,8 @@ fn to_base36(mut number: u64) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Translates the posts of the button, each into the language of whoever pressed it.
+/// Translates the posts of the button and the posts around them, each into the language of whoever
+/// pressed it.
 async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), UserError> {
     let failed = || UserError::message("linkexpand-translate-failed");
     let ids: Vec<u64> = cx
@@ -534,12 +579,21 @@ async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), Use
     }
     cx.defer(true).await?;
     let to = cx.locale().tag();
-    let mut embeds = Vec::new();
+    let mut posts: Vec<x::Tweet> = Vec::new();
     for id in ids {
-        // A post that cannot be fetched or translated is left out; the others still are told.
         let Ok(tweet) = fetch_post(&*fetch, id).await else {
             continue;
         };
+        let thread = walk(&*fetch, tweet, true, true).await;
+        posts.extend(thread.ancestors);
+        posts.push(thread.post);
+        posts.extend(thread.quotes);
+    }
+    posts.truncate(MAX_EMBEDS);
+    let each = (TEXT_BUDGET / posts.len().max(1)).clamp(120, 1300);
+    let mut embeds = Vec::new();
+    for tweet in &posts {
+        // A post that cannot be translated is left out; the others still are told.
         let Ok(done) = translate::translate(&*fetch, &tweet.text, to).await else {
             continue;
         };
@@ -547,7 +601,7 @@ async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), Use
             "**{} (@{})**\n{}",
             tweet.author.name,
             tweet.author.screen_name,
-            plugin_kit::truncate(&done.text, TRANSLATED_CHARS)
+            plugin_kit::truncate(&done.text, each)
         );
         let embed = closure_sdk::EmbedBuilder::new()
             .description(text)

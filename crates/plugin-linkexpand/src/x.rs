@@ -21,7 +21,7 @@ struct FxResponse {
 }
 
 /// A post on X.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Tweet {
     pub url: String,
     #[serde(default)]
@@ -48,14 +48,14 @@ pub struct Tweet {
     pub reposted_by: Option<TweetAuthor>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TweetAuthor {
     pub name: String,
     pub screen_name: String,
     pub avatar_url: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Media {
     #[serde(default)]
     pub photos: Vec<Picture>,
@@ -63,7 +63,7 @@ pub struct Media {
     pub videos: Vec<Picture>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Picture {
     pub url: String,
 }
@@ -194,47 +194,80 @@ fn piece(tweet: &Tweet, title: Option<String>, color: u32, limit: usize, main: b
     }
 }
 
-/// The messages of `tweet`: the post it replies to (`parent`, fetched by the caller) first, then
-/// the post itself, then the post it quotes (`quoted`: the nested one is enough, but the caller can
-/// give the whole post, which has the counts).
+/// A post with the posts around it: every post it answers up to the first one, and the posts it
+/// quotes, one inside the other.
+#[derive(Debug, Clone)]
+pub struct Thread {
+    /// What the post answers: the first post of the conversation first, the post it answers last.
+    pub ancestors: Vec<Tweet>,
+    /// The post that was linked.
+    pub post: Tweet,
+    /// The post it quotes, the post that one quotes, and so on.
+    pub quotes: Vec<Tweet>,
+}
+
+impl Thread {
+    #[must_use]
+    pub fn new(post: Tweet) -> Self {
+        Self {
+            ancestors: Vec::new(),
+            post,
+            quotes: Vec::new(),
+        }
+    }
+
+    /// How many posts there are, the one that was linked among them.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        1 + self.ancestors.len() + self.quotes.len()
+    }
+
+    /// Drops the posts farthest from the one that was linked until at most `room` are left.
+    pub fn fit(&mut self, room: usize) {
+        while self.size() > room.max(1) {
+            if self.ancestors.len() > self.quotes.len() {
+                self.ancestors.remove(0);
+            } else {
+                self.quotes.pop();
+            }
+        }
+    }
+}
+
+/// `label`, with how far the post is from the one that was linked when there are several.
+fn numbered(label: &str, distance: usize, of: usize) -> String {
+    if of > 1 {
+        format!("{label} {distance}")
+    } else {
+        label.to_owned()
+    }
+}
+
+/// The messages of a thread, in the order they are read: what the post answers, the post, and what
+/// it quotes.
 #[must_use]
-pub fn pieces(
-    tweet: &Tweet,
-    parent: Option<&Tweet>,
-    quoted: Option<&Tweet>,
-    labels: &Labels,
-    limit: usize,
-) -> Vec<Piece> {
-    let mut all: Vec<Piece> = parent
-        .into_iter()
-        .map(|parent| {
-            piece(
-                parent,
-                Some(labels.replied_to.clone()),
-                REPLIED_COLOR,
-                limit,
-                false,
-            )
-        })
-        .collect();
-    match &tweet.reposted_by {
-        Some(who) => all.push(piece(
+pub fn pieces(thread: &Thread, labels: &Labels, limit: usize) -> Vec<Piece> {
+    let mut all = Vec::new();
+    let answered = thread.ancestors.len();
+    for (at, parent) in thread.ancestors.iter().enumerate() {
+        let title = numbered(&labels.replied_to, answered - at, answered);
+        all.push(piece(parent, Some(title), REPLIED_COLOR, limit, false));
+    }
+    let tweet = &thread.post;
+    all.push(match &tweet.reposted_by {
+        Some(who) => piece(
             tweet,
             Some(format!("{} {}", labels.reposted_by, who.name)),
             REPOST_COLOR,
             limit,
             true,
-        )),
-        None => all.push(piece(tweet, None, X_COLOR, limit, true)),
-    }
-    if let Some(quoted) = quoted {
-        all.push(piece(
-            quoted,
-            Some(labels.quoted.clone()),
-            QUOTED_COLOR,
-            limit,
-            false,
-        ));
+        ),
+        None => piece(tweet, None, X_COLOR, limit, true),
+    });
+    let quoted = thread.quotes.len();
+    for (at, quote) in thread.quotes.iter().enumerate() {
+        let title = numbered(&labels.quoted, at + 1, quoted);
+        all.push(piece(quote, Some(title), QUOTED_COLOR, limit, false));
     }
     all
 }
@@ -275,7 +308,7 @@ mod tests {
     #[test]
     fn a_post_is_one_message_with_its_pictures_and_video_to_attach() {
         let tweet = parse_tweet(POST.as_bytes()).unwrap();
-        let shown = pieces(&tweet, None, None, &labels(), 1000);
+        let shown = pieces(&Thread::new(tweet), &labels(), 1000);
         assert_eq!(shown.len(), 1);
         let first = &shown[0];
         assert!(first.main);
@@ -305,13 +338,12 @@ mod tests {
         let tweet = parse_tweet(POST.as_bytes()).unwrap();
         assert_eq!(tweet.parent_id(), Some(19));
         let parent = parse_tweet(PARENT.as_bytes()).unwrap();
-        let shown = pieces(
-            &tweet,
-            Some(&parent),
-            tweet.quote.as_deref(),
-            &labels(),
-            1000,
-        );
+        let thread = Thread {
+            ancestors: vec![parent],
+            quotes: tweet.quote.as_deref().cloned().into_iter().collect(),
+            post: tweet,
+        };
+        let shown = pieces(&thread, &labels(), 1000);
         let texts: Vec<Option<&str>> = shown
             .iter()
             .map(|p| p.embed.description.as_deref())
@@ -342,7 +374,7 @@ mod tests {
         );
         let tweet = parse_tweet(json.as_bytes()).unwrap();
         assert_eq!(tweet.parent_id(), None);
-        let shown = pieces(&tweet, None, None, &labels(), 1000);
+        let shown = pieces(&Thread::new(tweet), &labels(), 1000);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].embed.title.as_deref(), Some("Reposted by kit"));
         assert_eq!(shown[0].embed.color, Some(REPOST_COLOR));
@@ -350,6 +382,49 @@ mod tests {
             shown[0].embed.footer.as_ref().unwrap().text,
             "💬 32  🔁 1,628  ❤ 12,468"
         );
+    }
+
+    #[test]
+    fn a_long_thread_is_numbered_from_the_post_that_was_linked_and_fits_by_its_far_ends() {
+        let post = |id: u32| {
+            parse_tweet(
+                format!(
+                    r#"{{"tweet":{{"url":"https://x.com/a/status/{id}","text":"p{id}",
+                    "author":{{"name":"a","screen_name":"a"}}}}}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let mut thread = Thread {
+            ancestors: vec![post(1), post(2), post(3)],
+            post: post(4),
+            quotes: vec![post(5), post(6)],
+        };
+        let titles = |thread: &Thread| -> Vec<Option<String>> {
+            pieces(thread, &labels(), 100)
+                .into_iter()
+                .map(|p| p.embed.title)
+                .collect()
+        };
+        assert_eq!(
+            titles(&thread),
+            [
+                Some("In reply to 3".to_owned()),
+                Some("In reply to 2".to_owned()),
+                Some("In reply to 1".to_owned()),
+                None,
+                Some("Quoted 1".to_owned()),
+                Some("Quoted 2".to_owned()),
+            ]
+        );
+        thread.fit(4);
+        // The far ends go first: the first post of the conversation, then the last quote.
+        assert_eq!(thread.size(), 4);
+        assert_eq!(thread.ancestors.len(), 2);
+        assert_eq!(thread.quotes.len(), 1);
+        thread.fit(1);
+        assert_eq!(thread.size(), 1);
     }
 
     #[test]
@@ -363,9 +438,7 @@ mod tests {
             photos.join(",")
         );
         let shown = pieces(
-            &parse_tweet(json.as_bytes()).unwrap(),
-            None,
-            None,
+            &Thread::new(parse_tweet(json.as_bytes()).unwrap()),
             &labels(),
             100,
         );

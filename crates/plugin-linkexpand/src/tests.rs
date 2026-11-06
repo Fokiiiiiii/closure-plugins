@@ -103,6 +103,31 @@ fn thread(url: &str) -> Option<&'static str> {
     }
 }
 
+/// A conversation of posts 46 to 50, each answering the one before, and quotes of posts 60 to 63,
+/// each quoting the next.
+fn conversation(url: &str) -> Option<&'static str> {
+    let id: u32 = url.rsplit("/status/").next()?.parse().ok()?;
+    let reply = if (47..=50).contains(&id) {
+        format!(r#""replying_to_status":"{}","#, id - 1)
+    } else {
+        String::new()
+    };
+    let quote = if (60..=62).contains(&id) {
+        let next = id + 1;
+        format!(
+            r#""quote":{{"url":"https://x.com/u/status/{next}","text":"p{next}",
+            "author":{{"name":"u","screen_name":"u"}}}},"#
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        r#"{{"tweet":{{{reply}{quote}"url":"https://x.com/u/status/{id}","text":"p{id}",
+        "author":{{"name":"u","screen_name":"u"}}}}}}"#
+    );
+    Some(Box::leak(body.into_boxed_str()))
+}
+
 fn channel(id: u64, overwrites: &serde_json::Value) -> Channel {
     serde_json::from_value(json!({
         "id": id.to_string(), "type": 0, "guild_id": GUILD.to_string(),
@@ -298,10 +323,7 @@ async fn a_reply_and_a_quote_are_messages_of_their_own_each_answering_the_one_be
     assert!(buttons(&all[0]).is_empty() && buttons(&all[1]).is_empty());
     let last = buttons(&all[2]);
     assert_eq!(last.len(), 3);
-    assert!(
-        last[0].starts_with("linkexpand:translate:*:j,k,5"),
-        "{last:?}"
-    );
+    assert!(last[0].starts_with("linkexpand:translate:*:k"), "{last:?}");
     assert_eq!(last[1], "https://x.com/jack/status/20");
     let delete = &last[2];
     assert!(
@@ -342,6 +364,61 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     assert!(one.reply_to.is_some());
     assert_eq!(buttons(one).len(), 3);
     assert!(hid_the_original(&harness));
+}
+
+#[tokio::test]
+async fn a_conversation_is_followed_up_to_its_first_post_and_the_quotes_inside_quotes() {
+    let harness = harness(Fake(conversation));
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://x.com/u/status/50").await;
+    let all = posted(&harness);
+    assert_eq!(all.len(), 1);
+    let titles: Vec<Option<&str>> = all[0].titles.iter().map(Option::as_deref).collect();
+    assert_eq!(
+        titles,
+        [
+            Some("↩ Original post (this replies to it) 4"),
+            Some("↩ Original post (this replies to it) 3"),
+            Some("↩ Original post (this replies to it) 2"),
+            Some("↩ Original post (this replies to it) 1"),
+            None,
+        ],
+        "46 is the first post"
+    );
+    let harness = self::harness(Fake(conversation));
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://x.com/u/status/60").await;
+    let all = posted(&harness);
+    assert_eq!(
+        all[0].embeds, 4,
+        "the post and three quotes inside one another"
+    );
+    assert_eq!(all[0].titles[1].as_deref(), Some("💬 Quoted post 1"));
+    assert_eq!(all[0].titles[3].as_deref(), Some("💬 Quoted post 3"));
+}
+
+#[tokio::test]
+async fn the_embeds_of_an_answer_stay_within_what_discord_takes() {
+    let harness = harness(Fake(conversation));
+    harness.set_config(json!({"auto_translate": false}));
+    say(
+        &harness,
+        "https://x.com/u/status/50 https://x.com/u/status/60",
+    )
+    .await;
+    let all = posted(&harness);
+    assert_eq!(all.len(), 1);
+    assert!(all[0].embeds <= 10, "{}", all[0].embeds);
+    // The first link is whole, what is left of the room goes to the second.
+    assert_eq!(all[0].embeds, 5 + 4);
+}
+
+#[tokio::test]
+async fn a_chain_of_messages_keeps_to_four() {
+    let harness = harness(Fake(conversation));
+    harness.set_config(json!({"layout": "chain", "auto_translate": false}));
+    say(&harness, "https://x.com/u/status/50").await;
+    assert_eq!(posted(&harness).len(), 4);
 }
 
 #[tokio::test]
@@ -442,7 +519,7 @@ async fn only_the_one_who_posted_the_link_deletes_the_answer_all_of_it() {
 async fn the_translate_button_answers_with_the_post_in_another_language() {
     let harness = harness(Fake(thread));
     let replies = harness
-        .click(Click::new("linkexpand:translate:*:j,k,5"))
+        .click(Click::new("linkexpand:translate:*:k"))
         .await
         .unwrap();
     assert!(
@@ -453,7 +530,7 @@ async fn the_translate_button_answers_with_the_post_in_another_language() {
     );
     let down_harness = self::harness(Fake(down));
     let replies = down_harness
-        .click(Click::new("linkexpand:translate:*:j,k,5"))
+        .click(Click::new("linkexpand:translate:*:k"))
         .await
         .unwrap();
     assert!(
