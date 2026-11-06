@@ -146,7 +146,7 @@ struct Posted {
     embeds: usize,
     titles: Vec<Option<String>>,
     footers: Vec<Option<String>>,
-    thumbnails: usize,
+    images: usize,
     reply_to: Option<u64>,
     files: Vec<String>,
     components: Vec<Component>,
@@ -172,7 +172,7 @@ fn posted(harness: &Harness) -> Vec<Posted> {
                     .iter()
                     .map(|e| e.footer.as_ref().map(|f| f.text.clone()))
                     .collect(),
-                thumbnails: embeds.iter().filter(|e| e.thumbnail.is_some()).count(),
+                images: embeds.iter().filter(|e| e.image.is_some()).count(),
                 reply_to: reply_to.map(twilight_model::id::Id::get),
                 files: files.into_iter().map(|f| f.filename).collect(),
                 components,
@@ -323,7 +323,7 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     assert_eq!(one.footers[2].as_deref(), Some("💬 9  🔁 8  ❤ 7"));
     // What was linked has its picture attached; the others show theirs small.
     assert_eq!(one.files, ["photo-1.jpg"]);
-    assert_eq!(one.thumbnails, 1, "the quoted post has a picture");
+    assert_eq!(one.images, 1, "the quoted post has a picture");
     assert!(one.reply_to.is_some());
     assert_eq!(buttons(one).len(), 3);
     assert!(hid_the_original(&harness));

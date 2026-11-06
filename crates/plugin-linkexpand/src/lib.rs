@@ -31,7 +31,7 @@ use plugin_kit::{Quoted, quote_embed};
 use serde::Deserialize;
 use serde_json::json;
 use twilight_model::channel::message::component::ButtonStyle;
-use twilight_model::channel::message::embed::EmbedThumbnail;
+use twilight_model::channel::message::embed::EmbedImage;
 use twilight_model::channel::message::{Component, Embed};
 use twilight_model::channel::{Channel, Message};
 use twilight_model::guild::Permissions;
@@ -569,8 +569,8 @@ pub fn module() -> Result<SdkModule, CoreError> {
 #[cfg(test)]
 mod tests;
 /// All of the answer in one message: an embed for each post, and the pictures and the video of
-/// what was linked attached. A post shown for the sake of another has its first picture as a small
-/// one in its embed, so that it is clear whose it is.
+/// what was linked attached. A post shown for the sake of another has its first picture as the picture
+/// in its embed, under its text, so that it is clear whose it is.
 async fn send_embeds(
     ctx: &EventContext,
     fetch: &dyn Get,
@@ -593,7 +593,7 @@ async fn send_embeds(
             .first()
             .filter(|url| url.starts_with("https://"))
         {
-            unit.embed.thumbnail = Some(EmbedThumbnail {
+            unit.embed.image = Some(EmbedImage {
                 url: url.clone(),
                 proxy_url: None,
                 height: None,
