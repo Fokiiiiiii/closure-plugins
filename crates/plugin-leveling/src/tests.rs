@@ -7,7 +7,7 @@ use closure_sdk::{CommandOptionValue, Level};
 use serde_json::json;
 use twilight_model::id::Id;
 
-use crate::{Profile, builder};
+use crate::builder;
 
 const MODERATOR: u64 = 200;
 const REWARD_ROLE: u64 = 9;
@@ -34,12 +34,7 @@ async fn say(harness: &Harness, user: u64, channel: u64) {
 }
 
 async fn xp(harness: &Harness, user: u64) -> u64 {
-    harness
-        .store()
-        .get::<Profile>(&format!("xp:{user}"))
-        .await
-        .unwrap()
-        .map_or(0, |p| p.xp)
+    u64::try_from(harness.store().score("xp", user).await.unwrap()).unwrap()
 }
 
 fn user(id: u64) -> CommandOptionValue {
@@ -214,6 +209,34 @@ async fn a_reward_can_take_the_rewards_before_it_away() {
             .iter()
             .any(|a| matches!(a, Action::RemoveRole { .. }))
     );
+}
+
+#[tokio::test]
+async fn the_place_and_the_board_are_right_beyond_a_thousand_members() {
+    let harness = harness(&json!({}));
+    for member in 1..=1500_u64 {
+        harness
+            .store()
+            .score_add("xp", member, i64::try_from(member).unwrap())
+            .await
+            .unwrap();
+    }
+    let reply = harness
+        .invoke(Invocation::new("rank").option("user", user(1)).user(70))
+        .await
+        .unwrap();
+    let fields: Vec<String> = reply[0].embeds[0]
+        .fields
+        .iter()
+        .map(|f| f.value.clone())
+        .collect();
+    assert_eq!(fields[2], "#1500 / 1500");
+    let board = harness
+        .invoke(Invocation::new("leaderboard").user(70))
+        .await
+        .unwrap();
+    let text = board[0].embeds[0].description.clone().unwrap();
+    assert!(text.starts_with("1. <@1500>"), "{text}");
 }
 
 #[tokio::test]

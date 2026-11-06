@@ -5,8 +5,9 @@
 //! tells them and the button goes. `/giveaway end` ends one at once and `/giveaway reroll` draws
 //! again from a giveaway that is over.
 //!
-//! shortcut: the draw reads the first thousand entries the module keeps (the limit of one
-//! listing); upgrade when a giveaway has more who enter.
+//! Built for servers of hundreds of thousands: those who entered are a set of the store (a row
+//! each, no quota, no lock), so entering, leaving, counting and drawing a random few cost the
+//! same however many entered, and the winners are told in as many messages as they need.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -27,10 +28,10 @@ const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
 const END: &str = "end";
 const MIN_SECONDS: i64 = 60;
-const MAX_SECONDS: i64 = 30 * 24 * 3600;
-const MAX_WINNERS: i64 = 20;
-/// The most entries one draw reads: the limit of one listing of the store.
-const MAX_ENTRIES: usize = 1000;
+/// The most winners of one giveaway: a draw of this many is still one query.
+const MAX_WINNERS: i64 = 10_000;
+/// How many winners one message names: Discord takes 100 mentions and 2000 characters.
+const NAMES_PER_MESSAGE: usize = 50;
 const COLOR: u32 = 0x00F5_B301;
 
 /// What the module keeps of a giveaway, under the id of its message.
@@ -55,8 +56,9 @@ fn giveaway_key(message: MessageId) -> String {
     format!("g:{message}")
 }
 
-fn entry_prefix(message: MessageId) -> String {
-    format!("e:{message}:")
+/// The name of the set of those who entered the giveaway on `message`.
+fn entries_of(message: MessageId) -> String {
+    format!("e-{message}")
 }
 
 fn stored(error: &closure_sdk::StorageError) -> ModuleError {
@@ -89,15 +91,7 @@ fn span(text: &str) -> Option<i64> {
         total = total.checked_add(number.checked_mul(unit)?)?;
         any = true;
     }
-    (digits.is_empty() && any && (MIN_SECONDS..=MAX_SECONDS).contains(&total)).then_some(total)
-}
-
-/// `count` of the `entrants`, chosen at random and each at most once.
-fn draw(entrants: &[u64], count: usize, rng: &mut fastrand::Rng) -> Vec<u64> {
-    let mut pool = entrants.to_vec();
-    rng.shuffle(&mut pool);
-    pool.truncate(count);
-    pool
+    (digits.is_empty() && any && total >= MIN_SECONDS).then_some(total)
 }
 
 fn mentions(users: &[u64]) -> String {
@@ -106,6 +100,18 @@ fn mentions(users: &[u64]) -> String {
         .map(|id| format!("<@{id}>"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The winners as the message of the giveaway shows them: the first ones, and how many more.
+fn shown(winners: &[u64]) -> String {
+    if winners.len() <= NAMES_PER_MESSAGE {
+        return mentions(winners);
+    }
+    format!(
+        "{} (+{})",
+        mentions(&winners[..NAMES_PER_MESSAGE]),
+        winners.len() - NAMES_PER_MESSAGE
+    )
 }
 
 fn embed_of(title: &str, text: String) -> Result<Embed, ModuleError> {
@@ -123,18 +129,6 @@ fn enter_button(ctx: &EventContext) -> Component {
         ctx.t_in(ctx.locale, "giveaway-enter", &Args::new()),
         CustomId::new("join").encode(&ctx.module),
     )])
-}
-
-async fn entrants(ctx: &EventContext, message: MessageId) -> Result<Vec<u64>, ModuleError> {
-    let entries = ctx
-        .store()
-        .list(&entry_prefix(message), MAX_ENTRIES)
-        .await
-        .map_err(|e| stored(&e))?;
-    Ok(entries
-        .into_iter()
-        .filter_map(|(key, _)| key.rsplit(':').next()?.parse().ok())
-        .collect())
 }
 
 /// How a giveaway ended, or why it could not.
@@ -164,11 +158,11 @@ async fn finish(
     if giveaway.ended != redraw {
         return Ok(Finish::WrongState);
     }
-    let winners = draw(
-        &entrants(ctx, message).await?,
-        giveaway.winners as usize,
-        &mut fastrand::Rng::new(),
-    );
+    let winners = ctx
+        .store()
+        .set_sample(&entries_of(message), giveaway.winners as usize)
+        .await
+        .map_err(|e| stored(&e))?;
     let channel = ChannelId::new(giveaway.channel);
     let host = format!("<@{}>", giveaway.host);
     if !redraw {
@@ -188,7 +182,7 @@ async fn finish(
                 ctx.locale,
                 "giveaway-ended-winners",
                 &Args::new()
-                    .with("winners", mentions(&winners))
+                    .with("winners", shown(&winners))
                     .with("host", host),
             )
         };
@@ -217,30 +211,37 @@ async fn finish(
     } else {
         "giveaway-won"
     };
-    let text = ctx.t_in(
-        ctx.locale,
-        key,
-        &Args::new()
-            .with("winners", mentions(&winners))
-            .with("prize", giveaway.prize.clone()),
-    );
-    let told = ctx
-        .api
-        .execute(Action::SendMessage {
-            channel_id: channel,
-            content: Some(text),
-            embeds: Vec::new(),
-            reply_to: Some(message),
-            mentions: MentionPolicy::Users(
-                winners
-                    .iter()
-                    .map(|id| closure_core::event::UserId::new(*id))
-                    .collect(),
-            ),
-        })
-        .await;
-    if let Err(error) = told {
-        tracing::debug!(?error, "the winners of a giveaway were not announced");
+    // As many messages as the winners need, the first with the words.
+    for (at, names) in winners.chunks(NAMES_PER_MESSAGE).enumerate() {
+        let text = if at == 0 {
+            ctx.t_in(
+                ctx.locale,
+                key,
+                &Args::new()
+                    .with("winners", mentions(names))
+                    .with("prize", giveaway.prize.clone()),
+            )
+        } else {
+            mentions(names)
+        };
+        let told = ctx
+            .api
+            .execute(Action::SendMessage {
+                channel_id: channel,
+                content: Some(text),
+                embeds: Vec::new(),
+                reply_to: (at == 0).then_some(message),
+                mentions: MentionPolicy::Users(
+                    names
+                        .iter()
+                        .map(|id| closure_core::event::UserId::new(*id))
+                        .collect(),
+                ),
+            })
+            .await;
+        if let Err(error) = told {
+            tracing::debug!(?error, "the winners of a giveaway were not announced");
+        }
     }
     Ok(Finish::Drawn)
 }
@@ -408,20 +409,25 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
     if giveaway.ended {
         return say_privately(&cx, cx.t("giveaway-over", &Args::new())).await;
     }
-    let key = format!("{}{}", entry_prefix(message), cx.user().id);
-    let in_already = cx.store().get::<u8>(&key).await.map_err(|e| failed(&e))?;
-    if in_already.is_some() {
-        cx.store().delete(&key).await.map_err(|e| failed(&e))?;
-        return say_privately(&cx, cx.t("giveaway-left", &Args::new())).await;
-    }
-    cx.store().set(&key, &1_u8).await.map_err(|e| failed(&e))?;
-    let count = entrants(cx.ctx(), message)
+    let name = entries_of(message);
+    let user = cx.user().id.get();
+    // One statement decides: whoever was in leaves, whoever was not enters.
+    if cx
+        .store()
+        .set_remove(&name, user)
         .await
         .map_err(|e| failed(&e))?
-        .len();
+    {
+        return say_privately(&cx, cx.t("giveaway-left", &Args::new())).await;
+    }
+    cx.store()
+        .set_add(&name, user)
+        .await
+        .map_err(|e| failed(&e))?;
+    let count = cx.store().set_count(&name).await.map_err(|e| failed(&e))?;
     say_privately(
         &cx,
-        cx.t("giveaway-joined", &Args::new().with("count", count as u64)),
+        cx.t("giveaway-joined", &Args::new().with("count", count)),
     )
     .await
 }

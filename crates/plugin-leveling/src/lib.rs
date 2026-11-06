@@ -6,12 +6,17 @@
 //! and channels can make the experience worth more or less. Reaching a level can be announced and
 //! can give a role, which can take the roles of the levels before it away.
 //!
-//! shortcut: the leaderboard and the rank read the first thousand members the module keeps (the
-//! limit of one listing); upgrade when a server has more members than that who talk.
+//! Built for servers of hundreds of thousands: the experience of a member is a score of the store
+//! (one row each, no quota, no lock), the leaderboard and the place of a member are answered by
+//! its index, and a message that falls inside the cooldown is answered from memory without
+//! touching the database.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod rules;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use closure_core::action::{Action, MentionPolicy, Reason};
 use closure_core::error::ModuleError;
@@ -22,7 +27,7 @@ use closure_sdk::{
     Args, Command, CommandArgs, CommandCx, CoreError, EmbedBuilder, Intents, InteractionReply,
     Level, Locale, ModuleBuilder, PermissionSpec, SdkModule, Subscription, UserError,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::rules::{Progress, bar, grouped, progress};
@@ -133,17 +138,13 @@ impl Config {
     }
 }
 
-/// What the module keeps of a member.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Profile {
-    xp: u64,
-    /// Unix seconds of the last message that gave experience.
-    last: i64,
-}
-
-fn key(user: UserId) -> String {
-    format!("xp:{user}")
-}
+/// The name of the score that holds the experience of a member.
+const XP: &str = "xp";
+/// The name of the score that holds when a member came into the voice channel they are in.
+const SINCE: &str = "voice-since";
+/// How many members the cooldowns remember before the ones that may get experience again are
+/// forgotten.
+const MAX_REMEMBERED: usize = 200_000;
 
 fn stored(error: &closure_sdk::StorageError) -> ModuleError {
     ModuleError::other(error.to_string())
@@ -153,56 +154,87 @@ fn failed(error: &impl ToString) -> UserError {
     UserError::from(ModuleError::other(error.to_string()))
 }
 
-async fn profile(ctx: &EventContext, user: UserId) -> Result<Profile, ModuleError> {
-    Ok(ctx
-        .store()
-        .get::<Profile>(&key(user))
-        .await
-        .map_err(|e| stored(&e))?
-        .unwrap_or_default())
+/// When each member last got experience for a message, kept in memory: most messages are inside
+/// the cooldown, and those cost no read or write of the database at all. After a restart a
+/// member may get one more award sooner than they should; that is all it costs.
+#[derive(Debug, Default)]
+struct Cooldowns(Mutex<HashMap<(u64, u64), i64>>);
+
+impl Cooldowns {
+    /// Whether `user` may get experience now; when they may, they have to wait `wait` seconds
+    /// from now.
+    fn take(&self, guild: u64, user: u64, now: i64, wait: i64) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if last
+            .get(&(guild, user))
+            .is_some_and(|before| now - before < wait)
+        {
+            return false;
+        }
+        if last.len() >= MAX_REMEMBERED {
+            last.retain(|_, before| now - *before < wait);
+        }
+        last.insert((guild, user), now);
+        true
+    }
 }
 
-/// Every member the module keeps, with their experience, most first.
-async fn standings(ctx: &EventContext) -> Result<Vec<(UserId, u64)>, ModuleError> {
-    let entries = ctx
+/// The experience of a member.
+async fn experience(ctx: &EventContext, user: UserId) -> Result<u64, ModuleError> {
+    let score = ctx
         .store()
-        .list("xp:", 1000)
+        .score(XP, user.get())
         .await
         .map_err(|e| stored(&e))?;
-    let mut all: Vec<(UserId, u64)> = entries
-        .into_iter()
-        .filter_map(|(key, entry)| {
-            let id = key.strip_prefix("xp:")?.parse::<u64>().ok()?;
-            let xp = entry.value.get("xp")?.as_u64()?;
-            (id > 0).then(|| (UserId::new(id), xp))
-        })
-        .collect();
-    all.sort_by_key(|(id, xp)| (std::cmp::Reverse(*xp), id.get()));
-    Ok(all)
+    Ok(u64::try_from(score).unwrap_or(0))
 }
 
-/// Puts `user` at `total` experience, announcing and rewarding the levels they pass on the way up.
-async fn set_total(
+/// Gives `user` `gain` experience and acts on the levels it takes them through.
+async fn award(
     ctx: &EventContext,
     config: &Config,
     user: UserId,
-    before: &Profile,
-    total: u64,
-    last: i64,
+    gain: u64,
     here: Option<ChannelId>,
 ) -> Result<(), ModuleError> {
-    if total == 0 {
+    if gain == 0 {
+        return Ok(());
+    }
+    let delta = i64::try_from(gain).unwrap_or(i64::MAX);
+    let new = ctx
+        .store()
+        .score_add(XP, user.get(), delta)
+        .await
+        .map_err(|e| stored(&e))?;
+    let total = new.min(MAX_TOTAL);
+    if total < new {
         ctx.store()
-            .delete(&key(user))
-            .await
-            .map_err(|e| stored(&e))?;
-    } else {
-        ctx.store()
-            .set(&key(user), &Profile { xp: total, last })
+            .score_put(XP, user.get(), total)
             .await
             .map_err(|e| stored(&e))?;
     }
-    let (old, new) = (progress(before.xp).level, progress(total).level);
+    let before = u64::try_from(new.saturating_sub(delta)).unwrap_or(0);
+    reached(
+        ctx,
+        config,
+        user,
+        before,
+        u64::try_from(total).unwrap_or(0),
+        here,
+    )
+    .await
+}
+
+/// Announces and rewards the levels `user` passed going from `before` to `total` experience.
+async fn reached(
+    ctx: &EventContext,
+    config: &Config,
+    user: UserId,
+    before: u64,
+    total: u64,
+    here: Option<ChannelId>,
+) -> Result<(), ModuleError> {
+    let (old, new) = (progress(before).level, progress(total).level);
     if new <= old {
         return Ok(());
     }
@@ -285,7 +317,11 @@ async fn take_earlier_rewards_away(
     Ok(())
 }
 
-async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
+async fn on_message(
+    cooldowns: Arc<Cooldowns>,
+    ctx: EventContext,
+    event: Event,
+) -> Result<Flow, ModuleError> {
     let Event::MessageCreated(message) = &event else {
         return Ok(Flow::Continue);
     };
@@ -296,36 +332,22 @@ async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, ModuleError
     if config.ignores(message.channel_id) {
         return Ok(Flow::Continue);
     }
-    let now = ctx.now();
-    let before = profile(&ctx, message.author.id).await?;
-    if now - before.last < i64::from(config.cooldown_seconds) {
+    let wait = i64::from(config.cooldown_seconds);
+    if !cooldowns.take(ctx.guild_id.get(), message.author.id.get(), ctx.now(), wait) {
         return Ok(Flow::Continue);
     }
     let gain = u64::from(config.xp_per_message)
         * config.percent(&message.author_roles, message.channel_id)
         / 100;
-    let total = before.xp.saturating_add(gain).min(MAX_TOTAL.unsigned_abs());
-    set_total(
+    award(
         &ctx,
         &config,
         message.author.id,
-        &before,
-        total,
-        now,
+        gain,
         Some(message.channel_id),
     )
     .await?;
     Ok(Flow::Continue)
-}
-
-/// When a member joined the voice channel they are in.
-#[derive(Debug, Serialize, Deserialize)]
-struct Sitting {
-    since: i64,
-}
-
-fn voice_key(user: UserId) -> String {
-    format!("voice:{user}")
 }
 
 /// Experience for the time `user` was in `channel`, since they came in.
@@ -335,19 +357,19 @@ async fn settle(
     user: UserId,
     channel: ChannelId,
 ) -> Result<(), ModuleError> {
-    let Some(sitting) = ctx
+    let since = ctx
         .store()
-        .get::<Sitting>(&voice_key(user))
-        .await
-        .map_err(|e| stored(&e))?
-    else {
-        return Ok(());
-    };
-    ctx.store()
-        .delete(&voice_key(user))
+        .score(SINCE, user.get())
         .await
         .map_err(|e| stored(&e))?;
-    let minutes = ((ctx.now() - sitting.since) / 60).clamp(0, MAX_VOICE_MINUTES);
+    if since == 0 {
+        return Ok(());
+    }
+    ctx.store()
+        .score_put(SINCE, user.get(), 0)
+        .await
+        .map_err(|e| stored(&e))?;
+    let minutes = ((ctx.now() - since) / 60).clamp(0, MAX_VOICE_MINUTES);
     if config.voice_xp_per_minute == 0 || minutes == 0 || config.ignores(channel) {
         return Ok(());
     }
@@ -367,9 +389,7 @@ async fn settle(
         * u64::from(config.voice_xp_per_minute)
         * config.percent(&roles, channel)
         / 100;
-    let before = profile(ctx, user).await?;
-    let total = before.xp.saturating_add(gain).min(MAX_TOTAL.unsigned_abs());
-    set_total(ctx, config, user, &before, total, before.last, None).await
+    award(ctx, config, user, gain, None).await
 }
 
 async fn on_voice(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
@@ -391,7 +411,7 @@ async fn on_voice(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> 
     }
     if after.is_some() {
         ctx.store()
-            .set(&voice_key(user.id), &Sitting { since: ctx.now() })
+            .score_put(SINCE, user.id.get(), ctx.now())
             .await
             .map_err(|e| stored(&e))?;
     }
@@ -421,14 +441,20 @@ struct OneUser {
 async fn rank(cx: CommandCx, args: MaybeUser) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let user = args.user.unwrap_or(cx.user().id);
-    let mine = profile(ctx, user).await.map_err(|e| failed(&e))?;
+    let mine = experience(ctx, user).await.map_err(|e| failed(&e))?;
     let Progress {
         level,
         into,
         needed,
-    } = progress(mine.xp);
-    let all = standings(ctx).await.map_err(|e| failed(&e))?;
-    let position = all.iter().filter(|(_, xp)| *xp > mine.xp).count() + 1;
+    } = progress(mine);
+    // The place and the number of members come from the index, not from reading the members.
+    let above = ctx
+        .store()
+        .score_above(XP, i64::try_from(mine).unwrap_or(i64::MAX))
+        .await
+        .map_err(|e| failed(&e))?;
+    let members = ctx.store().score_count(XP).await.map_err(|e| failed(&e))?;
+    let position = above + 1;
     let say = |key: &str| cx.t(key, &Args::new());
     let embed = EmbedBuilder::new()
         .description(format!(
@@ -438,10 +464,10 @@ async fn rank(cx: CommandCx, args: MaybeUser) -> Result<(), UserError> {
             grouped(needed)
         ))
         .field(say("leveling-level"), level.to_string(), true)
-        .field(say("leveling-xp"), grouped(mine.xp), true)
+        .field(say("leveling-xp"), grouped(mine), true)
         .field(
             say("leveling-position"),
-            format!("#{position} / {}", all.len().max(position)),
+            format!("#{position} / {}", members.max(position)),
             true,
         )
         .build()
@@ -456,20 +482,25 @@ async fn rank(cx: CommandCx, args: MaybeUser) -> Result<(), UserError> {
 }
 
 async fn leaderboard(cx: CommandCx, (): ()) -> Result<(), UserError> {
-    let all = standings(cx.ctx()).await.map_err(|e| failed(&e))?;
+    let all = cx
+        .ctx()
+        .store()
+        .score_top(XP, BOARD_SIZE)
+        .await
+        .map_err(|e| failed(&e))?;
     if all.is_empty() {
         return cx.reply_private_t("leveling-empty", &Args::new()).await;
     }
     let lines: Vec<String> = all
         .iter()
-        .take(BOARD_SIZE)
         .enumerate()
         .map(|(at, (user, xp))| {
+            let xp = u64::try_from(*xp).unwrap_or(0);
             format!(
                 "{}. <@{user}>  ·  Lv {}  ·  {} XP",
                 at + 1,
-                progress(*xp).level,
-                grouped(*xp)
+                progress(xp).level,
+                grouped(xp)
             )
         })
         .collect();
@@ -491,9 +522,14 @@ async fn leaderboard(cx: CommandCx, (): ()) -> Result<(), UserError> {
 async fn put(cx: &CommandCx, user: UserId, total: i64) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let config: Config = cx.config()?;
-    let before = profile(ctx, user).await.map_err(|e| failed(&e))?;
-    let total = u64::try_from(total.clamp(0, MAX_TOTAL)).unwrap_or(0);
-    set_total(ctx, &config, user, &before, total, before.last, None)
+    let before = experience(ctx, user).await.map_err(|e| failed(&e))?;
+    let total = total.clamp(0, MAX_TOTAL);
+    ctx.store()
+        .score_put(XP, user.get(), total)
+        .await
+        .map_err(|e| failed(&e))?;
+    let total = u64::try_from(total).unwrap_or(0);
+    reached(ctx, &config, user, before, total, None)
         .await
         .map_err(|e| failed(&e))?;
     cx.reply_private_t(
@@ -507,8 +543,10 @@ async fn put(cx: &CommandCx, user: UserId, total: i64) -> Result<(), UserError> 
 }
 
 async fn xp_add(cx: CommandCx, args: UserAmount) -> Result<(), UserError> {
-    let before = profile(cx.ctx(), args.user).await.map_err(|e| failed(&e))?;
-    let now = i64::try_from(before.xp).unwrap_or(i64::MAX);
+    let before = experience(cx.ctx(), args.user)
+        .await
+        .map_err(|e| failed(&e))?;
+    let now = i64::try_from(before).unwrap_or(i64::MAX);
     put(&cx, args.user, now.saturating_add(args.amount)).await
 }
 
@@ -529,6 +567,7 @@ async fn xp_reset(cx: CommandCx, args: OneUser) -> Result<(), UserError> {
     reason = "the schema and the declaration, one after the other"
 )]
 pub fn builder() -> Result<ModuleBuilder, CoreError> {
+    let cooldowns = Arc::new(Cooldowns::default());
     let snowflake = json!({"type": "string", "pattern": "^[0-9]{1,20}$"});
     let schema = json!({
         "type": "object",
@@ -664,7 +703,10 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                         .handler(xp_reset),
                 ],
             )
-            .on(Subscription::new(EventKind::MessageCreated), on_message)
+            .on(
+                Subscription::new(EventKind::MessageCreated),
+                move |ctx, event| on_message(Arc::clone(&cooldowns), ctx, event),
+            )
             .on(Subscription::new(EventKind::VoiceStateChanged), on_voice)
             .catalog(Locale::En, EN)
             .catalog(Locale::Ja, JA),

@@ -6,7 +6,7 @@ use closure_sdk::testing::{Click, Harness, Invocation};
 use closure_sdk::{CommandOptionValue, Level};
 use twilight_model::id::Id;
 
-use crate::{Giveaway, builder, draw, span};
+use crate::{Giveaway, builder, span};
 
 const MODERATOR: u64 = 200;
 
@@ -44,7 +44,7 @@ fn of_message(sub: &str, message: u64) -> Invocation {
 async fn enter(harness: &Harness, message: u64, user: u64) {
     harness
         .store()
-        .set(&format!("e:{message}:{user}"), &1_u8)
+        .set_add(&format!("e-{message}"), user)
         .await
         .unwrap();
 }
@@ -73,27 +73,14 @@ fn announced(harness: &Harness) -> Vec<(String, Vec<u64>)> {
 }
 
 #[test]
-fn a_time_is_minutes_hours_and_days_from_a_minute_to_a_month() {
+fn a_time_is_minutes_hours_and_days_from_a_minute_up() {
     assert_eq!(span("30m"), Some(1800));
     assert_eq!(span("2h"), Some(7200));
     assert_eq!(span("1d"), Some(86_400));
     assert_eq!(span("1h30m"), Some(5400));
-    for bad in ["", "m", "30", "30s", "0m", "31d", "ab", "1h x"] {
+    for bad in ["", "m", "30", "30s", "0m", "ab", "1h x"] {
         assert_eq!(span(bad), None, "{bad}");
     }
-}
-
-#[test]
-fn a_draw_takes_each_entrant_at_most_once_and_no_more_than_there_are() {
-    let mut rng = fastrand::Rng::with_seed(7);
-    let entrants: Vec<u64> = (1..=10).collect();
-    let mut won = draw(&entrants, 3, &mut rng);
-    assert_eq!(won.len(), 3);
-    won.sort_unstable();
-    won.dedup();
-    assert_eq!(won.len(), 3);
-    assert_eq!(draw(&entrants, 50, &mut rng).len(), 10);
-    assert!(draw(&[], 3, &mut rng).is_empty());
 }
 
 #[tokio::test]
@@ -145,10 +132,8 @@ async fn the_button_enters_and_a_second_press_leaves() {
     let second = harness.click(click(71)).await.unwrap();
     assert!(second[0].content.contains('2'), "{second:?}");
     harness.click(click(70)).await.unwrap();
-    let left: Option<u8> = harness.store().get("e:900:70").await.unwrap();
-    assert!(left.is_none());
-    let still: Option<u8> = harness.store().get("e:900:71").await.unwrap();
-    assert!(still.is_some());
+    assert!(!harness.store().set_has("e-900", 70_u64).await.unwrap());
+    assert!(harness.store().set_has("e-900", 71_u64).await.unwrap());
 }
 
 #[tokio::test]
@@ -189,6 +174,26 @@ async fn at_the_end_the_winners_are_told_and_the_button_goes_and_it_ends_only_on
     // Ending it again does nothing.
     harness.invoke(of_message("end", 1)).await.unwrap();
     assert_eq!(announced(&harness).len(), 1);
+}
+
+#[tokio::test]
+async fn a_giveaway_of_many_winners_tells_them_in_as_many_messages_as_they_need() {
+    let harness = harness();
+    harness
+        .invoke(start("a prize", "1m").option("winners", CommandOptionValue::Integer(120)))
+        .await
+        .unwrap();
+    for user in 1..=300_u64 {
+        enter(&harness, 1, user).await;
+    }
+    harness.invoke(of_message("end", 1)).await.unwrap();
+    let told = announced(&harness);
+    assert_eq!(told.len(), 3, "50, 50 and 20 names");
+    let mut all: Vec<u64> = told.iter().flat_map(|(_, users)| users.clone()).collect();
+    assert_eq!(all.len(), 120);
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), 120, "each winner once");
 }
 
 #[tokio::test]

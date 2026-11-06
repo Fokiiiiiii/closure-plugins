@@ -18,7 +18,7 @@ use closure_core::module::EventContext;
 use closure_core::subscription::Flow;
 use closure_sdk::{CoreError, Intents, Locale, ModuleBuilder, SdkModule, Subscription};
 use plugin_kit::{Quoted, quote_embed};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use twilight_model::channel::message::EmojiReactionType;
 use twilight_model::channel::{Channel, Message};
@@ -65,18 +65,66 @@ impl Config {
 }
 
 /// Where the post of a starred message is.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 struct Posted {
     board: u64,
     post: u64,
 }
 
-fn stored(error: &closure_sdk::StorageError) -> ModuleError {
-    ModuleError::other(error.to_string())
+/// The name of the score that holds, for a starred message, the id of its post on the board.
+const POSTS: &str = "post";
+/// How many locks take turns: reactions to the same message wait for each other, those to
+/// messages that fall in other places do not.
+const LOCKS: u64 = 256;
+
+struct Locks(Vec<tokio::sync::Mutex<()>>);
+
+impl Locks {
+    fn new() -> Self {
+        Self((0..LOCKS).map(|_| tokio::sync::Mutex::new(())).collect())
+    }
+
+    fn of(&self, message: MessageId) -> &tokio::sync::Mutex<()> {
+        &self.0[usize::try_from(message.get() % LOCKS).unwrap_or(0)]
+    }
 }
 
-fn key(source: MessageId) -> String {
-    format!("post:{source}")
+impl std::fmt::Debug for Locks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Locks").finish_non_exhaustive()
+    }
+}
+
+/// The post of `source`, when it has one: kept as a score, a row for each starred message that
+/// costs the same however many there are.
+async fn posted_of(
+    ctx: &EventContext,
+    source: MessageId,
+    board: ChannelId,
+) -> Result<Option<Posted>, ModuleError> {
+    let post = ctx
+        .store()
+        .score(POSTS, source.get())
+        .await
+        .map_err(|e| stored(&e))?;
+    Ok(u64::try_from(post)
+        .ok()
+        .filter(|post| *post > 0)
+        .map(|post| Posted {
+            board: board.get(),
+            post,
+        }))
+}
+
+async fn forget(ctx: &EventContext, source: MessageId) -> Result<(), ModuleError> {
+    ctx.store()
+        .score_put(POSTS, source.get(), 0)
+        .await
+        .map_err(|e| stored(&e))
+}
+
+fn stored(error: &closure_sdk::StorageError) -> ModuleError {
+    ModuleError::other(error.to_string())
 }
 
 /// The emoji of the configuration as a request names it.
@@ -230,12 +278,10 @@ async fn post(
         .await?;
     if let Outcome::Message(sent) = sent {
         ctx.store()
-            .set(
-                &key(source.id),
-                &Posted {
-                    board: board.get(),
-                    post: sent.id.get(),
-                },
+            .score_put(
+                POSTS,
+                source.id.get(),
+                i64::try_from(sent.id.get()).unwrap_or(0),
             )
             .await
             .map_err(|e| stored(&e))?;
@@ -244,7 +290,7 @@ async fn post(
 }
 
 async fn on_reaction(
-    gate: Arc<tokio::sync::Mutex<()>>,
+    locks: Arc<Locks>,
     ctx: EventContext,
     event: Event,
 ) -> Result<Flow, ModuleError> {
@@ -262,18 +308,14 @@ async fn on_reaction(
     if !rules::emoji_matches(&config.emoji, unicode, custom) || info.channel_id == board {
         return Ok(Flow::Continue);
     }
-    // One at a time, so that two stars at once do not post twice.
-    let _one_at_a_time = gate.lock().await;
+    // One at a time for a message, so that two stars at once do not post twice.
+    let _one_at_a_time = locks.of(info.message_id).lock().await;
     let source = ctx
         .api
         .get_message(info.channel_id, info.message_id)
         .await?;
     let stars = count_stars(&ctx, &source, &config).await?;
-    let posted: Option<Posted> = ctx
-        .store()
-        .get(&key(source.id))
-        .await
-        .map_err(|e| stored(&e))?;
+    let posted = posted_of(&ctx, source.id, board).await?;
     match rules::decide(stars, config.threshold, posted.is_some()) {
         Step::Nothing => {}
         Step::Post => post(&ctx, board, &source, &config, stars).await?,
@@ -291,10 +333,7 @@ async fn on_reaction(
                     .await;
                 if edited.is_err() {
                     // The post was deleted by hand: forget it, so that the next star posts it again.
-                    ctx.store()
-                        .delete(&key(source.id))
-                        .await
-                        .map_err(|e| stored(&e))?;
+                    forget(&ctx, source.id).await?;
                 }
             }
         }
@@ -310,10 +349,7 @@ async fn on_reaction(
                         reason,
                     )
                     .await;
-                ctx.store()
-                    .delete(&key(source.id))
-                    .await
-                    .map_err(|e| stored(&e))?;
+                forget(&ctx, source.id).await?;
             }
         }
     }
@@ -337,7 +373,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             "threshold": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 25,
+                "maximum": 1_000_000,
                 "description": "config-starboard-threshold",
                 "x-ui": { "level": "basic" }
             },
@@ -355,7 +391,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             }
         }
     });
-    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let locks = Arc::new(Locks::new());
     Ok(
         ModuleBuilder::new("starboard", "Starboard", env!("CARGO_PKG_VERSION"))?
             .capability(closure_sdk::Capability::SendMessages)
@@ -369,11 +405,11 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                 json!({"channel": null, "threshold": 3, "emoji": DEFAULT_EMOJI, "self_star": false}),
             )
             .on(Subscription::new(EventKind::ReactionAdded), {
-                let gate = Arc::clone(&gate);
-                move |ctx, event| on_reaction(Arc::clone(&gate), ctx, event)
+                let locks = Arc::clone(&locks);
+                move |ctx, event| on_reaction(Arc::clone(&locks), ctx, event)
             })
             .on(Subscription::new(EventKind::ReactionRemoved), move |ctx, event| {
-                on_reaction(Arc::clone(&gate), ctx, event)
+                on_reaction(Arc::clone(&locks), ctx, event)
             })
             .catalog(Locale::En, EN)
             .catalog(Locale::Ja, JA),
