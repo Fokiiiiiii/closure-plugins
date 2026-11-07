@@ -262,6 +262,7 @@ async fn reached(
             tracing::debug!(?error, "could not announce a level");
         }
     }
+    let mut gave_all = true;
     for reward in config
         .rewards
         .iter()
@@ -273,9 +274,11 @@ async fn reached(
         let reason = Reason::new(ctx.t_in(ctx.locale, "leveling-reward-reason", &Args::new()))?;
         if let Err(error) = ctx.api.add_role(ctx.guild_id, user, role, reason).await {
             tracing::debug!(?error, "could not give a reward");
+            gave_all = false;
         }
     }
-    if config.replace_rewards {
+    // The earlier roles go only when the new one is on: a member is never left with none.
+    if config.replace_rewards && gave_all {
         take_earlier_rewards_away(ctx, config, user, new).await?;
     }
     Ok(())
