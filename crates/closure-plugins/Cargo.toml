@@ -16,6 +16,7 @@ plugin-starboard.workspace = true
 plugin-leveling.workspace = true
 plugin-translate.workspace = true
 plugin-giveaway.workspace = true
+plugin-tickets.workspace = true
 
 [lints]
 workspace = true

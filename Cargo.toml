@@ -23,6 +23,7 @@ plugin-starboard = { path = "crates/plugin-starboard" }
 plugin-leveling = { path = "crates/plugin-leveling" }
 plugin-translate = { path = "crates/plugin-translate" }
 plugin-giveaway = { path = "crates/plugin-giveaway" }
+plugin-tickets = { path = "crates/plugin-tickets" }
 
 anyhow = "1"
 fastrand = "2"
