@@ -555,12 +555,44 @@ async fn put(cx: &CommandCx, user: UserId, total: i64) -> Result<(), UserError> 
     .await
 }
 
+/// Adds to the experience of a member as one step of the store, so that an addition at the same
+/// moment as another (a message, a second moderator) is not lost.
 async fn xp_add(cx: CommandCx, args: UserAmount) -> Result<(), UserError> {
-    let before = experience(cx.ctx(), args.user)
+    let ctx = cx.ctx();
+    let config: Config = cx.config()?;
+    let user = args.user;
+    let new = ctx
+        .store()
+        .score_add(XP, user.get(), args.amount)
         .await
         .map_err(|e| failed(&e))?;
-    let now = i64::try_from(before).unwrap_or(i64::MAX);
-    put(&cx, args.user, now.saturating_add(args.amount)).await
+    let total = new.clamp(0, MAX_TOTAL);
+    if total != new {
+        ctx.store()
+            .score_put(XP, user.get(), total)
+            .await
+            .map_err(|e| failed(&e))?;
+    }
+    let before = new.saturating_sub(args.amount).clamp(0, MAX_TOTAL);
+    let total = u64::try_from(total).unwrap_or(0);
+    reached(
+        ctx,
+        &config,
+        user,
+        u64::try_from(before).unwrap_or(0),
+        total,
+        None,
+    )
+    .await
+    .map_err(|e| failed(&e))?;
+    cx.reply_private_t(
+        "leveling-set",
+        &Args::new()
+            .with("user", format!("<@{user}>"))
+            .with("xp", grouped(total))
+            .with("level", u64::from(progress(total).level)),
+    )
+    .await
 }
 
 async fn xp_set(cx: CommandCx, args: UserAmount) -> Result<(), UserError> {

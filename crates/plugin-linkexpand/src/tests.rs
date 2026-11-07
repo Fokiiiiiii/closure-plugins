@@ -261,6 +261,31 @@ async fn a_channel_the_author_cannot_read_is_not_quoted() {
     assert!(posted(&harness).is_empty());
 }
 
+#[tokio::test]
+async fn a_message_of_an_adult_channel_is_not_quoted_in_another_channel() {
+    let harness = harness(Fake(down));
+    let adult: Channel = serde_json::from_value(json!({
+        "id": "10", "type": 0, "guild_id": GUILD.to_string(), "name": "adults",
+        "nsfw": true, "permission_overwrites": [],
+    }))
+    .unwrap();
+    harness
+        .api()
+        .set_channels(Id::new(GUILD), vec![channel(7, &json!([])), adult]);
+    // Readable by everybody, and still not for the others of channel 5.
+    harness
+        .message(Message::new(50, 5).content("https://discord.com/channels/1/10/42"))
+        .await
+        .unwrap();
+    assert!(posted(&harness).is_empty());
+    // Where it was said, it is quoted.
+    harness
+        .message(Message::new(50, 10).content("https://discord.com/channels/1/10/42"))
+        .await
+        .unwrap();
+    assert_eq!(posted(&harness).len(), 1);
+}
+
 fn role_with(id: u64, permissions: &str) -> Role {
     serde_json::from_value(json!({
         "id": id.to_string(), "name": format!("role-{id}"), "color": 0,
@@ -623,4 +648,32 @@ fn both_catalogs_define_the_same_messages() {
         closure_i18n::missing_keys(crate::JA, crate::EN).unwrap(),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn embeds_that_are_too_long_together_are_shortened_and_not_refused() {
+    let embed = |text: &str| {
+        let mut e = twilight_model::channel::message::Embed {
+            author: None,
+            color: None,
+            description: Some(text.to_owned()),
+            fields: Vec::new(),
+            footer: None,
+            image: None,
+            kind: "rich".into(),
+            provider: None,
+            thumbnail: None,
+            timestamp: None,
+            title: Some("t".into()),
+            url: None,
+            video: None,
+        };
+        e.title = Some("t".into());
+        e
+    };
+    let mut embeds: Vec<_> = (0..10).map(|_| embed(&"x".repeat(1200))).collect();
+    crate::fit(&mut embeds);
+    let total: usize = embeds.iter().map(crate::counted).sum();
+    assert!(total <= 5_800, "{total}");
+    assert_eq!(embeds.len(), 10, "all are kept, shortened");
 }

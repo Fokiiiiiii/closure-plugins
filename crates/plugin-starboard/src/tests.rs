@@ -303,3 +303,70 @@ async fn an_edit_made_after_the_channel_went_private_is_not_put_on_the_board() {
     );
     assert_eq!(deleted(&harness), 1, "what was quoted comes off the board");
 }
+
+#[tokio::test]
+async fn a_post_that_could_not_be_taken_off_is_still_recorded_and_not_made_twice() {
+    let harness = harness();
+    harness
+        .api()
+        .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
+    react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
+    assert_eq!(posts(&harness).len(), 1);
+    // The star goes, and the deletion of the post fails (the first call is the read of the
+    // message, the second the deletion).
+    harness
+        .api()
+        .set_message(message(SOURCE_CHANNEL, 100, 0, "⭐"));
+    harness
+        .api()
+        .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
+    let _ = harness
+        .emit(Event::ReactionRemoved(ReactionInfo {
+            guild_id: Id::new(GUILD),
+            channel_id: ChannelId::new(SOURCE_CHANNEL),
+            message_id: MessageId::new(100),
+            user_id: UserId::new(70),
+            emoji: Emoji::Unicode {
+                value: "⭐".into()
+            },
+        }))
+        .await;
+    // Stars again: the post that is still there is updated, not made a second time.
+    harness
+        .api()
+        .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
+    react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
+    assert_eq!(posts(&harness).len(), 1, "no second post beside the first");
+}
+
+#[tokio::test]
+async fn a_post_stays_managed_on_the_board_it_was_made_on() {
+    let harness = harness();
+    harness
+        .api()
+        .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
+    react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
+    // The server points the setting at another board; the source is deleted.
+    harness.set_config(json!({"channel": "21", "threshold": 3}));
+    harness
+        .emit(Event::MessageDeleted {
+            guild_id: Id::new(GUILD),
+            channel_id: ChannelId::new(SOURCE_CHANNEL),
+            message_id: MessageId::new(100),
+        })
+        .await
+        .unwrap();
+    let deleted_on: Vec<u64> = harness
+        .actions()
+        .iter()
+        .filter_map(|a| match a {
+            Action::DeleteMessage { channel_id, .. } => Some(channel_id.get()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deleted_on,
+        [BOARD],
+        "the old post is taken off the old board"
+    );
+}

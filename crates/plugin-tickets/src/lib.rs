@@ -24,6 +24,7 @@ use closure_core::action::{
 use closure_core::error::ModuleError;
 use closure_core::event::{ChannelId, RoleId, UserId};
 use closure_core::module::EventContext;
+use closure_core::storage::{Expect, StorageError};
 use closure_sdk::ui::{self, CustomId};
 use closure_sdk::{
     Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, InteractionReply, JobCx, Level,
@@ -110,6 +111,10 @@ struct Ticket {
     opener: u64,
     claimed_by: Option<u64>,
     created: i64,
+    /// When somebody began to close it (unix seconds): a claim made now is refused, and a second
+    /// close waits for the first, unless that one stopped long ago.
+    #[serde(default)]
+    closing: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -230,6 +235,8 @@ async fn panel(cx: CommandCx, args: Panel) -> Result<(), UserError> {
     reason = "one flow: reserve a place, make the channel, greet, remember, schedule"
 )]
 async fn open(cx: ComponentCx) -> Result<(), UserError> {
+    // The button is not a way around what `/ticket` asks: the same permission.
+    cx.require("tickets.use").await?;
     let config: Config = cx.config()?;
     let staff = config.staff();
     if staff.is_empty() {
@@ -315,6 +322,7 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
         opener: user.get(),
         claimed_by: None,
         created: cx.now(),
+        closing: None,
     };
     ctx.store()
         .set_for(
@@ -437,7 +445,14 @@ async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
         Ok(Outcome::Channel(found)) => found
             .last_message_id
             .map_or(ticket.created, |id| made_at(id.get())),
-        _ => ticket.created,
+        Ok(_) => ticket.created,
+        // The channel is gone: nothing is left to close, and the place is given back.
+        Err(closure_core::error::DiscordError::NotFound) => {
+            forget(ctx, channel, &ticket).await?;
+            return Ok(());
+        }
+        // A channel that cannot be read now is not an idle one: the job is tried again.
+        Err(error) => return Err(error.into()),
     };
     let due = last + i64::from(config.close_after_days) * DAY;
     if ctx.now() >= due {
@@ -465,7 +480,8 @@ async fn transcript(
 ) -> Result<String, ModuleError> {
     let mut messages = Vec::new();
     let mut cursor = None;
-    for _ in 0..TRANSCRIPT_PAGES {
+    let mut cut = false;
+    for page_number in 0..TRANSCRIPT_PAGES {
         let page = ctx
             .api
             .get_messages(channel, cursor, 100)
@@ -479,6 +495,10 @@ async fn transcript(
         if !full {
             break;
         }
+        if page_number + 1 == TRANSCRIPT_PAGES {
+            // The limit was reached with more behind it: the file says so.
+            cut = true;
+        }
         cursor = Some(MessageCursor::Before(oldest));
     }
     messages.reverse();
@@ -490,6 +510,14 @@ async fn transcript(
             .with("opener", ticket.opener.to_string()),
     );
     text.push('\n');
+    if cut {
+        text.push_str(&ctx.t_in(
+            ctx.locale,
+            "tickets-transcript-cut",
+            &Args::new().with("count", messages.len() as u64),
+        ));
+        text.push('\n');
+    }
     for message in &messages {
         let attached = message
             .attachments
@@ -509,9 +537,66 @@ async fn transcript(
     Ok(text)
 }
 
-/// Saves the transcript, then deletes the channel. The entry of the ticket is deleted first, and
-/// whoever deletes it closes it: a second press finds nothing. When the transcript cannot be sent
-/// the ticket stays open.
+/// How long a close that began is waited for before another may take over.
+const CLOSING_WAIT: i64 = 300;
+
+/// Takes the ticket for closing, against the revision read: whoever writes first closes it, and a
+/// claim that was read before it cannot be written after it. `false` when somebody else is closing
+/// it, or it is gone.
+async fn begin_closing(ctx: &EventContext, key: &str) -> Result<Option<Ticket>, ModuleError> {
+    for _ in 0..5 {
+        let Some(entry) = ctx.store().entry(key).await.map_err(|e| stored(&e))? else {
+            return Ok(None);
+        };
+        let mut ticket: Ticket = serde_json::from_value(entry.value)
+            .map_err(|error| ModuleError::other(error.to_string()))?;
+        if ticket
+            .closing
+            .is_some_and(|since| ctx.now() - since < CLOSING_WAIT)
+        {
+            return Ok(None);
+        }
+        ticket.closing = Some(ctx.now());
+        match ctx
+            .store()
+            .replace(
+                key,
+                &ticket,
+                Expect::Revision(entry.revision),
+                Some(Duration::from_hours(24 * 365)),
+            )
+            .await
+        {
+            Ok(_) => return Ok(Some(ticket)),
+            Err(StorageError::Conflict) => {}
+            Err(error) => return Err(stored(&error)),
+        }
+    }
+    Ok(None)
+}
+
+/// Stops tracking a ticket whose channel is gone: its entry, its idle job and its place.
+async fn forget(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket: &Ticket,
+) -> Result<(), ModuleError> {
+    if ctx
+        .store()
+        .delete(&ticket_key(channel))
+        .await
+        .map_err(|e| stored(&e))?
+    {
+        give_back(ctx, ticket.opener).await;
+    }
+    let _ = ctx.scheduler().cancel(&idle_key(channel)).await;
+    Ok(())
+}
+
+/// Saves the transcript, then deletes the channel. The ticket is marked as being closed first, and
+/// whoever marks it closes it: a second press finds it taken. The entry stays until the channel is
+/// gone, so a deletion that failed can be tried again. When the transcript cannot be sent the
+/// ticket stays open.
 async fn finish(
     ctx: &EventContext,
     channel: ChannelId,
@@ -519,22 +604,20 @@ async fn finish(
     reason: &str,
 ) -> Result<Closed, ModuleError> {
     let key = ticket_key(channel);
-    let Some(ticket) = ctx
-        .store()
-        .get::<Ticket>(&key)
-        .await
-        .map_err(|e| stored(&e))?
-    else {
+    let Some(ticket) = begin_closing(ctx, &key).await? else {
         return Ok(Closed::Unknown);
     };
     let config: Config = ctx.parse_config()?;
     let file = match config.log() {
-        Some(log) => Some((log, transcript(ctx, channel, &ticket).await?)),
+        Some(log) => match transcript(ctx, channel, &ticket).await {
+            Ok(text) => Some((log, text)),
+            Err(error) => {
+                reopen(ctx, &key).await;
+                return Err(error);
+            }
+        },
         None => None,
     };
-    if !ctx.store().delete(&key).await.map_err(|e| stored(&e))? {
-        return Ok(Closed::Unknown);
-    }
     if let Some((log, text)) = file {
         let note = ctx.t_in(
             ctx.locale,
@@ -564,24 +647,36 @@ async fn finish(
             })
             .await;
         if let Err(error) = sent {
-            // The transcript is not lost: the ticket is put back, and stays open.
-            let _ = ctx
-                .store()
-                .set_for(&key, &ticket, Duration::from_hours(24 * 365))
-                .await;
+            // The transcript is not lost: the ticket stays open.
+            reopen(ctx, &key).await;
             return Err(stored(&error));
         }
     }
-    let _ = ctx.scheduler().cancel(&idle_key(channel)).await;
-    give_back(ctx, ticket.opener).await;
-    ctx.api
+    match ctx
+        .api
         .execute(Action::DeleteChannel {
             channel_id: channel,
             reason: Reason::truncated(reason),
         })
         .await
-        .map_err(|e| stored(&e))?;
+    {
+        Ok(_) | Err(closure_core::error::DiscordError::NotFound) => {}
+        // The entry is kept (marked as closing): the close is tried again.
+        Err(error) => return Err(stored(&error)),
+    }
+    forget(ctx, channel, &ticket).await?;
     Ok(Closed::Done)
+}
+
+/// A close that could not finish: the ticket is open again.
+async fn reopen(ctx: &EventContext, key: &str) {
+    if let Ok(Some(mut ticket)) = ctx.store().get::<Ticket>(key).await {
+        ticket.closing = None;
+        let _ = ctx
+            .store()
+            .set_for(key, &ticket, Duration::from_hours(24 * 365))
+            .await;
+    }
 }
 
 /// Whether `user` may close the ticket: whoever opened it, or the staff.
@@ -651,45 +746,61 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
     let channel = cx.click().channel_id;
     let ctx = cx.ctx();
     let key = ticket_key(channel);
-    let Some(mut ticket) = ctx
-        .store()
-        .get::<Ticket>(&key)
-        .await
-        .map_err(|e| failed(&e))?
-    else {
-        return say(&cx, "tickets-not-a-ticket", &Args::new()).await;
-    };
     let config: Config = cx.config()?;
     if !is_staff(&cx, &config).await {
         return say(&cx, "tickets-staff-only", &Args::new()).await;
     }
-    if let Some(holder) = ticket.claimed_by {
-        return say(
-            &cx,
-            "tickets-claimed-already",
-            &Args::new().with("user", format!("<@{holder}>")),
-        )
-        .await;
+    // Written against the revision read: two who press at once do not both take it, and a close
+    // that began in between wins.
+    for _ in 0..5 {
+        let Some(entry) = ctx.store().entry(&key).await.map_err(|e| failed(&e))? else {
+            return say(&cx, "tickets-not-a-ticket", &Args::new()).await;
+        };
+        let mut ticket: Ticket =
+            serde_json::from_value(entry.value).map_err(|error| failed(&error))?;
+        if ticket.closing.is_some() {
+            return say(&cx, "tickets-not-a-ticket", &Args::new()).await;
+        }
+        if let Some(holder) = ticket.claimed_by {
+            return say(
+                &cx,
+                "tickets-claimed-already",
+                &Args::new().with("user", format!("<@{holder}>")),
+            )
+            .await;
+        }
+        ticket.claimed_by = Some(cx.user().id.get());
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &ticket,
+                Expect::Revision(entry.revision),
+                Some(Duration::from_hours(24 * 365)),
+            )
+            .await
+        {
+            Ok(_) => {
+                ctx.api
+                    .execute(Action::SendMessage {
+                        channel_id: channel,
+                        content: Some(cx.t(
+                            "tickets-claimed",
+                            &Args::new().with("user", format!("<@{}>", cx.user().id)),
+                        )),
+                        embeds: Vec::new(),
+                        reply_to: None,
+                        mentions: MentionPolicy::None,
+                    })
+                    .await
+                    .map_err(|e| failed(&e))?;
+                return say(&cx, "tickets-claim-done", &Args::new()).await;
+            }
+            Err(StorageError::Conflict) => {}
+            Err(error) => return Err(failed(&error)),
+        }
     }
-    ticket.claimed_by = Some(cx.user().id.get());
-    ctx.store()
-        .set_for(&key, &ticket, Duration::from_hours(24 * 365))
-        .await
-        .map_err(|e| failed(&e))?;
-    ctx.api
-        .execute(Action::SendMessage {
-            channel_id: channel,
-            content: Some(cx.t(
-                "tickets-claimed",
-                &Args::new().with("user", format!("<@{}>", cx.user().id)),
-            )),
-            embeds: Vec::new(),
-            reply_to: None,
-            mentions: MentionPolicy::None,
-        })
-        .await
-        .map_err(|e| failed(&e))?;
-    say(&cx, "tickets-claim-done", &Args::new()).await
+    say(&cx, "tickets-failed", &Args::new()).await
 }
 
 /// Lets a member into the ticket, or takes them out of it.

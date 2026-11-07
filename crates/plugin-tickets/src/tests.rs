@@ -43,6 +43,7 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         opener,
         claimed_by: None,
         created: 0,
+        closing: None,
     };
     harness
         .store()
@@ -205,6 +206,59 @@ async fn the_staff_close_and_claim_and_a_claim_is_taken_once() {
         .user(OTHER);
     harness.invoke(command).await.unwrap();
     assert_eq!(deleted(&harness), [HERE]);
+}
+
+#[tokio::test]
+async fn a_channel_that_could_not_be_deleted_is_still_a_ticket_and_closes_when_tried_again() {
+    let harness = harness();
+    harness.click(press("open", MEMBER)).await.unwrap();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    // The calls of a close: the transcript is sent, then the channel deleted (the third).
+    harness
+        .api()
+        .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
+    let first = harness.click(press("close", MEMBER)).await;
+    let key = format!("ticket:{HERE}");
+    let kept: Option<Ticket> = harness.store().get(&key).await.unwrap();
+    assert!(
+        kept.is_some(),
+        "the ticket is not forgotten before its channel is gone: {first:?}"
+    );
+    // The close is tried again, once the wait for the first has passed.
+    harness.advance(Duration::from_secs(400));
+    harness.click(press("close", MEMBER)).await.unwrap();
+    assert!(deleted(&harness).contains(&HERE));
+    let gone: Option<Ticket> = harness.store().get(&key).await.unwrap();
+    assert!(gone.is_none());
+}
+
+#[tokio::test]
+async fn a_member_who_may_not_use_tickets_cannot_open_one_by_the_button() {
+    let harness = harness();
+    harness.permissions(|permissions| {
+        permissions
+            .keys
+            .entry(closure_core::permission::PermissionKey::new("tickets.use").unwrap())
+            .or_default()
+            .deny_users
+            .push(Id::new(MEMBER));
+    });
+    let _ = harness.click(press("open", MEMBER)).await;
+    assert!(created(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn a_claim_and_a_close_at_once_leave_the_close() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let staff = |user| press("claim", user).roles([STAFF_ROLE]);
+    // The close begins, and a claim after it is refused.
+    harness.click(press("close", MEMBER)).await.unwrap();
+    let late = harness.click(staff(OTHER)).await.unwrap();
+    assert!(
+        late.last().unwrap().content.contains("not an open ticket"),
+        "{late:?}"
+    );
 }
 
 #[tokio::test]

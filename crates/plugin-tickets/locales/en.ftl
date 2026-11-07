@@ -51,3 +51,4 @@ tickets-added = { $user } can see this ticket now.
 tickets-removed = { $user } cannot see this ticket any more.
 tickets-closed-log = Ticket #{ $number } of { $opener } is closed by { $closer }. { $reason }
 tickets-transcript-head = Ticket #{ $number } of { $opener }
+tickets-transcript-cut = Only the newest { $count } messages are kept here; older ones were not saved.

@@ -51,3 +51,4 @@ tickets-added = { $user } がこのチケットを見られるようになりま
 tickets-removed = { $user } はこのチケットを見られなくなりました。
 tickets-closed-log = { $opener } のチケット #{ $number } を { $closer } が閉じました。{ $reason }
 tickets-transcript-head = { $opener } のチケット #{ $number }
+tickets-transcript-cut = ここには新しい { $count } 件だけを保存しています。それより古いメッセージは保存していません。

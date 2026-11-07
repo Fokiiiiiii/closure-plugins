@@ -474,25 +474,57 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
     }
     let name = entries_of(message);
     let user = cx.user().id.get();
-    // One statement decides: whoever was in leaves, whoever was not enters.
+    // One statement decides: whoever was in leaves, whoever was not enters. The number of entries
+    // is kept as a score beside the set, so an entry does not count them all again.
+    let counter = format!("n-{message}");
     if cx
         .store()
         .set_remove(&name, user)
         .await
         .map_err(|e| failed(&e))?
     {
+        let left = cx
+            .store()
+            .score_add(&counter, 0_u64, -1)
+            .await
+            .map_err(|e| failed(&e))?;
+        if left < 0 {
+            recount(&cx, &name, &counter).await?;
+        }
         return say_privately(&cx, cx.t("giveaway-left", &Args::new())).await;
     }
     cx.store()
         .set_add(&name, user)
         .await
         .map_err(|e| failed(&e))?;
-    let count = cx.store().set_count(&name).await.map_err(|e| failed(&e))?;
+    let mut count = cx
+        .store()
+        .score_add(&counter, 0_u64, 1)
+        .await
+        .map_err(|e| failed(&e))?;
+    if count == 1 {
+        // The first entry, or a giveaway whose entries were made before the number was kept.
+        count = recount(&cx, &name, &counter).await?;
+    }
     say_privately(
         &cx,
-        cx.t("giveaway-joined", &Args::new().with("count", count)),
+        cx.t(
+            "giveaway-joined",
+            &Args::new().with("count", u64::try_from(count).unwrap_or(0)),
+        ),
     )
     .await
+}
+
+/// The number of entries counted from the set, and kept.
+async fn recount(cx: &ComponentCx, name: &str, counter: &str) -> Result<i64, UserError> {
+    let real = cx.store().set_count(name).await.map_err(|e| failed(&e))?;
+    let real = i64::try_from(real).unwrap_or(i64::MAX);
+    cx.store()
+        .score_put(counter, 0_u64, real)
+        .await
+        .map_err(|e| failed(&e))?;
+    Ok(real)
 }
 
 /// The module.

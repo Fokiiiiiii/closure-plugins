@@ -192,9 +192,10 @@ async fn quote_of(ctx: &EventContext, source: &MessageInfo, link: &MessageLink) 
         bail!("the author cannot read that channel");
     }
     // What the bot posts is read by everybody who reads where it is posted: a message of a channel
-    // that not everybody may read is quoted only in that same channel.
+    // that not everybody may read, or that is for adults only, is quoted only in that same channel.
     if channel_id != source.channel_id
-        && !can_read(ctx, closure_core::event::UserId::new(1), &[], &channel).await?
+        && (channel.nsfw == Some(true)
+            || !can_read(ctx, closure_core::event::UserId::new(1), &[], &channel).await?)
     {
         bail!("the channel is not one everybody may read");
     }
@@ -786,6 +787,47 @@ async fn post_videos(
     .await
 }
 
+/// The characters an embed counts toward the 6000 of a message.
+fn counted(embed: &Embed) -> usize {
+    let chars = |text: Option<&String>| text.map_or(0, |text| text.chars().count());
+    chars(embed.title.as_ref())
+        + chars(embed.description.as_ref())
+        + embed.author.as_ref().map_or(0, |a| a.name.chars().count())
+        + embed.footer.as_ref().map_or(0, |f| f.text.chars().count())
+        + embed
+            .fields
+            .iter()
+            .map(|f| f.name.chars().count() + f.value.chars().count())
+            .sum::<usize>()
+}
+
+/// Shortens the texts until the embeds fit the 6000 characters a message holds, the longest first,
+/// so that a mix of long quotes of the server and of X is shown shortened and not refused whole.
+fn fit(embeds: &mut Vec<Embed>) {
+    const LIMIT: usize = 5_800;
+    while embeds.iter().map(counted).sum::<usize>() > LIMIT {
+        let Some(longest) = embeds
+            .iter_mut()
+            .max_by_key(|embed| embed.description.as_ref().map_or(0, |d| d.chars().count()))
+        else {
+            return;
+        };
+        let Some(text) = longest
+            .description
+            .as_mut()
+            .filter(|d| d.chars().count() > 80)
+        else {
+            // Nothing left to shorten: the last embeds go.
+            embeds.pop();
+            continue;
+        };
+        let keep = text.chars().count() * 4 / 5;
+        let mut shorter: String = text.chars().take(keep.saturating_sub(1)).collect();
+        shorter.push('…');
+        *text = shorter;
+    }
+}
+
 /// All of the answer in one message: an embed for each post, and the pictures of what was linked
 /// attached. A post shown for the sake of another has its first picture in its embed, under its
 /// text, so that it is clear whose it is. The videos come first, as a message of their own.
@@ -837,6 +879,7 @@ async fn send_embeds(
     }
     // Discord takes ten files in a message: what is over is left out, not the whole answer.
     files.truncate(MAX_FILES);
+    fit(&mut embeds);
     post(
         ctx,
         message.channel_id,

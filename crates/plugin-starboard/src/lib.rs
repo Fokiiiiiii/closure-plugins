@@ -73,6 +73,8 @@ struct Posted {
 
 /// The name of the score that holds, for a starred message, the id of its post on the board.
 const POSTS: &str = "post";
+/// The name of the score that holds the board a post was made on.
+const BOARDS: &str = "post-board";
 /// How many locks take turns: reactions to the same message wait for each other, those to
 /// messages that fall in other places do not.
 const LOCKS: u64 = 256;
@@ -107,20 +109,52 @@ async fn posted_of(
         .score(POSTS, source.get())
         .await
         .map_err(|e| stored(&e))?;
+    // The board the post was made on, kept with it: a post is managed where it is, whatever the
+    // setting says now. Posts made before this was kept are taken to be on the board of now.
+    let made_on = ctx
+        .store()
+        .score(BOARDS, source.get())
+        .await
+        .map_err(|e| stored(&e))?;
     Ok(u64::try_from(post)
         .ok()
         .filter(|post| *post > 0)
         .map(|post| Posted {
-            board: board.get(),
+            board: u64::try_from(made_on)
+                .ok()
+                .filter(|board| *board > 0)
+                .unwrap_or_else(|| board.get()),
             post,
         }))
 }
 
 async fn forget(ctx: &EventContext, source: MessageId) -> Result<(), ModuleError> {
-    ctx.store()
-        .score_put(POSTS, source.get(), 0)
+    for name in [POSTS, BOARDS] {
+        ctx.store()
+            .score_put(name, source.get(), 0)
+            .await
+            .map_err(|e| stored(&e))?;
+    }
+    Ok(())
+}
+
+/// Takes the post of `posted` off its board. Gone already is as good as removed; a failure that
+/// may pass (a busy Discord, a missing permission) is an error, and the post stays recorded so
+/// that the next try finds it and no second post is made beside it.
+async fn take_off(ctx: &EventContext, posted: &Posted) -> Result<(), ModuleError> {
+    let reason = Reason::new(ctx.t_in(ctx.locale, "starboard-reason", &Args::new()))?;
+    match ctx
+        .api
+        .delete_message(
+            ChannelId::new(posted.board),
+            MessageId::new(posted.post),
+            reason,
+        )
         .await
-        .map_err(|e| stored(&e))
+    {
+        Ok(()) | Err(DiscordError::NotFound) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn stored(error: &closure_sdk::StorageError) -> ModuleError {
@@ -304,6 +338,14 @@ async fn post(
             )
             .await
             .map_err(|e| stored(&e))?;
+        ctx.store()
+            .score_put(
+                BOARDS,
+                source.id.get(),
+                i64::try_from(board.get()).unwrap_or(0),
+            )
+            .await
+            .map_err(|e| stored(&e))?;
     }
     Ok(())
 }
@@ -362,16 +404,7 @@ async fn on_reaction(
         }
         Step::Remove => {
             if let Some(posted) = posted {
-                let reason = Reason::new(ctx.t_in(ctx.locale, "starboard-reason", &Args::new()))?;
-                // Gone already is as good as removed.
-                let _ = ctx
-                    .api
-                    .delete_message(
-                        ChannelId::new(posted.board),
-                        MessageId::new(posted.post),
-                        reason,
-                    )
-                    .await;
+                take_off(&ctx, &posted).await?;
                 forget(&ctx, source.id).await?;
             }
         }
@@ -427,15 +460,7 @@ async fn on_source_change(
             // The channel is not public any more: what was quoted from it comes off the board, and
             // what was said since is not put there.
             if !shareable(&ctx, &channel).await? {
-                let reason = Reason::new(ctx.t_in(ctx.locale, "starboard-reason", &Args::new()))?;
-                let _ = ctx
-                    .api
-                    .delete_message(
-                        ChannelId::new(posted.board),
-                        MessageId::new(posted.post),
-                        reason,
-                    )
-                    .await;
+                take_off(&ctx, &posted).await?;
                 forget(&ctx, message.id).await?;
                 return Ok(Flow::Continue);
             }
@@ -476,16 +501,7 @@ async fn remove_post(
     let Some(posted) = posted_of(ctx, source, board).await? else {
         return Ok(());
     };
-    let reason = Reason::new(ctx.t_in(ctx.locale, "starboard-reason", &Args::new()))?;
-    // Gone already is as good as removed.
-    let _ = ctx
-        .api
-        .delete_message(
-            ChannelId::new(posted.board),
-            MessageId::new(posted.post),
-            reason,
-        )
-        .await;
+    take_off(ctx, &posted).await?;
     forget(ctx, source).await
 }
 
