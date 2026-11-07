@@ -80,6 +80,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twilight-model",
+ "url",
 ]
 
 [[package]]
