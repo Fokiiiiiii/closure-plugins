@@ -419,9 +419,11 @@ async fn on_voice(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> 
 }
 
 #[derive(CommandArgs)]
-struct MaybeUser {
+struct RankArgs {
     /// The member; yourself when left out.
     user: Option<UserId>,
+    /// Yes: show the members with the most experience instead.
+    top: Option<bool>,
 }
 
 #[derive(CommandArgs)]
@@ -438,9 +440,17 @@ struct OneUser {
     user: UserId,
 }
 
-async fn rank(cx: CommandCx, args: MaybeUser) -> Result<(), UserError> {
+/// The level of a member, or the members with the most experience.
+async fn rank(cx: CommandCx, args: RankArgs) -> Result<(), UserError> {
+    if args.top == Some(true) {
+        return leaderboard(cx).await;
+    }
+    member_rank(cx, args.user).await
+}
+
+async fn member_rank(cx: CommandCx, user: Option<UserId>) -> Result<(), UserError> {
     let ctx = cx.ctx();
-    let user = args.user.unwrap_or(cx.user().id);
+    let user = user.unwrap_or(cx.user().id);
     let mine = experience(ctx, user).await.map_err(|e| failed(&e))?;
     let Progress {
         level,
@@ -481,7 +491,7 @@ async fn rank(cx: CommandCx, args: MaybeUser) -> Result<(), UserError> {
     .await
 }
 
-async fn leaderboard(cx: CommandCx, (): ()) -> Result<(), UserError> {
+async fn leaderboard(cx: CommandCx) -> Result<(), UserError> {
     let all = cx
         .ctx()
         .store()
@@ -680,14 +690,9 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                 }),
             )
             .command(
-                Command::<MaybeUser>::new("rank")
+                Command::<RankArgs>::new("rank")
                     .requires("leveling.view")
                     .handler(rank),
-            )
-            .command(
-                Command::<()>::new("leaderboard")
-                    .requires("leveling.view")
-                    .handler(leaderboard),
             )
             .group(
                 "xp",

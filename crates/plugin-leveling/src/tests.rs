@@ -232,7 +232,11 @@ async fn the_place_and_the_board_are_right_beyond_a_thousand_members() {
         .collect();
     assert_eq!(fields[2], "#1500 / 1500");
     let board = harness
-        .invoke(Invocation::new("leaderboard").user(70))
+        .invoke(
+            Invocation::new("rank")
+                .option("top", CommandOptionValue::Boolean(true))
+                .user(70),
+        )
         .await
         .unwrap();
     let text = board[0].embeds[0].description.clone().unwrap();
@@ -324,7 +328,11 @@ async fn rank_shows_the_level_and_the_place_and_the_leaderboard_the_order() {
         .collect();
     assert_eq!(fields, ["0", "50", "#2 / 2"]);
     let board = harness
-        .invoke(Invocation::new("leaderboard").user(70))
+        .invoke(
+            Invocation::new("rank")
+                .option("top", CommandOptionValue::Boolean(true))
+                .user(70),
+        )
         .await
         .unwrap();
     let text = board[0].embeds[0].description.clone().unwrap();

@@ -1,10 +1,8 @@
 module-description = Gives experience for messages, levels with role rewards, and a leaderboard.
 command-rank = rank
-    .description = Show the level and experience of a member
+    .description = Show the level and experience of a member, or the members with the most
 option-rank-user = user
     .description = The member; yourself when left out
-command-leaderboard = leaderboard
-    .description = Show the members with the most experience
 command-xp = xp
     .description = Change the experience of a member
 subcommand-xp-add = add
@@ -43,3 +41,5 @@ config-leveling-voice_xp_per_minute = Experience for each minute in a voice chan
 config-leveling-role_multipliers = Roles that make experience worth more or less, in percent (100 is as it is). The best of a member's roles counts.
 config-leveling-channel_multipliers = Channels where experience is worth more or less, in percent (100 is as it is).
 config-leveling-replace_rewards = A reward role takes the reward roles of the earlier levels away.
+option-rank-top = top
+    .description = Yes: show the members with the most experience instead

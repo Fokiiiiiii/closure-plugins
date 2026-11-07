@@ -1,10 +1,8 @@
 module-description = メッセージに経験値を与え、レベルとロール報酬、ランキングを提供します。
 command-rank = rank
-    .description = メンバーのレベルと経験値を表示します
+    .description = メンバーのレベルと経験値、または経験値の多いメンバーを表示します
 option-rank-user = user
     .description = メンバー（省略すると自分）
-command-leaderboard = leaderboard
-    .description = 経験値の多いメンバーを表示します
 command-xp = xp
     .description = メンバーの経験値を変更します
 subcommand-xp-add = add
@@ -43,3 +41,5 @@ config-leveling-voice_xp_per_minute = ボイスチャンネルにいた1分ご�
 config-leveling-role_multipliers = 経験値の倍率を変えるロール（％、100で等倍）。持っているロールのうち最も高いものが使われる。
 config-leveling-channel_multipliers = 経験値の倍率を変えるチャンネル（％、100で等倍）。
 config-leveling-replace_rewards = 報酬ロールを付けるとき、前のレベルの報酬ロールを外す。
+option-rank-top = top
+    .description = はい: 代わりに経験値の多いメンバーを表示します
