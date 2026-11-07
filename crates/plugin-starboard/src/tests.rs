@@ -262,3 +262,44 @@ async fn the_post_goes_with_its_source_and_follows_an_edit_of_it() {
         .unwrap();
     assert_eq!(deleted(&harness), 1);
 }
+
+#[tokio::test]
+async fn an_edit_made_after_the_channel_went_private_is_not_put_on_the_board() {
+    let harness = harness();
+    harness
+        .api()
+        .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
+    react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
+    assert_eq!(posts(&harness).len(), 1);
+    // The channel stops being readable by everyone, and then the message is edited.
+    harness.api().set_channels(
+        Id::new(GUILD),
+        vec![
+            channel(
+                SOURCE_CHANNEL,
+                &json!([{"id": GUILD.to_string(), "type": 0, "allow": "0", "deny": "1024"}]),
+                false,
+            ),
+            channel(BOARD, &json!([]), false),
+        ],
+    );
+    let info = serde_json::from_value(json!({
+        "id": "100", "channel_id": SOURCE_CHANNEL.to_string(), "guild_id": GUILD.to_string(),
+        "author": {"id": "60", "name": "alice", "bot": false}, "author_roles": [],
+        "content": "something only some may read", "mentioned_users": [],
+        "mentions_everyone": false, "from_webhook": false, "created_at": 0,
+    }))
+    .expect("a message");
+    harness.emit(Event::MessageUpdated(info)).await.unwrap();
+    assert!(
+        !harness.actions().iter().any(|a| matches!(
+            a,
+            Action::EditMessage {
+                embeds: Some(_),
+                ..
+            }
+        )),
+        "the new text is not quoted"
+    );
+    assert_eq!(deleted(&harness), 1, "what was quoted comes off the board");
+}

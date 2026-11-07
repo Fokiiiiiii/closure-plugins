@@ -217,6 +217,13 @@ async fn is_public(ctx: &EventContext, channel: &Channel) -> Result<bool, Module
     )
 }
 
+/// Whether what is said in `channel` may be shown to all. What was said for some people only, or
+/// for adults only, is not. Asked again whenever a post is made or changed: a channel that was
+/// public may not be any longer.
+async fn shareable(ctx: &EventContext, channel: &Channel) -> Result<bool, ModuleError> {
+    Ok(channel.nsfw != Some(true) && !channel.kind.is_thread() && is_public(ctx, channel).await?)
+}
+
 fn quoted(message: &Message, guild: GuildId, place: &str) -> Quoted {
     Quoted {
         author: message
@@ -265,8 +272,7 @@ async fn post(
     else {
         return Ok(());
     };
-    // What was said for some people only, or for adults only, is not shown to all.
-    if channel.nsfw == Some(true) || channel.kind.is_thread() || !is_public(ctx, &channel).await? {
+    if !shareable(ctx, &channel).await? {
         return Ok(());
     }
     let place = channel.name.as_deref().unwrap_or("channel");
@@ -418,6 +424,21 @@ async fn on_source_change(
             else {
                 return Ok(Flow::Continue);
             };
+            // The channel is not public any more: what was quoted from it comes off the board, and
+            // what was said since is not put there.
+            if !shareable(&ctx, &channel).await? {
+                let reason = Reason::new(ctx.t_in(ctx.locale, "starboard-reason", &Args::new()))?;
+                let _ = ctx
+                    .api
+                    .delete_message(
+                        ChannelId::new(posted.board),
+                        MessageId::new(posted.post),
+                        reason,
+                    )
+                    .await;
+                forget(&ctx, message.id).await?;
+                return Ok(Flow::Continue);
+            }
             let place = channel.name.as_deref().unwrap_or("channel");
             let embed = quote_embed(
                 &quoted(&source, ctx.guild_id, place),
