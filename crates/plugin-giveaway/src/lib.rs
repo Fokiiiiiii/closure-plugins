@@ -50,6 +50,10 @@ struct Giveaway {
     /// next run of the job.
     #[serde(default)]
     announced: bool,
+    /// Who was drawn, kept when the draw is made, so a telling that failed is tried again for the
+    /// same winners and not for a new draw.
+    #[serde(default)]
+    drawn: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,11 +187,23 @@ async fn finish(
             Err(error) => return Err(stored(&error)),
         }
     }
-    let winners = ctx
-        .store()
-        .set_sample(&entries_of(message), giveaway.winners as usize)
-        .await
-        .map_err(|e| stored(&e))?;
+    let winners = if let (Some(drawn), false) = (&giveaway.drawn, redraw) {
+        drawn.clone()
+    } else {
+        let winners = ctx
+            .store()
+            .set_sample(&entries_of(message), giveaway.winners as usize)
+            .await
+            .map_err(|e| stored(&e))?;
+        if !redraw {
+            giveaway.drawn = Some(winners.clone());
+            ctx.store()
+                .set(&key, &giveaway)
+                .await
+                .map_err(|e| stored(&e))?;
+        }
+        winners
+    };
     let channel = ChannelId::new(giveaway.channel);
     let host = format!("<@{}>", giveaway.host);
     if !redraw {
@@ -223,27 +239,22 @@ async fn finish(
             tracing::debug!(?error, "the message of a giveaway was not edited");
         }
     }
-    if !redraw {
-        giveaway.announced = true;
-        ctx.store()
-            .set(&key, &giveaway)
-            .await
-            .map_err(|e| stored(&e))?;
-    }
     if winners.is_empty() {
+        mark_announced(ctx, &key, &mut giveaway, redraw).await?;
         return Ok(Finish::NoEntries);
     }
-    let key = if redraw {
+    let words = if redraw {
         "giveaway-redrawn"
     } else {
         "giveaway-won"
     };
+    let mut untold = false;
     // As many messages as the winners need, the first with the words.
     for (at, names) in winners.chunks(NAMES_PER_MESSAGE).enumerate() {
         let text = if at == 0 {
             ctx.t_in(
                 ctx.locale,
-                key,
+                words,
                 &Args::new()
                     .with("winners", mentions(names))
                     .with("prize", giveaway.prize.clone()),
@@ -268,9 +279,31 @@ async fn finish(
             .await;
         if let Err(error) = told {
             tracing::debug!(?error, "the winners of a giveaway were not announced");
+            untold = true;
         }
     }
+    // Done once they were told: a telling that failed is tried again, for the same winners.
+    if untold && !redraw {
+        return Err(ModuleError::other(
+            "the winners of a giveaway were not told",
+        ));
+    }
+    mark_announced(ctx, &key, &mut giveaway, redraw).await?;
     Ok(Finish::Drawn)
+}
+
+/// Notes that the end of a giveaway was announced.
+async fn mark_announced(
+    ctx: &EventContext,
+    key: &str,
+    giveaway: &mut Giveaway,
+    redraw: bool,
+) -> Result<(), ModuleError> {
+    if redraw {
+        return Ok(());
+    }
+    giveaway.announced = true;
+    ctx.store().set(key, giveaway).await.map_err(|e| stored(&e))
 }
 
 #[derive(CommandArgs)]
@@ -319,6 +352,7 @@ async fn start(cx: CommandCx, args: Start) -> Result<(), UserError> {
         host: cx.user().id.get(),
         ended: false,
         announced: false,
+        drawn: None,
     };
     let text = ctx.t_in(
         ctx.locale,

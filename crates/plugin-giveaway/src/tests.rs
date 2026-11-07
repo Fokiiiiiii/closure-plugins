@@ -125,6 +125,7 @@ async fn the_button_enters_and_a_second_press_leaves() {
         host: 1,
         ended: false,
         announced: false,
+        drawn: None,
     };
     harness.store().set("g:900", &record).await.unwrap();
     let click = |user: u64| Click::new("giveaway:join:*").user(user);
@@ -175,6 +176,42 @@ async fn at_the_end_the_winners_are_told_and_the_button_goes_and_it_ends_only_on
     // Ending it again does nothing.
     harness.invoke(of_message("end", 1)).await.unwrap();
     assert_eq!(announced(&harness).len(), 1);
+}
+
+#[tokio::test]
+async fn a_telling_that_failed_is_tried_again_for_the_same_winners() {
+    let harness = harness();
+    harness.invoke(start("a prize", "1m")).await.unwrap();
+    for user in 1..=20_u64 {
+        enter(&harness, 1, user).await;
+    }
+    // The first call of the end is the edit of the message, the second tells the winner.
+    harness
+        .api()
+        .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
+    harness.advance(Duration::from_secs(61));
+    let first = harness.run_due_jobs().await;
+    assert!(first.iter().any(Result::is_err), "{first:?}");
+    let stored: Giveaway = harness.store().get("g:1").await.unwrap().unwrap();
+    assert!(
+        !stored.announced,
+        "it is not done until the winners were told"
+    );
+    let drawn = stored.drawn.clone().expect("the draw is kept");
+    assert_eq!(drawn.len(), 1);
+
+    for _ in 0..3 {
+        harness.advance(Duration::from_secs(600));
+        harness.run_due_jobs().await;
+    }
+    let told = announced(&harness);
+    assert_eq!(told.len(), 1, "told once, in the end");
+    assert_eq!(
+        told[0].1, drawn,
+        "the same winner as the draw that was kept"
+    );
+    let stored: Giveaway = harness.store().get("g:1").await.unwrap().unwrap();
+    assert!(stored.announced);
 }
 
 #[tokio::test]
