@@ -39,7 +39,7 @@ use twilight_util::permission_calculator::PermissionCalculator;
 
 use crate::links::MessageLink;
 
-pub use plugin_kit::net::{Fetcher, Get};
+pub use plugin_kit::net::{Budget, Fetcher, Get};
 
 const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
@@ -371,11 +371,31 @@ fn buttons(
     clippy::too_many_lines,
     reason = "one flow: find the links, expand them, answer"
 )]
+/// What one message may ask of the network, in calls and in time.
+const EVENT_CALLS: usize = 30;
+const EVENT_TIME: std::time::Duration = std::time::Duration::from_secs(20);
+
 async fn on_message(
     fetch: Arc<dyn Get>,
     ctx: EventContext,
     event: Event,
 ) -> Result<Flow, ModuleError> {
+    // A message with many links, or a long thread of quotes, gets a part of the network and of the
+    // time, not all it asks for: the handler's own limit is not met by waiting on the calls.
+    let budget = Budget::new(&*fetch, EVENT_CALLS);
+    if let Ok(result) = tokio::time::timeout(EVENT_TIME, expand(&budget, ctx, event)).await {
+        result
+    } else {
+        tracing::debug!("a message took too long to expand; it is left alone");
+        Ok(Flow::Continue)
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flow: the links of a message, the posts, the pieces, the answer"
+)]
+async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
     let Event::MessageCreated(message) = &event else {
         return Ok(Flow::Continue);
     };
@@ -415,14 +435,14 @@ async fn on_message(
             if planned >= cap {
                 break;
             }
-            let tweet = match fetch_post(&*fetch, link.id).await {
+            let tweet = match fetch_post(get, link.id).await {
                 Ok(tweet) => tweet,
                 Err(error) => {
                     tracing::debug!(%error, "a post is not expanded");
                     continue;
                 }
             };
-            let mut thread = walk(&*fetch, tweet, config.replied_post, config.quoted_post).await;
+            let mut thread = walk(get, tweet, config.replied_post, config.quoted_post).await;
             // What does not fit goes, from the far ends: the post that was linked stays.
             thread.fit(cap - planned);
             planned += thread.size();
@@ -438,7 +458,7 @@ async fn on_message(
                 open.get_or_insert_with(|| piece.link.clone());
             }
             let embed = if config.auto_translate {
-                with_translation(&*fetch, &ctx, piece.embed, limit).await
+                with_translation(get, &ctx, piece.embed, limit).await
             } else {
                 piece.embed
             };
@@ -469,7 +489,7 @@ async fn on_message(
         Layout::Chain => {
             send_chain(
                 &ctx,
-                &*fetch,
+                get,
                 message,
                 &units,
                 &config,
@@ -481,7 +501,7 @@ async fn on_message(
         Layout::Embeds => {
             send_embeds(
                 &ctx,
-                &*fetch,
+                get,
                 message,
                 units,
                 &config,

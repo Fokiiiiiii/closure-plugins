@@ -41,6 +41,52 @@ pub trait Get: Send + Sync {
     }
 }
 
+/// A number of calls to another [`Get`] and no more: what one event may ask of the network, so a
+/// post with a long thread of quotes cannot hold the handler for as long as it takes to follow all.
+pub struct Budget<'a> {
+    inner: &'a dyn Get,
+    left: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Debug for Budget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budget").finish_non_exhaustive()
+    }
+}
+
+impl<'a> Budget<'a> {
+    #[must_use]
+    pub fn new(inner: &'a dyn Get, calls: usize) -> Self {
+        Self {
+            inner,
+            left: std::sync::atomic::AtomicUsize::new(calls),
+        }
+    }
+
+    fn spend(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        self.left
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .map(drop)
+            .map_err(|_| anyhow::anyhow!("the calls this event may make are used up"))
+    }
+}
+
+#[async_trait]
+impl Get for Budget<'_> {
+    async fn get(&self, url: &str) -> Result<Vec<u8>> {
+        self.spend()?;
+        self.inner.get(url).await
+    }
+
+    async fn get_large(&self, url: &str, max: usize) -> Result<Vec<u8>> {
+        self.spend()?;
+        self.inner.get_large(url, max).await
+    }
+}
+
 pub struct Fetcher {
     client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>,
 }
@@ -106,5 +152,32 @@ impl std::fmt::Debug for Fetcher {
 impl Default for Fetcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct Counting(AtomicUsize);
+
+    #[async_trait]
+    impl Get for Counting {
+        async fn get(&self, _url: &str) -> Result<Vec<u8>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_budget_lets_through_its_calls_and_no_more() {
+        let inner = Counting(AtomicUsize::new(0));
+        let budget = Budget::new(&inner, 2);
+        assert!(budget.get("a").await.is_ok());
+        assert!(budget.get_large("b", 10).await.is_ok());
+        assert!(budget.get("c").await.is_err());
+        assert_eq!(inner.0.load(Ordering::Relaxed), 2);
     }
 }
