@@ -864,7 +864,8 @@ async fn send_chain(
     let by = message.author.id;
     // The message of the videos is one of the messages the button names.
     let units = if units.iter().any(|unit| unit.video.is_some()) {
-        &units[..units.len().min(MAX_UNITS - 1)]
+        // The post that was linked is the last of the thread: what goes is the far end of it.
+        &units[units.len().saturating_sub(MAX_UNITS - 1)..]
     } else {
         units
     };

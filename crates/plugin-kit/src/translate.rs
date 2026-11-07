@@ -71,12 +71,62 @@ pub fn parse(bytes: &[u8]) -> Result<Translation> {
     Ok(Translation { text, from })
 }
 
-/// Translates `text` into the language `to`.
+/// How many requests one text may take: a longer text is cut, and the cut is shown.
+pub const MAX_CHUNKS: usize = 3;
+
+/// `text` in pieces of at most [`MAX_CHARS`], each ended where a line, a sentence or a word ends if
+/// there is such a place in its second half; the pieces are at most [`MAX_CHUNKS`].
+#[must_use]
+pub fn chunks_of(text: &str) -> Vec<String> {
+    let mut rest: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    while !rest.is_empty() && out.len() < MAX_CHUNKS {
+        if rest.len() <= MAX_CHARS {
+            out.push(rest.iter().collect());
+            rest.clear();
+            break;
+        }
+        let window = &rest[..MAX_CHARS];
+        let cut = window
+            .iter()
+            .rposition(|c| matches!(c, '\n' | '。' | '.' | '!' | '?' | '！' | '？' | ' '))
+            .filter(|at| *at >= MAX_CHARS / 2)
+            .map_or(MAX_CHARS, |at| at + 1);
+        out.push(rest[..cut].iter().collect());
+        rest.drain(..cut);
+    }
+    // What is left over is shown by the mark the translation ends with.
+    if !rest.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Translates `text` into the language `to`, in pieces when it is long. A text that is longer than
+/// the pieces allowed ends with an ellipsis, so a part of a text is never taken for all of it.
 ///
 /// # Errors
 /// The service is out of reach, or its answer cannot be read.
 pub async fn translate(get: &dyn Get, text: &str, to: &str) -> Result<Translation> {
-    parse(&get.get(&request_url(text, to)).await?)
+    let mut chunks = chunks_of(text);
+    // An empty last piece says that there was more.
+    let cut = chunks.last().is_some_and(String::is_empty);
+    if cut {
+        chunks.pop();
+    }
+    let mut joined = String::new();
+    let mut from = String::from("?");
+    for (n, chunk) in chunks.iter().enumerate() {
+        let part = parse(&get.get(&request_url(chunk, to)).await?)?;
+        if n == 0 {
+            from = part.from;
+        }
+        joined.push_str(&part.text);
+    }
+    if cut {
+        joined.push('…');
+    }
+    Ok(Translation { text: joined, from })
 }
 
 #[cfg(test)]
@@ -95,6 +145,24 @@ mod tests {
         let url = request_url(&"a".repeat(MAX_CHARS + 50), "ja");
         assert_eq!(url.split("&q=").nth(1).map(str::len), Some(MAX_CHARS));
         assert!(url.contains("tl=ja"));
+    }
+
+    #[test]
+    fn a_long_text_is_cut_in_pieces_at_a_line_or_sentence_end_and_the_rest_is_marked() {
+        let sentence = format!("{}. ", "a".repeat(500));
+        let text = sentence.repeat(6);
+        let chunks = chunks_of(&text);
+        // Three pieces, each ending after a full stop, and an empty one that says the text went on.
+        assert_eq!(chunks.len(), MAX_CHUNKS + 1);
+        assert!(
+            chunks[..MAX_CHUNKS]
+                .iter()
+                .all(|c| c.chars().count() <= MAX_CHARS)
+        );
+        assert!(chunks[0].ends_with(". "));
+        assert!(chunks[MAX_CHUNKS].is_empty());
+        assert_eq!(chunks_of("short"), ["short"]);
+        assert!(chunks_of("").is_empty());
     }
 
     #[test]
