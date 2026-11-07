@@ -217,3 +217,48 @@ fn both_catalogs_define_the_same_messages() {
         Vec::<String>::new()
     );
 }
+
+#[tokio::test]
+async fn the_post_goes_with_its_source_and_follows_an_edit_of_it() {
+    let harness = harness();
+    harness
+        .api()
+        .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
+    react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
+    assert_eq!(posts(&harness).len(), 1);
+    // The source is edited: the quote of the post is made again.
+    let edited = serde_json::from_value(json!({
+        "id": "100", "channel_id": SOURCE_CHANNEL.to_string(), "guild_id": GUILD.to_string(),
+        "author": {"id": "60", "name": "alice", "bot": false}, "author_roles": [],
+        "content": "changed", "mentioned_users": [], "mentions_everyone": false,
+        "from_webhook": false, "created_at": 0,
+    }));
+    {
+        let info = edited.expect("a message");
+        harness.emit(Event::MessageUpdated(info)).await.unwrap();
+        let quotes = harness
+            .actions()
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::EditMessage {
+                        embeds: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(quotes, 1);
+    }
+    // The source is deleted: the post is taken off the board.
+    harness
+        .emit(Event::MessageDeleted {
+            guild_id: Id::new(GUILD),
+            channel_id: ChannelId::new(SOURCE_CHANNEL),
+            message_id: MessageId::new(100),
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted(&harness), 1);
+}

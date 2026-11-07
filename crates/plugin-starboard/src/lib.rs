@@ -373,6 +373,101 @@ async fn on_reaction(
     Ok(Flow::Continue)
 }
 
+/// A message that was starred is deleted, or changed: its post follows. A deleted source takes its
+/// post away; an edited one has the quote of the post made again.
+async fn on_source_change(
+    locks: Arc<Locks>,
+    ctx: EventContext,
+    event: Event,
+) -> Result<Flow, ModuleError> {
+    let config: Config = ctx.parse_config()?;
+    let Some(board) = config.board() else {
+        return Ok(Flow::Continue);
+    };
+    match &event {
+        Event::MessageDeleted {
+            channel_id,
+            message_id,
+            ..
+        } if *channel_id != board => remove_post(&ctx, &locks, board, *message_id).await?,
+        Event::MessagesBulkDeleted {
+            channel_id,
+            message_ids,
+            ..
+        } if *channel_id != board => {
+            for message_id in message_ids {
+                remove_post(&ctx, &locks, board, *message_id).await?;
+            }
+        }
+        Event::MessageUpdated(message) if message.channel_id != board => {
+            let _one_at_a_time = locks.of(message.id).lock().await;
+            let Some(posted) = posted_of(&ctx, message.id, board).await? else {
+                return Ok(Flow::Continue);
+            };
+            let source = match ctx.api.get_message(message.channel_id, message.id).await {
+                Ok(source) => source,
+                Err(DiscordError::NotFound) => return Ok(Flow::Continue),
+                Err(error) => return Err(error.into()),
+            };
+            let Outcome::Channel(channel) = ctx
+                .api
+                .execute(Action::GetChannel {
+                    channel_id: source.channel_id,
+                })
+                .await?
+            else {
+                return Ok(Flow::Continue);
+            };
+            let place = channel.name.as_deref().unwrap_or("channel");
+            let embed = quote_embed(
+                &quoted(&source, ctx.guild_id, place),
+                QUOTE_CHARS,
+                &ctx.t_in(ctx.locale, "starboard-source", &Args::new()),
+            );
+            let edited = ctx
+                .api
+                .execute(Action::EditMessage {
+                    channel_id: ChannelId::new(posted.board),
+                    message_id: MessageId::new(posted.post),
+                    content: None,
+                    embeds: Some(vec![embed]),
+                })
+                .await;
+            match edited {
+                Ok(_) => {}
+                Err(DiscordError::NotFound) => forget(&ctx, message.id).await?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        _ => {}
+    }
+    Ok(Flow::Continue)
+}
+
+/// Takes the post of `source` off the board, if it has one.
+async fn remove_post(
+    ctx: &EventContext,
+    locks: &Locks,
+    board: ChannelId,
+    source: MessageId,
+) -> Result<(), ModuleError> {
+    let _one_at_a_time = locks.of(source).lock().await;
+    let Some(posted) = posted_of(ctx, source, board).await? else {
+        return Ok(());
+    };
+    let reason = Reason::new(ctx.t_in(ctx.locale, "starboard-reason", &Args::new()))?;
+    // Gone already is as good as removed.
+    let _ = ctx
+        .api
+        .delete_message(
+            ChannelId::new(posted.board),
+            MessageId::new(posted.post),
+            reason,
+        )
+        .await;
+    forget(ctx, source).await
+}
+
 /// The module.
 ///
 /// # Errors
@@ -416,7 +511,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .capability(closure_sdk::Capability::ManageMessages)
             .capability(closure_sdk::Capability::ReadGuild)
             .capability(closure_sdk::Capability::Storage)
-            .intents(Intents::GUILD_MESSAGE_REACTIONS)
+            .intents(Intents::GUILD_MESSAGE_REACTIONS | Intents::GUILD_MESSAGES)
             .config(
                 schema,
                 json!({"channel": null, "threshold": 3, "emoji": DEFAULT_EMOJI, "self_star": false}),
@@ -425,8 +520,20 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                 let locks = Arc::clone(&locks);
                 move |ctx, event| on_reaction(Arc::clone(&locks), ctx, event)
             })
-            .on(Subscription::new(EventKind::ReactionRemoved), move |ctx, event| {
-                on_reaction(Arc::clone(&locks), ctx, event)
+            .on(Subscription::new(EventKind::ReactionRemoved), {
+                let locks = Arc::clone(&locks);
+                move |ctx, event| on_reaction(Arc::clone(&locks), ctx, event)
+            })
+            .on(Subscription::new(EventKind::MessageDeleted), {
+                let locks = Arc::clone(&locks);
+                move |ctx, event| on_source_change(Arc::clone(&locks), ctx, event)
+            })
+            .on(Subscription::new(EventKind::MessagesBulkDeleted), {
+                let locks = Arc::clone(&locks);
+                move |ctx, event| on_source_change(Arc::clone(&locks), ctx, event)
+            })
+            .on(Subscription::new(EventKind::MessageUpdated), move |ctx, event| {
+                on_source_change(Arc::clone(&locks), ctx, event)
             })
             .catalog(Locale::En, EN)
             .catalog(Locale::Ja, JA),
