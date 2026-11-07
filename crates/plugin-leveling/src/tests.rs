@@ -189,6 +189,8 @@ async fn a_reward_can_take_the_rewards_before_it_away() {
         "xp_per_message": 1000, "cooldown_seconds": 0, "announce": false,
         "rewards": rewards, "replace_rewards": true,
     }));
+    // The member has the role of level 2, which is given as the level is reached.
+    harness.api().set_member(Id::new(1), member(50, &[10]));
     say(&harness, 50, 5).await;
     let gone: Vec<u64> = harness
         .actions()
@@ -382,5 +384,28 @@ fn both_catalogs_define_the_same_messages() {
     assert_eq!(
         closure_i18n::missing_keys(crate::JA, crate::EN).unwrap(),
         Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn an_earlier_reward_stays_when_the_best_one_could_not_be_given() {
+    let harness = harness(&json!({
+        "xp_per_message": 1000, "cooldown_seconds": 0, "announce": false,
+        "rewards": json!([{"level": 1, "role": "9"}, {"level": 2, "role": "10"}]),
+        "replace_rewards": true,
+    }));
+    // The member has the first reward, not the second (it could not be given at level 2).
+    harness.api().set_member(Id::new(1), member(50, &[9]));
+    harness.api().fail_role(
+        Id::new(10),
+        closure_core::error::DiscordError::Forbidden("above the bot".into()),
+    );
+    say(&harness, 50, 5).await;
+    assert!(
+        !harness
+            .actions()
+            .iter()
+            .any(|a| matches!(a, Action::RemoveRole { .. })),
+        "the member is not left with none"
     );
 }

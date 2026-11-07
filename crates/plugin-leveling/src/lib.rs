@@ -300,6 +300,27 @@ async fn take_earlier_rewards_away(
     else {
         return Ok(());
     };
+    // The best reward must be on the member before the earlier ones go: a reward that failed to
+    // be given at its level is given now, and if it still cannot be, nothing is taken away.
+    let Ok(member) = ctx.api.get_member(ctx.guild_id, user).await else {
+        return Ok(());
+    };
+    for reward in config.rewards.iter().filter(|r| r.level == top) {
+        let Some(role) = snowflake(&reward.role).map(RoleId::new) else {
+            continue;
+        };
+        if member.roles.contains(&role) {
+            continue;
+        }
+        let reason = Reason::new(ctx.t_in(ctx.locale, "leveling-reward-reason", &Args::new()))?;
+        if let Err(error) = ctx.api.add_role(ctx.guild_id, user, role, reason).await {
+            tracing::debug!(
+                ?error,
+                "could not give the best reward; the earlier ones stay"
+            );
+            return Ok(());
+        }
+    }
     for reward in config.rewards.iter().filter(|r| r.level < top) {
         let Some(role) = snowflake(&reward.role).map(RoleId::new) else {
             continue;
