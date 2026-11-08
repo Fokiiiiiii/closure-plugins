@@ -71,7 +71,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "closure-core"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#90a53ca0dbb682d4fbce929fa0280c9c96b94299"
+source = "git+https://github.com/Fokiiiiiii/closure#59591c4e2d11e33d57c943f22bb76601f2a79dfe"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -87,7 +87,7 @@ dependencies = [
 [[package]]
 name = "closure-i18n"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#90a53ca0dbb682d4fbce929fa0280c9c96b94299"
+source = "git+https://github.com/Fokiiiiiii/closure#59591c4e2d11e33d57c943f22bb76601f2a79dfe"
 dependencies = [
  "closure-core",
  "fluent-bundle",
@@ -114,7 +114,7 @@ dependencies = [
 [[package]]
 name = "closure-sdk"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#90a53ca0dbb682d4fbce929fa0280c9c96b94299"
+source = "git+https://github.com/Fokiiiiiii/closure#59591c4e2d11e33d57c943f22bb76601f2a79dfe"
 dependencies = [
  "async-trait",
  "closure-core",
@@ -132,7 +132,7 @@ dependencies = [
 [[package]]
 name = "closure-sdk-macros"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#90a53ca0dbb682d4fbce929fa0280c9c96b94299"
+source = "git+https://github.com/Fokiiiiiii/closure#59591c4e2d11e33d57c943f22bb76601f2a79dfe"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -189,7 +189,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -907,7 +907,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1421,7 +1421,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

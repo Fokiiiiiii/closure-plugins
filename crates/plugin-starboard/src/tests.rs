@@ -370,3 +370,26 @@ async fn a_post_stays_managed_on_the_board_it_was_made_on() {
         "the old post is taken off the old board"
     );
 }
+
+#[tokio::test]
+async fn the_authors_own_star_is_left_out_however_many_people_reacted() {
+    let harness = harness();
+    let mut starred = serde_json::to_value(message(SOURCE_CHANNEL, 100, 1_201, "⭐")).unwrap();
+    starred["author"]["id"] = json!("5000");
+    harness
+        .api()
+        .set_message(serde_json::from_value(starred).unwrap());
+    // Discord lists the reactors by id: the author is the last of more than a thousand.
+    let mut reactors: Vec<UserId> = (1_000..2_200).map(UserId::new).collect();
+    reactors.push(UserId::new(5_000));
+    harness.api().set_reactors(
+        ChannelId::new(SOURCE_CHANNEL),
+        MessageId::new(100),
+        reactors,
+    );
+    react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
+    assert_eq!(
+        posts(&harness),
+        [format!("⭐ **1200** | <#{SOURCE_CHANNEL}>")]
+    );
+}

@@ -174,9 +174,6 @@ fn emoji_of(configured: &str) -> Emoji {
     }
 }
 
-/// How many pages of reactors are read to find the author among them.
-const REACTOR_PAGES: usize = 10;
-
 /// The stars of a message: the reactions of the configured emoji, without the author's own unless
 /// the server counts it.
 async fn count_stars(
@@ -196,35 +193,35 @@ async fn count_stars(
             }
         });
     let mut stars = counted.map_or(0, |r| u32::try_from(r.count).unwrap_or(u32::MAX));
-    if !config.self_star && stars > 0 {
-        // The reactors are read a hundred at a time, as far as the stars go (at most REACTOR_PAGES
-        // pages): the author may be on any of them.
-        let mut after = None;
-        for _ in 0..REACTOR_PAGES {
-            let Outcome::Users(users) = ctx
-                .api
-                .execute(Action::GetReactionUsers {
-                    channel_id: message.channel_id,
-                    message_id: message.id,
-                    emoji: emoji_of(&config.emoji),
-                    after,
-                    limit: 100,
-                })
-                .await?
-            else {
-                break;
-            };
-            if users.iter().any(|user| user.id == message.author.id) {
-                stars -= 1;
-                break;
-            }
-            if users.len() < 100 {
-                break;
-            }
-            after = users.last().map(|user| user.id);
-        }
+    if !config.self_star && stars > 0 && author_reacted(ctx, message, config).await? {
+        stars -= 1;
     }
     Ok(stars)
+}
+
+/// Whether the author reacted with the emoji. Discord lists the reactors by user id, so the first
+/// one after the id just below the author's is the author, if the author is among them: one
+/// request, however many people reacted.
+async fn author_reacted(
+    ctx: &EventContext,
+    message: &Message,
+    config: &Config,
+) -> Result<bool, ModuleError> {
+    let author = message.author.id;
+    let Outcome::Users(users) = ctx
+        .api
+        .execute(Action::GetReactionUsers {
+            channel_id: message.channel_id,
+            message_id: message.id,
+            emoji: emoji_of(&config.emoji),
+            after: UserId::new_checked(author.get().saturating_sub(1)),
+            limit: 1,
+        })
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(users.first().is_some_and(|user| user.id == author))
 }
 
 /// Whether everybody in the server can read `channel`.
