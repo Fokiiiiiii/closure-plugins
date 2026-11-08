@@ -374,7 +374,8 @@ fn buttons(
 )]
 /// What one message may ask of the network, in calls and in time.
 const EVENT_CALLS: usize = 30;
-const EVENT_TIME: std::time::Duration = std::time::Duration::from_secs(20);
+// Under the 10 seconds a handler has by default, so the answer is cut short by this and not by the host.
+const EVENT_TIME: std::time::Duration = std::time::Duration::from_secs(8);
 
 async fn on_message(
     fetch: Arc<dyn Get>,
@@ -594,37 +595,46 @@ async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), Use
     }
     cx.defer(true).await?;
     let to = cx.locale().tag();
-    let mut posts: Vec<x::Tweet> = Vec::new();
-    for id in ids {
-        let Ok(tweet) = fetch_post(&*fetch, id).await else {
-            continue;
-        };
-        let thread = walk(&*fetch, tweet, true, true).await;
-        posts.extend(thread.ancestors);
-        posts.push(thread.post);
-        posts.extend(thread.quotes);
-    }
-    posts.truncate(MAX_EMBEDS);
-    let each = (TEXT_BUDGET / posts.len().max(1)).clamp(120, 1300);
-    let mut embeds = Vec::new();
-    for tweet in &posts {
-        // A post that cannot be translated is left out; the others still are told.
-        let Ok(done) = translate::translate(&*fetch, &tweet.text, to).await else {
-            continue;
-        };
-        let text = format!(
-            "**{} (@{})**\n{}",
-            tweet.author.name,
-            tweet.author.screen_name,
-            plugin_kit::truncate(&done.text, each)
-        );
-        let embed = closure_sdk::EmbedBuilder::new()
-            .description(text)
-            .footer(format!("{} → {to}", done.from))
-            .build()
-            .map_err(|_| failed())?;
-        embeds.push(embed);
-    }
+    // The same share of the network and of the time as a message gets: a thread of quotes does not
+    // use up the handler.
+    let budget = Budget::new(&*fetch, EVENT_CALLS);
+    let work = async {
+        let mut posts: Vec<x::Tweet> = Vec::new();
+        for id in ids {
+            let Ok(tweet) = fetch_post(&budget, id).await else {
+                continue;
+            };
+            let thread = walk(&budget, tweet, true, true).await;
+            posts.extend(thread.ancestors);
+            posts.push(thread.post);
+            posts.extend(thread.quotes);
+        }
+        posts.truncate(MAX_EMBEDS);
+        let each = (TEXT_BUDGET / posts.len().max(1)).clamp(120, 1300);
+        let mut embeds = Vec::new();
+        for tweet in &posts {
+            // A post that cannot be translated is left out; the others still are told.
+            let Ok(done) = translate::translate(&budget, &tweet.text, to).await else {
+                continue;
+            };
+            let text = format!(
+                "**{} (@{})**\n{}",
+                tweet.author.name,
+                tweet.author.screen_name,
+                plugin_kit::truncate(&done.text, each)
+            );
+            let embed = closure_sdk::EmbedBuilder::new()
+                .description(text)
+                .footer(format!("{} → {to}", done.from))
+                .build()
+                .map_err(|_| failed())?;
+            embeds.push(embed);
+        }
+        Ok::<_, UserError>(embeds)
+    };
+    let embeds = tokio::time::timeout(EVENT_TIME, work)
+        .await
+        .map_err(|_| failed())??;
     if embeds.is_empty() {
         return Err(failed());
     }
@@ -893,6 +903,23 @@ async fn send_embeds(
     Ok(())
 }
 
+/// At most `room` of the units, in their order: the posts that were linked first, and then those
+/// nearest to them, so that what goes is the far end of the thread and never what was linked.
+fn within(units: &[Unit], room: usize) -> Vec<&Unit> {
+    if units.len() <= room {
+        return units.iter().collect();
+    }
+    let anchor = units
+        .iter()
+        .position(|unit| unit.main)
+        .unwrap_or(units.len() - 1);
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    order.sort_by_key(|&at| (!units[at].main, at.abs_diff(anchor)));
+    order.truncate(room);
+    order.sort_unstable();
+    order.into_iter().map(|at| &units[at]).collect()
+}
+
 /// The answer as the videos in a message of their own, then a message for each post; the buttons
 /// are under the last one and take them all away.
 async fn send_chain(
@@ -906,11 +933,10 @@ async fn send_chain(
 ) -> Result<(), ModuleError> {
     let by = message.author.id;
     // The message of the videos is one of the messages the button names.
-    let units = if units.iter().any(|unit| unit.video.is_some()) {
-        // The post that was linked is the last of the thread: what goes is the far end of it.
-        &units[units.len().saturating_sub(MAX_UNITS - 1)..]
+    let units: Vec<&Unit> = if units.iter().any(|unit| unit.video.is_some()) {
+        within(units, MAX_UNITS - 1)
     } else {
-        units
+        units.iter().collect()
     };
     let mut posts = Vec::new();
     let mut videos: Vec<String> = Vec::new();

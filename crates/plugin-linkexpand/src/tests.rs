@@ -677,3 +677,42 @@ fn embeds_that_are_too_long_together_are_shortened_and_not_refused() {
     assert!(total <= 5_800, "{total}");
     assert_eq!(embeds.len(), 10, "all are kept, shortened");
 }
+
+#[test]
+fn a_chain_that_is_too_long_keeps_what_was_linked_and_its_neighbours() {
+    let unit = |main: bool| crate::Unit {
+        embed: twilight_model::channel::message::Embed {
+            author: None,
+            color: None,
+            description: None,
+            fields: Vec::new(),
+            footer: None,
+            image: None,
+            kind: "rich".into(),
+            provider: None,
+            thumbnail: None,
+            timestamp: None,
+            title: Some(if main { "main" } else { "other" }.into()),
+            url: None,
+            video: None,
+        },
+        photos: Vec::new(),
+        video: None,
+        link: None,
+        main,
+    };
+    // One that was linked, with a post it answers before it and three quotes after it.
+    let units = vec![
+        unit(false),
+        unit(true),
+        unit(false),
+        unit(false),
+        unit(false),
+    ];
+    let kept = crate::within(&units, 3);
+    assert_eq!(kept.len(), 3);
+    assert!(
+        kept.iter().any(|unit| unit.main),
+        "what was linked is never the one that goes"
+    );
+}
