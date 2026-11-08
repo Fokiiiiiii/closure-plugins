@@ -13,7 +13,6 @@ use crate::net::Get;
 /// The most characters sent in one request.
 pub const MAX_CHARS: usize = 700;
 
-/// A text in another language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Translation {
     pub text: String,
@@ -46,8 +45,6 @@ pub fn request_url(text: &str, to: &str) -> String {
     )
 }
 
-/// Reads the answer of the service.
-///
 /// # Errors
 /// The answer is not the shape the service gives.
 pub fn parse(bytes: &[u8]) -> Result<Translation> {
@@ -102,9 +99,7 @@ pub fn chunks_of(text: &str) -> Vec<String> {
     out
 }
 
-/// Translates `text` into the language `to`, in pieces when it is long. A text that is longer than
-/// the pieces allowed ends with an ellipsis, so a part of a text is never taken for all of it.
-///
+/// Translates `text` into `to`, in pieces when long; a text beyond the allowed pieces ends with an ellipsis.
 /// # Errors
 /// The service is out of reach, or its answer cannot be read.
 pub async fn translate(get: &dyn Get, text: &str, to: &str) -> Result<Translation> {
@@ -152,7 +147,6 @@ mod tests {
         let sentence = format!("{}. ", "a".repeat(500));
         let text = sentence.repeat(6);
         let chunks = chunks_of(&text);
-        // Three pieces, each ending after a full stop, and an empty one that says the text went on.
         assert_eq!(chunks.len(), MAX_CHUNKS + 1);
         assert!(
             chunks[..MAX_CHUNKS]

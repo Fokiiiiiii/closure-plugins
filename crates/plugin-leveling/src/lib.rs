@@ -1,15 +1,7 @@
 //! Experience for messages, levels, role rewards and a leaderboard.
 //!
-//! A member gets `xp_per_message` experience for a message, at most once in `cooldown_seconds`, so
-//! that flooding does not pay. The levels take more experience as they go up (see [`rules`]).
-//! Time in a voice channel gives experience too, by the minute, when the member leaves it. Roles
-//! and channels can make the experience worth more or less. Reaching a level can be announced and
-//! can give a role, which can take the roles of the levels before it away.
-//!
-//! Built for servers of hundreds of thousands: the experience of a member is a score of the store
-//! (one row each, no quota, no lock), the leaderboard and the place of a member are answered by
-//! its index, and a message that falls inside the cooldown is answered from memory without
-//! touching the database.
+//! A message gives `xp_per_message` at most once per `cooldown_seconds`, so flooding does not pay.
+//! The score is one row per member in the store; the cooldowns are in memory, so a restart may award once more.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -138,7 +130,6 @@ impl Config {
     }
 }
 
-/// The name of the score that holds the experience of a member.
 const XP: &str = "xp";
 /// The name of the score that holds when a member came into the voice channel they are in.
 const SINCE: &str = "voice-since";
@@ -154,9 +145,8 @@ fn failed(error: &impl ToString) -> UserError {
     UserError::from(ModuleError::other(error.to_string()))
 }
 
-/// When each member last got experience for a message, kept in memory: most messages are inside
-/// the cooldown, and those cost no read or write of the database at all. After a restart a
-/// member may get one more award sooner than they should; that is all it costs.
+/// Last award per member, in memory: most messages fall inside the cooldown and cost no database access.
+/// After a restart a member may get one award sooner than the cooldown; that is all it costs.
 #[derive(Debug, Default)]
 struct Cooldowns(Mutex<HashMap<(u64, u64), i64>>);
 
@@ -179,7 +169,6 @@ impl Cooldowns {
     }
 }
 
-/// The experience of a member.
 async fn experience(ctx: &EventContext, user: UserId) -> Result<u64, ModuleError> {
     let score = ctx
         .store()
@@ -624,8 +613,6 @@ async fn xp_reset(cx: CommandCx, args: OneUser) -> Result<(), UserError> {
     put(&cx, args.user, 0).await
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 #[allow(
@@ -774,8 +761,6 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
     )
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {

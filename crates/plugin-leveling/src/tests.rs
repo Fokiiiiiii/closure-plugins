@@ -75,7 +75,6 @@ fn voice(user: u64, before: Option<u64>, after: Option<u64>) -> Event {
     }
 }
 
-/// `user` is in `channel` for `minutes`.
 async fn sit(harness: &Harness, user: u64, channel: u64, minutes: u64) {
     harness
         .emit(voice(user, None, Some(channel)))
@@ -107,7 +106,6 @@ async fn time_in_voice_gives_experience_by_the_minute_when_the_member_leaves() {
     assert_eq!(xp(&harness, 50).await, 0, "nothing until they leave");
     harness.emit(voice(50, Some(5), None)).await.unwrap();
     assert_eq!(xp(&harness, 50).await, 40, "ten whole minutes");
-    // A member who is left there for days is rewarded for half a day.
     sit(&harness, 51, 5, 3 * 24 * 60).await;
     assert_eq!(xp(&harness, 51).await, 12 * 60 * 4);
 }
@@ -174,7 +172,6 @@ async fn roles_and_channels_make_experience_worth_more_or_less() {
         "the best role counts, they do not add up"
     );
     assert_eq!(xp(&harness, 52).await, 20, "twice, then half");
-    // In voice the roles are asked for.
     harness.api().set_member(Id::new(1), member(53, &[70]));
     sit(&harness, 53, 5, 3).await;
     assert_eq!(xp(&harness, 53).await, 60);
@@ -189,7 +186,6 @@ async fn a_reward_can_take_the_rewards_before_it_away() {
         "xp_per_message": 1000, "cooldown_seconds": 0, "announce": false,
         "rewards": rewards, "replace_rewards": true,
     }));
-    // The member has the role of level 2, which is given as the level is reached.
     harness.api().set_member(Id::new(1), member(50, &[10]));
     say(&harness, 50, 5).await;
     let gone: Vec<u64> = harness
@@ -247,7 +243,6 @@ async fn the_place_and_the_board_are_right_beyond_a_thousand_members() {
 
 #[tokio::test]
 async fn a_setting_the_sdk_keeps_for_every_module_does_not_stop_the_events() {
-    // The module refuses settings it does not know, and `replies` is the SDK's, not its own.
     let harness = harness(&json!({"xp_per_message": 20, "replies": "public"}));
     say(&harness, 50, 5).await;
     assert_eq!(xp(&harness, 50).await, 20);
@@ -291,7 +286,6 @@ async fn a_new_level_is_announced_and_its_reward_is_given_once() {
         "{said:?}"
     );
     assert!(rewarded(&harness, 50));
-    // Level 2 needs more: the next message is no new level and no new reward.
     say(&harness, 50, 5).await;
     assert_eq!(announcements(&harness).len(), 1);
 }
@@ -394,7 +388,6 @@ async fn an_earlier_reward_stays_when_the_best_one_could_not_be_given() {
         "rewards": json!([{"level": 1, "role": "9"}, {"level": 2, "role": "10"}]),
         "replace_rewards": true,
     }));
-    // The member has the first reward, not the second (it could not be given at level 2).
     harness.api().set_member(Id::new(1), member(50, &[9]));
     harness.api().fail_role(
         Id::new(10),

@@ -37,10 +37,8 @@ pub struct Tweet {
     #[serde(default)]
     pub replies: Option<u64>,
     pub created_timestamp: Option<i64>,
-    /// The post this one quotes.
     #[serde(default)]
     pub quote: Option<Box<Tweet>>,
-    /// The id of the post this one replies to.
     #[serde(default)]
     pub replying_to_status: Option<String>,
     /// Who reposted it, when the link is to a repost.
@@ -68,8 +66,6 @@ pub struct Picture {
     pub url: String,
 }
 
-/// Reads the answer of the `FxTwitter` service.
-///
 /// # Errors
 /// The answer is not JSON, or has no post in it (the post is gone, or is private).
 pub fn parse_tweet(bytes: &[u8]) -> Result<Tweet> {
@@ -78,7 +74,6 @@ pub fn parse_tweet(bytes: &[u8]) -> Result<Tweet> {
 }
 
 impl Tweet {
-    /// The id of the post this one quotes.
     #[must_use]
     pub fn quote_id(&self) -> Option<u64> {
         let url = &self.quote.as_ref()?.url;
@@ -104,11 +99,8 @@ impl Tweet {
 /// The words around the embeds, in the language of the server.
 #[derive(Debug, Clone)]
 pub struct Labels {
-    /// On the post a post replies to.
     pub replied_to: String,
-    /// On the post a post quotes.
     pub quoted: String,
-    /// Before the name of who reposted.
     pub reposted_by: String,
 }
 
@@ -225,7 +217,6 @@ fn piece(tweet: &Tweet, title: Option<String>, color: u32, limit: usize, main: b
 pub struct Thread {
     /// What the post answers: the first post of the conversation first, the post it answers last.
     pub ancestors: Vec<Tweet>,
-    /// The post that was linked.
     pub post: Tweet,
     /// The post it quotes, the post that one quotes, and so on.
     pub quotes: Vec<Tweet>,
@@ -440,7 +431,6 @@ mod tests {
             ]
         );
         thread.fit(4);
-        // The far ends go first: the first post of the conversation, then the last quote.
         assert_eq!(thread.size(), 4);
         assert_eq!(thread.ancestors.len(), 2);
         assert_eq!(thread.quotes.len(), 1);

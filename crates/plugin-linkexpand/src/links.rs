@@ -140,7 +140,6 @@ mod tests {
     fn a_link_in_angle_brackets_is_a_request_for_no_preview() {
         assert!(message_links("<https://discord.com/channels/1/2/3>").is_empty());
         assert!(post_links("<https://x.com/user/status/9>").is_empty());
-        // Only one bracket is not a pair.
         assert_eq!(
             message_links("<https://discord.com/channels/1/2/3").len(),
             1

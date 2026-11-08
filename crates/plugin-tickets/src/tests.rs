@@ -15,7 +15,6 @@ const MODERATOR: u64 = 200;
 const LOG: u64 = 6;
 const MEMBER: u64 = 7;
 const OTHER: u64 = 8;
-/// The channel every click of the test harness comes from.
 const HERE: u64 = 5;
 
 fn harness() -> Harness {
@@ -52,7 +51,6 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         .unwrap();
 }
 
-/// What a channel was made with: a target, and what it may and may not do.
 type Rights = (OverwriteTarget, Permissions, Permissions);
 
 fn created(harness: &Harness) -> Vec<(String, Vec<Rights>)> {
@@ -127,14 +125,12 @@ async fn a_press_opens_a_private_channel_for_the_member_and_the_staff_and_only_o
     };
     assert!(sees(OverwriteTarget::Member(Id::new(MEMBER))));
     assert!(sees(OverwriteTarget::Role(Id::new(STAFF_ROLE))));
-    // A second ticket is turned away.
     let again = harness.click(press("open", MEMBER)).await.unwrap();
     assert!(
         again.last().unwrap().content.contains("open already"),
         "{again:?}"
     );
     assert_eq!(created(&harness).len(), 1);
-    // Somebody else has a ticket of their own, with the next number.
     harness.click(press("open", OTHER)).await.unwrap();
     assert_eq!(created(&harness)[1].0, "ticket-0002");
 }
@@ -156,7 +152,6 @@ async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_pla
     let harness = harness();
     harness.click(press("open", MEMBER)).await.unwrap();
     seed_ticket(&harness, HERE, MEMBER).await;
-    // Somebody who is neither the opener nor staff cannot close it.
     let refused = harness.click(press("close", OTHER)).await.unwrap();
     assert!(
         refused.last().unwrap().content.contains("Only the member"),
@@ -169,7 +164,6 @@ async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_pla
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].0, "ticket-0003.txt");
     assert!(saved[0].1.contains("Ticket #3"), "{}", saved[0].1);
-    // A second press finds nothing, and the member can open another ticket.
     let late = harness.click(press("close", MEMBER)).await.unwrap();
     assert!(
         late.last().unwrap().content.contains("not an open ticket"),
@@ -213,7 +207,6 @@ async fn a_channel_that_could_not_be_deleted_is_still_a_ticket_and_closes_when_t
     let harness = harness();
     harness.click(press("open", MEMBER)).await.unwrap();
     seed_ticket(&harness, HERE, MEMBER).await;
-    // The calls of a close: the transcript is sent, then the channel deleted (the third).
     harness
         .api()
         .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
@@ -224,7 +217,6 @@ async fn a_channel_that_could_not_be_deleted_is_still_a_ticket_and_closes_when_t
         kept.is_some(),
         "the ticket is not forgotten before its channel is gone: {first:?}"
     );
-    // The close is tried again, once the wait for the first has passed.
     harness.advance(Duration::from_secs(400));
     harness.click(press("close", MEMBER)).await.unwrap();
     assert!(deleted(&harness).contains(&HERE));
@@ -252,7 +244,6 @@ async fn a_claim_and_a_close_at_once_leave_the_close() {
     let harness = harness();
     seed_ticket(&harness, HERE, MEMBER).await;
     let staff = |user| press("claim", user).roles([STAFF_ROLE]);
-    // The close begins, and a claim after it is refused.
     harness.click(press("close", MEMBER)).await.unwrap();
     let late = harness.click(staff(OTHER)).await.unwrap();
     assert!(

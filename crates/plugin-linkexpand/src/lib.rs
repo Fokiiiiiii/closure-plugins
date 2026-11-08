@@ -1,11 +1,7 @@
 //! Answers a link to a message of the server, or to a post on X, with a preview of it.
 //!
-//! - A link to a message of the same server is answered with a quote of it: who said it, what, the
-//!   first picture, and a link back. The quote is made only when the person who posted the link
-//!   can read that channel, and never for a link to another server.
-//! - A link to a post on X is answered with its text, up to four pictures and its counts, through
-//!   the `FxTwitter` service. A video is posted as a link, which Discord plays.
-//!
+//! A link to a message of the same server is answered with a quote, only when its author may read that channel.
+//! A link to a post on X is answered with its text and pictures, through the `FxTwitter` service.
 //! A link written as `<https://...>` is left alone.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -81,11 +77,8 @@ enum Layout {
 struct Config {
     message_links: bool,
     x_links: bool,
-    /// Show the post a post replies to.
     replied_post: bool,
-    /// Show the post a post quotes.
     quoted_post: bool,
-    /// A button that translates the post.
     translate_button: bool,
     /// Hide the preview Discord made of the link, which the answer repeats.
     hide_original: bool,
@@ -114,7 +107,6 @@ fn avatar(user: &twilight_model::user::User) -> Option<String> {
         .map(|hash| format!("https://cdn.discordapp.com/avatars/{}/{hash}.png", user.id))
 }
 
-/// What of a message a quote shows.
 fn quoted(message: &Message, guild: u64, place: &str) -> Quoted {
     Quoted {
         author: message
@@ -262,7 +254,6 @@ async fn walk(fetch: &dyn Get, post: x::Tweet, replied: bool, quoted: bool) -> x
     thread
 }
 
-/// The service, asked about the post `id`.
 async fn fetch_post(fetch: &dyn Get, id: u64) -> Result<x::Tweet> {
     let bytes = fetch
         .get(&format!("https://api.fxtwitter.com/status/{id}"))
@@ -284,7 +275,6 @@ struct Unit {
     embed: Embed,
     photos: Vec<String>,
     video: Option<String>,
-    /// The link of the post.
     link: Option<String>,
     /// Whether this is what the writer linked, and not the post it answers or quotes.
     main: bool,
@@ -305,7 +295,6 @@ fn extension_of(url: &str) -> &str {
 }
 
 /// The pictures of a unit as files, and the address of its video, which is posted as a link.
-///
 /// `room` is what a message can still carry in files, and is used up by what is attached.
 async fn attachments(
     fetch: &dyn Get,
@@ -556,7 +545,6 @@ async fn with_translation(
     embed
 }
 
-/// The number at the end of the address of a post.
 fn status_id(link: &str) -> Option<u64> {
     let (_, tail) = link.rsplit_once("/status/")?;
     tail.split(|c: char| !c.is_ascii_digit())
@@ -674,7 +662,6 @@ async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
 }
 
 /// The module, with the network it reaches the services through.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
@@ -737,7 +724,6 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
 }
 
 /// The module, reaching the network as it is.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {

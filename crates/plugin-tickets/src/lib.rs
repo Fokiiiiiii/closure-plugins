@@ -1,15 +1,8 @@
 //! Tickets: a button opens a private channel for the member and the staff, and closing it saves
 //! a transcript.
 //!
-//! `/ticket panel` posts the message with the button. A press opens `ticket-0001` in the category
-//! of the settings, seen by the member and the staff roles only. The ticket has a button to claim
-//! it and a button to close it (`/ticket close` does the same). Closing writes the messages of the
-//! channel as a text file into the log channel, then deletes the channel. A ticket nobody has
-//! written in for `close_after_days` is closed the same way.
-//!
-//! Built for servers of hundreds of thousands: the tickets a member has open are a score, the
-//! numbers are a score, and a ticket is one entry that is deleted when it closes, so what is kept
-//! is the open tickets only.
+//! `/ticket panel` posts the button; a press opens `ticket-0001` for the member and the staff.
+//! Closing writes the channel's messages to the log channel as text, then deletes the channel.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -63,7 +56,6 @@ struct Config {
     staff_roles: Vec<String>,
     /// The channel the transcripts go to. Without one no transcript is kept.
     log_channel: Option<String>,
-    /// How many tickets a member may have open.
     max_open: u32,
     /// A ticket nobody writes in for this many days is closed; 0 never closes one.
     close_after_days: u32,
@@ -201,7 +193,6 @@ fn overwrite(target: OverwriteTarget, allow: Permissions, deny: Permissions) -> 
     }
 }
 
-/// The post with the button that opens a ticket.
 async fn panel(cx: CommandCx, args: Panel) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let channel = args.channel.unwrap_or(cx.invocation().channel_id);
@@ -389,7 +380,6 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
     .await
 }
 
-/// Gives a reserved place back.
 async fn give_back(ctx: &EventContext, user: u64) {
     if let Err(error) = ctx.store().score_add(OPEN, user, -1).await {
         tracing::warn!(?error, guild = %ctx.guild_id, "could not give a ticket place back");
@@ -593,10 +583,8 @@ async fn forget(
     Ok(())
 }
 
-/// Saves the transcript, then deletes the channel. The ticket is marked as being closed first, and
-/// whoever marks it closes it: a second press finds it taken. The entry stays until the channel is
-/// gone, so a deletion that failed can be tried again. When the transcript cannot be sent the
-/// ticket stays open.
+/// Saves the transcript, then deletes the channel; a failed deletion is tried again later.
+/// A transcript that cannot be sent keeps the ticket open.
 async fn finish(
     ctx: &EventContext,
     channel: ChannelId,
@@ -741,7 +729,6 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
         .map_err(|e| failed(&e))
 }
 
-/// The staff takes the ticket.
 async fn claim(cx: ComponentCx) -> Result<(), UserError> {
     let channel = cx.click().channel_id;
     let ctx = cx.ctx();
@@ -854,8 +841,6 @@ async fn remove(cx: CommandCx, args: Member) -> Result<(), UserError> {
     change_member(cx, args.user, false).await
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn builder() -> Result<ModuleBuilder, CoreError> {
@@ -953,8 +938,6 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
     )
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {

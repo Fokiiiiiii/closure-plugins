@@ -33,7 +33,6 @@ fn everyone() -> Role {
     .unwrap()
 }
 
-/// A message with `stars` reactions of `emoji`.
 fn message(channel: u64, id: u64, stars: u64, emoji: &str) -> Message {
     let reactions = if stars == 0 {
         json!([])
@@ -160,7 +159,6 @@ async fn the_post_follows_the_count_and_goes_when_no_star_is_left() {
         .set_message(message(SOURCE_CHANNEL, 100, 0, "⭐"));
     react(&harness, SOURCE_CHANNEL, 100, "⭐", false).await;
     assert_eq!(deleted(&harness), 1);
-    // Starred again, it is posted again.
     harness
         .api()
         .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
@@ -226,7 +224,6 @@ async fn the_post_goes_with_its_source_and_follows_an_edit_of_it() {
         .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
     react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
     assert_eq!(posts(&harness).len(), 1);
-    // The source is edited: the quote of the post is made again.
     let edited = serde_json::from_value(json!({
         "id": "100", "channel_id": SOURCE_CHANNEL.to_string(), "guild_id": GUILD.to_string(),
         "author": {"id": "60", "name": "alice", "bot": false}, "author_roles": [],
@@ -251,7 +248,6 @@ async fn the_post_goes_with_its_source_and_follows_an_edit_of_it() {
             .count();
         assert_eq!(quotes, 1);
     }
-    // The source is deleted: the post is taken off the board.
     harness
         .emit(Event::MessageDeleted {
             guild_id: Id::new(GUILD),
@@ -271,7 +267,6 @@ async fn an_edit_made_after_the_channel_went_private_is_not_put_on_the_board() {
         .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
     react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
     assert_eq!(posts(&harness).len(), 1);
-    // The channel stops being readable by everyone, and then the message is edited.
     harness.api().set_channels(
         Id::new(GUILD),
         vec![
@@ -312,8 +307,6 @@ async fn a_post_that_could_not_be_taken_off_is_still_recorded_and_not_made_twice
         .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
     react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
     assert_eq!(posts(&harness).len(), 1);
-    // The star goes, and the deletion of the post fails (the first call is the read of the
-    // message, the second the deletion).
     harness
         .api()
         .set_message(message(SOURCE_CHANNEL, 100, 0, "⭐"));
@@ -331,7 +324,6 @@ async fn a_post_that_could_not_be_taken_off_is_still_recorded_and_not_made_twice
             },
         }))
         .await;
-    // Stars again: the post that is still there is updated, not made a second time.
     harness
         .api()
         .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
@@ -346,7 +338,6 @@ async fn a_post_stays_managed_on_the_board_it_was_made_on() {
         .api()
         .set_message(message(SOURCE_CHANNEL, 100, 3, "⭐"));
     react(&harness, SOURCE_CHANNEL, 100, "⭐", true).await;
-    // The server points the setting at another board; the source is deleted.
     harness.set_config(json!({"channel": "21", "threshold": 3}));
     harness
         .emit(Event::MessageDeleted {
@@ -379,7 +370,6 @@ async fn the_authors_own_star_is_left_out_however_many_people_reacted() {
     harness
         .api()
         .set_message(serde_json::from_value(starred).unwrap());
-    // Discord lists the reactors by id: the author is the last of more than a thousand.
     let mut reactors: Vec<UserId> = (1_000..2_200).map(UserId::new).collect();
     reactors.push(UserId::new(5_000));
     harness.api().set_reactors(

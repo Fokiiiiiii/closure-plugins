@@ -161,7 +161,6 @@ fn stored(error: &closure_sdk::StorageError) -> ModuleError {
     ModuleError::other(error.to_string())
 }
 
-/// The emoji of the configuration as a request names it.
 fn emoji_of(configured: &str) -> Emoji {
     match (rules::custom_id(configured), rules::custom_name(configured)) {
         (Some(id), name) => Emoji::Custom {
@@ -224,7 +223,6 @@ async fn author_reacted(
     Ok(users.first().is_some_and(|user| user.id == author))
 }
 
-/// Whether everybody in the server can read `channel`.
 async fn is_public(ctx: &EventContext, channel: &Channel) -> Result<bool, ModuleError> {
     let Outcome::Roles(roles) = ctx
         .api
@@ -487,7 +485,6 @@ async fn on_source_change(
     Ok(Flow::Continue)
 }
 
-/// Takes the post of `source` off the board, if it has one.
 async fn remove_post(
     ctx: &EventContext,
     locks: &Locks,
@@ -502,8 +499,6 @@ async fn remove_post(
     forget(ctx, source).await
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn builder() -> Result<ModuleBuilder, CoreError> {
@@ -574,8 +569,6 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
     )
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {

@@ -116,7 +116,6 @@ async fn a_giveaway_is_a_message_with_a_button_and_an_end_that_is_scheduled() {
 #[tokio::test]
 async fn the_button_enters_and_a_second_press_leaves() {
     let harness = harness();
-    // The click of the harness is on the message 900.
     let record = Giveaway {
         channel: 5,
         prize: "p".into(),
@@ -152,7 +151,6 @@ async fn at_the_end_the_winners_are_told_and_the_button_goes_and_it_ends_only_on
     assert_eq!(told.len(), 1);
     assert!([70, 71, 72].contains(&told[0].1[0]));
     assert!(told[0].0.contains("a prize"));
-    // The message was edited: no button now.
     let edits: Vec<Action> = posted(&harness)
         .into_iter()
         .filter(|a| {
@@ -170,10 +168,8 @@ async fn at_the_end_the_winners_are_told_and_the_button_goes_and_it_ends_only_on
         unreachable!()
     };
     assert!(components.is_empty());
-    // Pressing the button of a giveaway that is over says so.
     let stored: Giveaway = harness.store().get("g:1").await.unwrap().unwrap();
     assert!(stored.ended);
-    // Ending it again does nothing.
     harness.invoke(of_message("end", 1)).await.unwrap();
     assert_eq!(announced(&harness).len(), 1);
 }
@@ -185,7 +181,6 @@ async fn a_telling_that_failed_is_tried_again_for_the_same_winners() {
     for user in 1..=20_u64 {
         enter(&harness, 1, user).await;
     }
-    // The first call of the end is the edit of the message, the second tells the winner.
     harness
         .api()
         .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
@@ -243,7 +238,6 @@ async fn nobody_entering_is_said_and_a_giveaway_can_be_ended_and_redrawn_by_hand
 
     let second = self::harness();
     second.invoke(start("p", "1d")).await.unwrap();
-    // A giveaway that runs cannot be drawn again.
     let early = second.invoke(of_message("reroll", 1)).await.unwrap();
     assert!(announced(&second).is_empty(), "{early:?}");
     enter(&second, 1, 70).await;

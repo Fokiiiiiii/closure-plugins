@@ -23,13 +23,11 @@ const AGENT: &str = "closure-plugins (https://github.com/Fokiiiiiii/closure-plug
 #[async_trait]
 pub trait Get: Send + Sync {
     /// The body of `url`.
-    ///
     /// # Errors
     /// The service is out of reach, slow, or answers with something else than a small success.
     async fn get(&self, url: &str) -> Result<Vec<u8>>;
 
     /// The body of `url`, a picture or a video, of at most `max` bytes.
-    ///
     /// # Errors
     /// The file is out of reach, slow, or larger than `max`.
     async fn get_large(&self, url: &str, max: usize) -> Result<Vec<u8>> {
@@ -41,8 +39,8 @@ pub trait Get: Send + Sync {
     }
 }
 
-/// A number of calls to another [`Get`] and no more: what one event may ask of the network, so a
-/// post with a long thread of quotes cannot hold the handler for as long as it takes to follow all.
+/// The calls one event may make to the network: a post with a long thread of quotes
+/// cannot hold the handler for as long as it takes to follow all.
 pub struct Budget<'a> {
     inner: &'a dyn Get,
     left: std::sync::atomic::AtomicUsize,

@@ -53,7 +53,6 @@ async fn translate_message(get: Arc<dyn Get>, cx: ContextCx) -> Result<(), UserE
 }
 
 /// The module, with the network it reaches the translator through.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn builder_with(get: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
@@ -77,7 +76,6 @@ pub fn builder_with(get: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
 }
 
 /// The module, reaching the network as it is.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {

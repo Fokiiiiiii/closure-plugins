@@ -1,13 +1,7 @@
 //! Giveaways: a message with a button to enter, and winners drawn when the time is up.
 //!
-//! `/giveaway start` posts the message and schedules its end. Pressing the button enters, and
-//! pressing it again leaves. At the end the winners are drawn from those who are in, the message
-//! tells them and the button goes. `/giveaway end` ends one at once and `/giveaway reroll` draws
-//! again from a giveaway that is over.
-//!
-//! Built for servers of hundreds of thousands: those who entered are a set of the store (a row
-//! each, no quota, no lock), so entering, leaving, counting and drawing a random few cost the
-//! same however many entered, and the winners are told in as many messages as they need.
+//! `/giveaway start` posts the message; the button enters and leaves; the end draws the winners.
+//! Entries are a set in the store (a row each, no lock), so the cost does not grow with the entrants.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -65,7 +59,6 @@ fn giveaway_key(message: MessageId) -> String {
     format!("g:{message}")
 }
 
-/// The name of the set of those who entered the giveaway on `message`.
 fn entries_of(message: MessageId) -> String {
     format!("e-{message}")
 }
@@ -292,7 +285,6 @@ async fn finish(
     Ok(Finish::Drawn)
 }
 
-/// Notes that the end of a giveaway was announced.
 async fn mark_announced(
     ctx: &EventContext,
     key: &str,
@@ -406,7 +398,6 @@ async fn end_job(cx: JobCx) -> Result<(), ModuleError> {
         .map(drop)
 }
 
-/// The message a command names, when it is a message id.
 fn message_of(args: &OfMessage) -> Option<MessageId> {
     args.message
         .trim()
@@ -516,7 +507,6 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
     .await
 }
 
-/// The number of entries counted from the set, and kept.
 async fn recount(cx: &ComponentCx, name: &str, counter: &str) -> Result<i64, UserError> {
     let real = cx.store().set_count(name).await.map_err(|e| failed(&e))?;
     let real = i64::try_from(real).unwrap_or(i64::MAX);
@@ -527,8 +517,6 @@ async fn recount(cx: &ComponentCx, name: &str, counter: &str) -> Result<i64, Use
     Ok(real)
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn builder() -> Result<ModuleBuilder, CoreError> {
@@ -563,8 +551,6 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
     )
 }
 
-/// The module.
-///
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {

@@ -8,8 +8,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use closure_core::module::Module;
 
-/// The modules of every plugin.
-///
 /// # Errors
 /// A module declaration is refused by the SDK.
 pub fn modules() -> Result<Vec<Arc<dyn Module>>> {

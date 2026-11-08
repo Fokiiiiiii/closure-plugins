@@ -22,8 +22,6 @@ const POST: &str = r#"{"code":200,"tweet":{
     "media":{"photos":[{"url":"https://pbs.twimg.com/1.jpg"},{"url":"https://pbs.twimg.com/2.jpg"}],
              "videos":[{"url":"https://video.twimg.com/v.mp4"}]}}}"#;
 
-/// The services, answering what `answer` says for an address, or failing when it says nothing. A
-/// file whose address says `huge` is too large to fetch.
 struct Fake(fn(&str) -> Option<&'static str>);
 
 #[async_trait]
@@ -103,8 +101,6 @@ fn thread(url: &str) -> Option<&'static str> {
     }
 }
 
-/// A conversation of posts 46 to 50, each answering the one before, and quotes of posts 60 to 63,
-/// each quoting the next.
 fn conversation(url: &str) -> Option<&'static str> {
     let id: u32 = url.rsplit("/status/").next()?.parse().ok()?;
     let reply = if (47..=50).contains(&id) {
@@ -146,7 +142,6 @@ fn everyone() -> Role {
     .unwrap()
 }
 
-/// Channel 7 is open to everybody, channel 8 hides itself from `@everyone`.
 fn harness(service: Fake) -> Harness {
     let harness = Harness::new(builder_with(Arc::new(service)).unwrap()).unwrap();
     let guild: GuildId = Id::new(GUILD);
@@ -166,7 +161,6 @@ fn harness(service: Fake) -> Harness {
     harness
 }
 
-/// What was posted, in order.
 struct Posted {
     content: Option<String>,
     embeds: usize,
@@ -217,7 +211,6 @@ fn hid_the_original(harness: &Harness) -> bool {
         .any(|a| matches!(a, Action::SuppressEmbeds { .. }))
 }
 
-/// The `custom_id` or the link of each button of a message.
 fn buttons(post: &Posted) -> Vec<String> {
     post.components
         .iter()
@@ -272,13 +265,11 @@ async fn a_message_of_an_adult_channel_is_not_quoted_in_another_channel() {
     harness
         .api()
         .set_channels(Id::new(GUILD), vec![channel(7, &json!([])), adult]);
-    // Readable by everybody, and still not for the others of channel 5.
     harness
         .message(Message::new(50, 5).content("https://discord.com/channels/1/10/42"))
         .await
         .unwrap();
     assert!(posted(&harness).is_empty());
-    // Where it was said, it is quoted.
     harness
         .message(Message::new(50, 10).content("https://discord.com/channels/1/10/42"))
         .await
@@ -298,7 +289,6 @@ fn role_with(id: u64, permissions: &str) -> Role {
 
 #[tokio::test]
 async fn a_message_of_a_channel_not_everybody_reads_is_quoted_only_in_that_channel() {
-    // Channel 9 is hidden from `@everyone` and open to the role 77, which the author has.
     let harness = harness(Fake(down));
     let guild: GuildId = Id::new(GUILD);
     harness.api().set_channels(
@@ -350,7 +340,6 @@ async fn a_post_on_x_has_its_pictures_attached_its_video_linked_and_its_preview_
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
     assert_eq!(all.len(), 2, "the video alone, then the post");
-    // Only a message without embeds gets a player from its link; it has no buttons.
     assert_eq!(all[0].embeds, 0);
     assert_eq!(
         all[0].content.as_deref(),
@@ -399,10 +388,8 @@ async fn a_reply_and_a_quote_are_messages_of_their_own_each_answering_the_one_be
         Some("https://video.twimg.com/q.mp4")
     );
     assert_eq!(all[2].files, ["photo-1.jpg"]);
-    // Only the first answers the link; the messages of the answer do not reply to one another.
     assert!(all[0].reply_to.is_some());
     assert!(all[1..].iter().all(|p| p.reply_to.is_none()));
-    // The buttons are under the last one, and take all of them away.
     assert!(buttons(&all[0]).is_empty() && buttons(&all[1]).is_empty());
     assert!(buttons(&all[2]).is_empty());
     let last = buttons(&all[3]);
@@ -435,9 +422,7 @@ async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_
     );
     assert!(one.titles[2].is_some());
     assert_ne!(one.titles[0], one.titles[2]);
-    // The quoted post was fetched whole, so it has its counts.
     assert_eq!(one.footers[2].as_deref(), Some("💬 9  🔁 8  ❤ 7"));
-    // What was linked has its picture attached; the others show theirs small.
     assert_eq!(one.files, ["photo-1.jpg"]);
     assert_eq!(
         all[0].content.as_deref(),
@@ -502,7 +487,6 @@ async fn the_embeds_of_an_answer_stay_within_what_discord_takes() {
     let all = posted(&harness);
     assert_eq!(all.len(), 1);
     assert!(all[0].embeds <= 10, "{}", all[0].embeds);
-    // The first link is whole, what is left of the room goes to the second.
     assert_eq!(all[0].embeds, 5 + 4);
 }
 
@@ -701,7 +685,6 @@ fn a_chain_that_is_too_long_keeps_what_was_linked_and_its_neighbours() {
         link: None,
         main,
     };
-    // One that was linked, with a post it answers before it and three quotes after it.
     let units = vec![
         unit(false),
         unit(true),
