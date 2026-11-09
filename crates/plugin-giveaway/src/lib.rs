@@ -23,8 +23,10 @@ const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
 const END: &str = "end";
 const MIN_SECONDS: i64 = 60;
-/// The most winners of one giveaway: a draw of this many is still one query.
-const MAX_WINNERS: i64 = 10_000;
+/// The most winners of one giveaway. Its winners are kept in one stored value of 32 KiB: a winner
+/// id takes at most 22 bytes of JSON, and the rest of the value (a prize of 200 characters at
+/// most) under 2 KiB.
+const MAX_WINNERS: i64 = (32 * 1024 - 2 * 1024) / 22;
 /// How many winners one message names: Discord takes 100 mentions and 2000 characters.
 const NAMES_PER_MESSAGE: usize = 50;
 const COLOR: u32 = 0x00F5_B301;
@@ -48,6 +50,10 @@ struct Giveaway {
     /// same winners and not for a new draw.
     #[serde(default)]
     drawn: Option<Vec<u64>>,
+    /// Whether the count beside the entries is kept from the first entry; one without it is
+    /// counted from its entries.
+    #[serde(default)]
+    counted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -331,7 +337,10 @@ async fn start(cx: CommandCx, args: Start) -> Result<(), UserError> {
         .filter(|n| (1..=MAX_WINNERS.unsigned_abs()).contains(&u64::from(*n)))
     else {
         return cx
-            .reply_private_t("giveaway-bad-winners", &Args::new())
+            .reply_private_t(
+                "giveaway-bad-winners",
+                &Args::new().with("max", MAX_WINNERS.to_string()),
+            )
             .await;
     };
     let ctx = cx.ctx();
@@ -345,6 +354,7 @@ async fn start(cx: CommandCx, args: Start) -> Result<(), UserError> {
         ended: false,
         announced: false,
         drawn: None,
+        counted: true,
     };
     let text = ctx.t_in(
         ctx.locale,
@@ -465,8 +475,8 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
     }
     let name = entries_of(message);
     let user = cx.user().id.get();
-    // One statement decides: whoever was in leaves, whoever was not enters. The number of entries
-    // is kept as a score beside the set, so an entry does not count them all again.
+    // The count beside the set moves with each change of the set, so it stays exact; a giveaway
+    // without one is counted from its entries, which does not write the count back.
     let counter = format!("n-{message}");
     if cx
         .store()
@@ -474,13 +484,11 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
         .await
         .map_err(|e| failed(&e))?
     {
-        let left = cx
-            .store()
-            .score_add(&counter, 0_u64, -1)
-            .await
-            .map_err(|e| failed(&e))?;
-        if left < 0 {
-            recount(&cx, &name, &counter).await?;
+        if giveaway.counted {
+            cx.store()
+                .score_add(&counter, 0_u64, -1)
+                .await
+                .map_err(|e| failed(&e))?;
         }
         return say_privately(&cx, cx.t("giveaway-left", &Args::new())).await;
     }
@@ -488,15 +496,15 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
         .set_add(&name, user)
         .await
         .map_err(|e| failed(&e))?;
-    let mut count = cx
-        .store()
-        .score_add(&counter, 0_u64, 1)
-        .await
-        .map_err(|e| failed(&e))?;
-    if count == 1 {
-        // The first entry, or a giveaway whose entries were made before the number was kept.
-        count = recount(&cx, &name, &counter).await?;
-    }
+    let count = if giveaway.counted {
+        cx.store()
+            .score_add(&counter, 0_u64, 1)
+            .await
+            .map_err(|e| failed(&e))?
+    } else {
+        let entered = cx.store().set_count(&name).await.map_err(|e| failed(&e))?;
+        i64::try_from(entered).unwrap_or(i64::MAX)
+    };
     say_privately(
         &cx,
         cx.t(
@@ -505,16 +513,6 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
         ),
     )
     .await
-}
-
-async fn recount(cx: &ComponentCx, name: &str, counter: &str) -> Result<i64, UserError> {
-    let real = cx.store().set_count(name).await.map_err(|e| failed(&e))?;
-    let real = i64::try_from(real).unwrap_or(i64::MAX);
-    cx.store()
-        .score_put(counter, 0_u64, real)
-        .await
-        .map_err(|e| failed(&e))?;
-    Ok(real)
 }
 
 /// # Errors

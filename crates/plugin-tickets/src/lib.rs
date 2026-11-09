@@ -447,7 +447,9 @@ async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
     let due = last + i64::from(config.close_after_days) * DAY;
     if ctx.now() >= due {
         let reason = ctx.t_in(ctx.locale, "tickets-idle-reason", &Args::new());
-        finish(ctx, channel, None, &reason).await?;
+        if let Closed::BusyUntil(until) = finish(ctx, channel, None, &reason).await? {
+            watch(ctx, channel, until).await?;
+        }
     } else {
         watch(ctx, channel, due).await?;
     }
@@ -458,8 +460,18 @@ async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
 #[derive(Debug, PartialEq, Eq)]
 enum Closed {
     Done,
-    /// No such ticket, or somebody else is closing it.
+    /// No such ticket.
     Unknown,
+    /// Somebody else is closing it; nothing was done, and the close may be tried at this time
+    /// (Unix seconds).
+    BusyUntil(i64),
+}
+
+/// What taking a ticket for closing found.
+enum Claim {
+    Taken(Ticket),
+    Gone,
+    Busy(i64),
 }
 
 /// The messages of the channel, the oldest first, as text.
@@ -531,20 +543,19 @@ async fn transcript(
 const CLOSING_WAIT: i64 = 300;
 
 /// Takes the ticket for closing, against the revision read: whoever writes first closes it, and a
-/// claim that was read before it cannot be written after it. `false` when somebody else is closing
-/// it, or it is gone.
-async fn begin_closing(ctx: &EventContext, key: &str) -> Result<Option<Ticket>, ModuleError> {
+/// claim that was read before it cannot be written after it.
+async fn begin_closing(ctx: &EventContext, key: &str) -> Result<Claim, ModuleError> {
     for _ in 0..5 {
         let Some(entry) = ctx.store().entry(key).await.map_err(|e| stored(&e))? else {
-            return Ok(None);
+            return Ok(Claim::Gone);
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
             .map_err(|error| ModuleError::other(error.to_string()))?;
-        if ticket
+        if let Some(since) = ticket
             .closing
-            .is_some_and(|since| ctx.now() - since < CLOSING_WAIT)
+            .filter(|since| ctx.now() - *since < CLOSING_WAIT)
         {
-            return Ok(None);
+            return Ok(Claim::Busy(since + CLOSING_WAIT));
         }
         ticket.closing = Some(ctx.now());
         match ctx
@@ -557,12 +568,14 @@ async fn begin_closing(ctx: &EventContext, key: &str) -> Result<Option<Ticket>, 
             )
             .await
         {
-            Ok(_) => return Ok(Some(ticket)),
+            Ok(_) => return Ok(Claim::Taken(ticket)),
             Err(StorageError::Conflict) => {}
             Err(error) => return Err(stored(&error)),
         }
     }
-    Ok(None)
+    Err(ModuleError::other(
+        "the ticket changed while it was being closed",
+    ))
 }
 
 /// Stops tracking a ticket whose channel is gone: its entry, its idle job and its place.
@@ -592,8 +605,10 @@ async fn finish(
     reason: &str,
 ) -> Result<Closed, ModuleError> {
     let key = ticket_key(channel);
-    let Some(ticket) = begin_closing(ctx, &key).await? else {
-        return Ok(Closed::Unknown);
+    let ticket = match begin_closing(ctx, &key).await? {
+        Claim::Taken(ticket) => ticket,
+        Claim::Gone => return Ok(Closed::Unknown),
+        Claim::Busy(until) => return Ok(Closed::BusyUntil(until)),
     };
     let config: Config = ctx.parse_config()?;
     let file = match config.log() {

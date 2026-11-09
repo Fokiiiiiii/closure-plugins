@@ -302,3 +302,31 @@ async fn staff_let_a_member_in_and_take_them_out_and_others_cannot() {
         .unwrap();
     assert_eq!(touched(&harness), 2);
 }
+
+#[tokio::test]
+async fn an_idle_close_that_meets_a_close_under_way_is_tried_again_after_it() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "close_after_days": 1
+    }));
+    harness.click(press("open", MEMBER)).await.unwrap();
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    let channel: u64 = tickets[0].0.trim_start_matches("ticket:").parse().unwrap();
+    harness.advance(Duration::from_hours(24));
+    harness
+        .api()
+        .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
+    let first = harness.run_due_jobs().await;
+    assert!(first.iter().any(Result::is_err), "{first:?}");
+    assert!(deleted(&harness).is_empty());
+
+    harness.advance(Duration::from_secs(5));
+    harness.run_due_jobs().await;
+    assert!(deleted(&harness).is_empty(), "the close still runs");
+    assert_eq!(harness.jobs(), 1, "the idle close waits for the other one");
+
+    harness.advance(Duration::from_secs(295));
+    harness.run_due_jobs().await;
+    assert_eq!(deleted(&harness), [channel]);
+}

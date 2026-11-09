@@ -125,6 +125,7 @@ async fn the_button_enters_and_a_second_press_leaves() {
         ended: false,
         announced: false,
         drawn: None,
+        counted: false,
     };
     harness.store().set("g:900", &record).await.unwrap();
     let click = |user: u64| Click::new("giveaway:join:*").user(user);
@@ -261,4 +262,96 @@ fn both_catalogs_define_the_same_messages() {
         closure_i18n::missing_keys(crate::JA, crate::EN).unwrap(),
         Vec::<String>::new()
     );
+}
+
+#[tokio::test]
+async fn winners_that_one_stored_value_cannot_hold_are_refused() {
+    let harness = harness();
+    let replies = harness
+        .invoke(start("a prize", "1m").option("winners", CommandOptionValue::Integer(10_000)))
+        .await
+        .unwrap();
+    assert!(
+        posted(&harness).is_empty(),
+        "a giveaway that cannot be drawn is not posted"
+    );
+    assert!(
+        replies
+            .last()
+            .unwrap()
+            .content
+            .contains(&crate::MAX_WINNERS.to_string()),
+        "{replies:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_most_winners_drawn_from_19_digit_ids_are_all_kept() {
+    let harness = harness();
+    let most = crate::MAX_WINNERS;
+    let count = usize::try_from(most).unwrap();
+    harness
+        .invoke(start("a prize", "1m").option("winners", CommandOptionValue::Integer(most)))
+        .await
+        .unwrap();
+    for offset in 0..u64::try_from(most).unwrap() {
+        enter(&harness, 1, 1_000_000_000_000_000_000 + offset).await;
+    }
+    harness.invoke(of_message("end", 1)).await.unwrap();
+    let stored: Giveaway = harness.store().get("g:1").await.unwrap().unwrap();
+    assert_eq!(stored.drawn.map(|drawn| drawn.len()), Some(count));
+    let told: usize = announced(&harness)
+        .iter()
+        .map(|(_, users)| users.len())
+        .sum();
+    assert_eq!(told, count);
+}
+
+#[tokio::test]
+async fn a_count_started_with_the_giveaway_stays_exact_through_entries_and_leaves() {
+    let harness = harness();
+    let record = Giveaway {
+        channel: 5,
+        prize: "p".into(),
+        winners: 1,
+        ends: 9_999_999_999,
+        host: 1,
+        ended: false,
+        announced: false,
+        drawn: None,
+        counted: true,
+    };
+    harness.store().set("g:900", &record).await.unwrap();
+    let click = |user: u64| Click::new("giveaway:join:*").user(user);
+    for user in [70, 71, 72] {
+        harness.click(click(user)).await.unwrap();
+    }
+    harness.click(click(70)).await.unwrap();
+    assert_eq!(harness.store().score("n-900", 0_u64).await.unwrap(), 2);
+    assert_eq!(harness.store().set_count("e-900").await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn a_giveaway_without_a_kept_count_is_counted_from_its_entries_and_nothing_is_written() {
+    let harness = harness();
+    let record = Giveaway {
+        channel: 5,
+        prize: "p".into(),
+        winners: 1,
+        ends: 9_999_999_999,
+        host: 1,
+        ended: false,
+        announced: false,
+        drawn: None,
+        counted: false,
+    };
+    harness.store().set("g:900", &record).await.unwrap();
+    enter(&harness, 900, 70).await;
+    enter(&harness, 900, 71).await;
+    let joined = harness
+        .click(Click::new("giveaway:join:*").user(72))
+        .await
+        .unwrap();
+    assert!(joined[0].content.contains('3'), "{joined:?}");
+    assert_eq!(harness.store().score("n-900", 0_u64).await.unwrap(), 0);
 }
