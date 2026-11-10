@@ -883,47 +883,35 @@ async fn a_failed_close_request_post_can_be_resent_with_the_same_id() {
     seed_ticket(&harness, HERE, MEMBER).await;
     harness
         .api()
-        .fail_nth(1, closure_core::error::DiscordError::Fatal("down".into()));
-    let barrier = tokio::sync::Barrier::new(2);
-    let first = async {
-        barrier.wait().await;
-        harness
-            .invoke(close_request_command(OTHER, Some("The issue is resolved")))
-            .await
-    };
-    let second = async {
-        barrier.wait().await;
-        harness
-            .invoke(close_request_command(
-                MODERATOR,
-                Some("The issue is resolved"),
-            ))
-            .await
-    };
-    let (first, second) = tokio::join!(first, second);
-    let first = first.unwrap();
-    let second = second.unwrap();
-    let replies = [
-        first.last().unwrap().content.clone(),
-        second.last().unwrap().content.clone(),
-    ];
-    assert!(
-        replies.iter().any(|reply| reply.contains("did not work")),
-        "{replies:?}"
-    );
-    assert!(
-        replies
-            .iter()
-            .any(|reply| reply.contains("sent to the ticket opener")),
-        "{replies:?}"
-    );
-    let ticket: Ticket = harness
-        .store()
-        .get(&format!("ticket:{HERE}"))
+        .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
+    let first = harness
+        .invoke(close_request_command(OTHER, Some("The issue is resolved")))
         .await
-        .unwrap()
         .unwrap();
+    assert!(
+        first.last().unwrap().content.contains("did not work"),
+        "{first:?}"
+    );
+    let key = format!("ticket:{HERE}");
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
     let request_id = ticket.close_request.as_ref().unwrap().id;
+    let second = harness
+        .invoke(close_request_command(
+            MODERATOR,
+            Some("The issue is resolved"),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        second
+            .last()
+            .unwrap()
+            .content
+            .contains("sent to the ticket opener"),
+        "{second:?}"
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.close_request.as_ref().unwrap().id, request_id);
     let posts: Vec<_> = harness
         .actions()
         .iter()
