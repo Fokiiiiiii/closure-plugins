@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use closure_core::action::MessageCursor;
 use closure_core::action::{
-    Action, ChannelKind, FileUpload, MentionPolicy, NewChannel, Outcome, OverwriteSpec,
-    OverwriteTarget, Reason,
+    Action, ChannelKind, ChannelPatch, FileUpload, MentionPolicy, NewChannel, Outcome,
+    OverwriteSpec, OverwriteTarget, Reason,
 };
 use closure_core::error::{DiscordError, ModuleError};
 use closure_core::event::{ChannelId, RoleId, UserId};
@@ -138,6 +138,12 @@ struct Unclaim {}
 struct Member {
     /// The member
     user: UserId,
+}
+
+#[derive(CommandArgs)]
+struct Rename {
+    /// The new channel name
+    name: String,
 }
 
 fn ticket_key(channel: ChannelId) -> String {
@@ -970,6 +976,43 @@ async fn transfer(cx: CommandCx, args: Member) -> Result<(), UserError> {
     set_claim(cx, Some(args.user)).await
 }
 
+async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
+    let config: Config = cx.config()?;
+    if !is_staff_command(&cx, &config).await {
+        return Err(UserError::message("tickets-staff-only"));
+    }
+    let ctx = cx.ctx();
+    let channel = cx.invocation().channel_id;
+    let Some(ticket) = ctx
+        .store()
+        .get::<Ticket>(&ticket_key(channel))
+        .await
+        .map_err(|error| failed(&error))?
+    else {
+        return Err(UserError::message("tickets-not-a-ticket"));
+    };
+    if ticket.closing.is_some() {
+        return Err(UserError::message("tickets-not-a-ticket"));
+    }
+    let action = Action::EditChannel {
+        channel_id: channel,
+        patch: ChannelPatch {
+            name: Some(args.name.clone()),
+            ..ChannelPatch::default()
+        },
+        reason: Reason::truncated(&cx.t("tickets-reason-rename", &Args::new())),
+    };
+    action
+        .validate()
+        .map_err(|_| UserError::message("tickets-invalid-name"))?;
+    ctx.api
+        .execute(action)
+        .await
+        .map_err(|error| failed(&error))?;
+    cx.reply_private_t("tickets-renamed", &Args::new().with("name", args.name))
+        .await
+}
+
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn builder() -> Result<ModuleBuilder, CoreError> {
@@ -1058,6 +1101,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                         .handler(remove),
                     Command::<Unclaim>::new("unclaim").handler(unclaim),
                     Command::<Member>::new("transfer").handler(transfer),
+                    Command::<Rename>::new("rename").handler(rename),
                 ],
             )
             .component("open", open)

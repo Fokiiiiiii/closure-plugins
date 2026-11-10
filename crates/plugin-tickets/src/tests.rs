@@ -141,6 +141,17 @@ fn press(route: &str, user: u64) -> Click {
     Click::new(format!("tickets:{route}:*")).user(user)
 }
 
+fn rename_invocation(name: &str, staff: bool) -> Invocation {
+    let command = Invocation::new("ticket")
+        .subcommand("rename")
+        .option("name", CommandOptionValue::String(name.to_owned()));
+    if staff {
+        command.roles([STAFF_ROLE]).user(MODERATOR)
+    } else {
+        command.user(OTHER)
+    }
+}
+
 #[tokio::test]
 async fn a_press_opens_a_private_channel_for_the_member_and_the_staff_and_only_one() {
     let harness = harness();
@@ -511,6 +522,150 @@ async fn a_close_and_transfer_at_once_leave_the_close() {
         .await
         .unwrap();
     assert!(ticket.is_none());
+}
+
+#[tokio::test]
+async fn a_staff_member_renames_only_the_ticket_channel() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let replies = harness
+        .invoke(rename_invocation("billing-help", true))
+        .await
+        .unwrap();
+    assert!(
+        replies.last().unwrap().content.contains("billing-help"),
+        "{replies:?}"
+    );
+    let edits: Vec<_> = harness
+        .actions()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::EditChannel {
+                channel_id, patch, ..
+            } => Some((channel_id.get(), patch)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].0, HERE);
+    assert_eq!(edits[0].1.name.as_deref(), Some("billing-help"));
+    assert_eq!(edits[0].1.topic, None);
+    assert_eq!(edits[0].1.nsfw, None);
+    assert_eq!(edits[0].1.slowmode_seconds, None);
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.number, 3);
+    assert_eq!(ticket.claimed_by, None);
+}
+
+#[tokio::test]
+async fn a_general_member_cannot_rename_a_ticket() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let replies = harness
+        .invoke(rename_invocation("should-not-change", false))
+        .await
+        .unwrap();
+    assert!(
+        replies.last().unwrap().content.contains("Only the staff"),
+        "{replies:?}"
+    );
+    assert!(
+        harness
+            .actions()
+            .iter()
+            .all(|action| !matches!(action, Action::EditChannel { .. }))
+    );
+}
+
+#[tokio::test]
+async fn renaming_requires_an_open_ticket() {
+    let harness = harness();
+    let not_a_ticket = harness
+        .invoke(rename_invocation("should-not-change", true))
+        .await
+        .unwrap();
+    assert!(
+        not_a_ticket
+            .last()
+            .unwrap()
+            .content
+            .contains("not an open ticket"),
+        "{not_a_ticket:?}"
+    );
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.closing = Some(1);
+    harness.store().set(&key, &ticket).await.unwrap();
+    let closing = harness
+        .invoke(rename_invocation("should-not-change", true))
+        .await
+        .unwrap();
+    assert!(
+        closing
+            .last()
+            .unwrap()
+            .content
+            .contains("not an open ticket"),
+        "{closing:?}"
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.closing, Some(1));
+    assert!(
+        harness
+            .actions()
+            .iter()
+            .all(|action| !matches!(action, Action::EditChannel { .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_name_outside_action_limits_is_rejected_before_the_channel_edit() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let invalid_name = "x".repeat(101);
+    let replies = harness
+        .invoke(rename_invocation(&invalid_name, true))
+        .await
+        .unwrap();
+    assert!(
+        replies
+            .last()
+            .unwrap()
+            .content
+            .contains("1 to 100 characters"),
+        "{replies:?}"
+    );
+    assert!(
+        harness
+            .actions()
+            .iter()
+            .all(|action| !matches!(action, Action::EditChannel { .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_channel_edit_failure_does_not_return_rename_success() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .api()
+        .fail_nth(1, closure_core::error::DiscordError::Fatal("down".into()));
+    let result = harness
+        .invoke(rename_invocation("billing-help", true))
+        .await;
+    assert!(result.is_err());
+    assert!(
+        harness
+            .actions()
+            .iter()
+            .all(|action| !matches!(action, Action::EditChannel { .. }))
+    );
 }
 
 #[tokio::test]
