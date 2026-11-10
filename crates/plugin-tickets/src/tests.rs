@@ -764,6 +764,19 @@ async fn staff_close_request_can_only_be_rejected_by_the_opener() {
         ticket.close_request.as_ref().unwrap().reason.as_deref(),
         reason
     );
+}
+
+#[tokio::test]
+async fn old_close_request_buttons_cannot_change_a_new_request() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .invoke(close_request_command(OTHER, Some("The issue is resolved")))
+        .await
+        .unwrap();
+    let key = format!("ticket:{HERE}");
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    let request_id = ticket.close_request.as_ref().unwrap().id;
     for route in ["close-request-approve", "close-request-reject"] {
         let denied = harness
             .click(request_click(route, request_id, OTHER).roles([STAFF_ROLE]))
