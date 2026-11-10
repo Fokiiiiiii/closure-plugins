@@ -635,6 +635,16 @@ async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), Use
     .await
 }
 
+/// Says why the answer could not be taken away, so the one who pressed knows what to do next.
+fn delete_failed(error: &closure_core::error::DiscordError) -> UserError {
+    use closure_core::error::DiscordError as Discord;
+    UserError::message(match error {
+        Discord::NotFound => "linkexpand-delete-gone",
+        Discord::Forbidden(_) => "linkexpand-delete-forbidden",
+        _ => "linkexpand-delete-failed",
+    })
+}
+
 /// Takes the answer away, all of its messages; only the one who posted the link gets this far.
 async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
     cx.defer_update().await?;
@@ -657,7 +667,7 @@ async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
     cx.api()
         .delete_message(click.channel_id, click.message_id, reason)
         .await
-        .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
+        .map_err(|error| delete_failed(&error))?;
     Ok(())
 }
 

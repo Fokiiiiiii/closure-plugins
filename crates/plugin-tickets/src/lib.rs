@@ -25,6 +25,7 @@ use closure_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use twilight_model::channel::ChannelType;
 use twilight_model::channel::message::Component;
 use twilight_model::channel::message::component::ButtonStyle;
 use twilight_model::guild::Permissions;
@@ -235,6 +236,9 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
     }
     let ctx = cx.ctx();
     let user = cx.user().id;
+    if let Some(parent) = config.category() {
+        ensure_category(ctx, parent).await?;
+    }
     // The place is taken first: two presses at once cannot go over the limit.
     let open = cx
         .store()
@@ -378,6 +382,22 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
         &Args::new().with("channel", format!("<#{channel}>")),
     )
     .await
+}
+
+/// A ticket made under anything but a category would fail at Discord, so a setting that is
+/// not one is refused before a place is taken.
+async fn ensure_category(ctx: &EventContext, parent: ChannelId) -> Result<(), UserError> {
+    match ctx
+        .api
+        .execute(Action::GetChannel { channel_id: parent })
+        .await
+    {
+        Ok(Outcome::Channel(found)) if found.kind == ChannelType::GuildCategory => Ok(()),
+        Ok(_) | Err(closure_core::error::DiscordError::NotFound) => Err(UserError::from(
+            ModuleError::Config("the ticket category is not a category channel".into()),
+        )),
+        Err(error) => Err(failed(&error)),
+    }
 }
 
 async fn give_back(ctx: &EventContext, user: u64) {
@@ -867,7 +887,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                 "type": ["string", "null"],
                 "pattern": "^[0-9]{1,20}$",
                 "description": "config-tickets-category",
-                "x-ui": { "level": "basic", "widget": "channel" }
+                "x-ui": { "level": "basic", "widget": "channel", "channel_kinds": ["category"] }
             },
             "staff_roles": {
                 "type": "array",

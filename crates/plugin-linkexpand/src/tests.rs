@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use closure_core::action::Action;
+use closure_core::error::DiscordError;
 use closure_core::event::{GuildId, UserId};
 use closure_sdk::testing::{Click, Harness, Message};
 use plugin_kit::net::Get;
@@ -595,6 +596,35 @@ async fn only_the_one_who_posted_the_link_deletes_the_answer_all_of_it() {
         "the two before it, and the one the button is on"
     );
     assert!(gone.contains(&111) && gone.contains(&222));
+}
+
+#[tokio::test]
+async fn a_delete_that_fails_says_why_in_its_own_words() {
+    let cases = [
+        (DiscordError::NotFound, "already deleted"),
+        (
+            DiscordError::Forbidden("missing permission".into()),
+            "may not delete",
+        ),
+        (
+            DiscordError::Transient("timed out".into()),
+            "could not be deleted",
+        ),
+    ];
+    for (error, said_of_it) in cases {
+        let harness = harness(Fake(down));
+        // The fourth request is the delete of the answer itself; the ones before it are the messages named.
+        harness.api().fail_nth(4, error);
+        let outcome = harness
+            .click(Click::new("linkexpand:delete:50:111,222").user(50))
+            .await;
+        let said = format!("{outcome:?}");
+        assert!(
+            said.contains(said_of_it),
+            "{said_of_it:?} expected, got {said}"
+        );
+        assert!(!said.contains("could not be translated"), "{said}");
+    }
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@ use closure_sdk::{CommandOptionValue, Level};
 use serde_json::json;
 use twilight_model::guild::Permissions;
 use twilight_model::id::Id;
+use twilight_model::id::marker::ChannelMarker;
 
 use crate::{Ticket, builder};
 
@@ -145,6 +146,49 @@ async fn tickets_are_off_until_a_staff_role_is_chosen() {
         "{replies:?}"
     );
     assert!(created(&harness).is_empty());
+}
+
+/// A guild whose channel 9 is the ticket category, or some other kind of channel when `kind` says so.
+fn with_category(harness: &Harness, kind: u8) {
+    let parent = serde_json::from_value(
+        json!({ "id": "9", "type": kind, "name": "parent", "parent_id": null }),
+    )
+    .unwrap();
+    harness.api().set_channels(Id::new(1), vec![parent]);
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "max_open": 1,
+        "category": "9"
+    }));
+}
+
+fn parents(harness: &Harness) -> Vec<Option<Id<ChannelMarker>>> {
+    harness
+        .actions()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::CreateChannel { spec, .. } => Some(spec.parent_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_ticket_is_made_under_a_category() {
+    let harness = harness();
+    with_category(&harness, 4);
+    harness.click(press("open", MEMBER)).await.unwrap();
+    assert_eq!(parents(&harness), [Some(Id::new(9))]);
+}
+
+#[tokio::test]
+async fn a_category_setting_that_is_not_a_category_is_refused_before_any_place_is_taken() {
+    let harness = harness();
+    with_category(&harness, 0);
+    let _ = harness.click(press("open", MEMBER)).await;
+    assert!(created(&harness).is_empty());
+    assert_eq!(harness.store().score("open", MEMBER).await.unwrap(), 0);
 }
 
 #[tokio::test]

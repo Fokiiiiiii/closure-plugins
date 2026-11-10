@@ -50,10 +50,6 @@ struct Giveaway {
     /// same winners and not for a new draw.
     #[serde(default)]
     drawn: Option<Vec<u64>>,
-    /// Whether the count beside the entries is kept from the first entry; one without it is
-    /// counted from its entries.
-    #[serde(default)]
-    counted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -354,7 +350,6 @@ async fn start(cx: CommandCx, args: Start) -> Result<(), UserError> {
         ended: false,
         announced: false,
         drawn: None,
-        counted: true,
     };
     let text = ctx.t_in(
         ctx.locale,
@@ -475,42 +470,23 @@ async fn join(cx: ComponentCx) -> Result<(), UserError> {
     }
     let name = entries_of(message);
     let user = cx.user().id.get();
-    // The count beside the set moves with each change of the set, so it stays exact; a giveaway
-    // without one is counted from its entries, which does not write the count back.
-    let counter = format!("n-{message}");
     if cx
         .store()
         .set_remove(&name, user)
         .await
         .map_err(|e| failed(&e))?
     {
-        if giveaway.counted {
-            cx.store()
-                .score_add(&counter, 0_u64, -1)
-                .await
-                .map_err(|e| failed(&e))?;
-        }
         return say_privately(&cx, cx.t("giveaway-left", &Args::new())).await;
     }
     cx.store()
         .set_add(&name, user)
         .await
         .map_err(|e| failed(&e))?;
-    let count = if giveaway.counted {
-        cx.store()
-            .score_add(&counter, 0_u64, 1)
-            .await
-            .map_err(|e| failed(&e))?
-    } else {
-        let entered = cx.store().set_count(&name).await.map_err(|e| failed(&e))?;
-        i64::try_from(entered).unwrap_or(i64::MAX)
-    };
+    // The set is the only record of entries; a separate counter could drift from it.
+    let count = cx.store().set_count(&name).await.map_err(|e| failed(&e))?;
     say_privately(
         &cx,
-        cx.t(
-            "giveaway-joined",
-            &Args::new().with("count", u64::try_from(count).unwrap_or(0)),
-        ),
+        cx.t("giveaway-joined", &Args::new().with("count", count)),
     )
     .await
 }

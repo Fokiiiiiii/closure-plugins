@@ -125,7 +125,6 @@ async fn the_button_enters_and_a_second_press_leaves() {
         ended: false,
         announced: false,
         drawn: None,
-        counted: false,
     };
     harness.store().set("g:900", &record).await.unwrap();
     let click = |user: u64| Click::new("giveaway:join:*").user(user);
@@ -308,7 +307,7 @@ async fn the_most_winners_drawn_from_19_digit_ids_are_all_kept() {
 }
 
 #[tokio::test]
-async fn a_count_started_with_the_giveaway_stays_exact_through_entries_and_leaves() {
+async fn the_shown_count_is_the_entries_even_when_a_kept_counter_has_drifted() {
     let harness = harness();
     let record = Giveaway {
         channel: 5,
@@ -319,20 +318,20 @@ async fn a_count_started_with_the_giveaway_stays_exact_through_entries_and_leave
         ended: false,
         announced: false,
         drawn: None,
-        counted: true,
     };
     harness.store().set("g:900", &record).await.unwrap();
-    let click = |user: u64| Click::new("giveaway:join:*").user(user);
-    for user in [70, 71, 72] {
-        harness.click(click(user)).await.unwrap();
-    }
-    harness.click(click(70)).await.unwrap();
-    assert_eq!(harness.store().score("n-900", 0_u64).await.unwrap(), 2);
-    assert_eq!(harness.store().set_count("e-900").await.unwrap(), 2);
+    harness.store().score_add("n-900", 0_u64, 99).await.unwrap();
+    enter(&harness, 900, 70).await;
+    enter(&harness, 900, 71).await;
+    let joined = harness
+        .click(Click::new("giveaway:join:*").user(72))
+        .await
+        .unwrap();
+    assert!(joined[0].content.contains('3'), "{joined:?}");
 }
 
 #[tokio::test]
-async fn a_giveaway_without_a_kept_count_is_counted_from_its_entries_and_nothing_is_written() {
+async fn joining_writes_no_counter_beside_the_entries() {
     let harness = harness();
     let record = Giveaway {
         channel: 5,
@@ -343,7 +342,6 @@ async fn a_giveaway_without_a_kept_count_is_counted_from_its_entries_and_nothing
         ended: false,
         announced: false,
         drawn: None,
-        counted: false,
     };
     harness.store().set("g:900", &record).await.unwrap();
     enter(&harness, 900, 70).await;
