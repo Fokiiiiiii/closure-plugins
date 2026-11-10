@@ -875,6 +875,42 @@ async fn close_request_followup(cx: &ComponentCx, channel: ChannelId, key: &str)
     }
 }
 
+async fn approve_request(
+    cx: &ComponentCx,
+    channel: ChannelId,
+    request_id: i64,
+    request: CloseRequest,
+) -> Result<(), UserError> {
+    cx.reply_private_t("tickets-close-request-processing", &Args::new())
+        .await?;
+    let reason = request
+        .reason
+        .unwrap_or_else(|| cx.t("tickets-close-request-approved-reason", &Args::new()));
+    let closed = match finish(
+        cx.ctx(),
+        channel,
+        Some(cx.user().id),
+        &reason,
+        Some(request_id),
+    )
+    .await
+    {
+        Ok(closed) => closed,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not close an approved ticket");
+            close_request_followup(cx, channel, "tickets-failed").await;
+            return Ok(());
+        }
+    };
+    let message = match closed {
+        Closed::Done => "tickets-close-request-approved",
+        Closed::BusyUntil(_) => "tickets-closing",
+        Closed::Unknown | Closed::RequestChanged => "tickets-close-request-stale",
+    };
+    close_request_followup(cx, channel, message).await;
+    Ok(())
+}
+
 async fn close_request_decision(cx: ComponentCx, approve: bool) -> Result<(), UserError> {
     let channel = cx.click().channel_id;
     let Some(request_id) = close_request_id(&cx, channel) else {
@@ -911,27 +947,7 @@ async fn close_request_decision(cx: ComponentCx, approve: bool) -> Result<(), Us
         return say(&cx, "tickets-close-request-stale", &Args::new()).await;
     };
     if approve {
-        cx.reply_private_t("tickets-close-request-processing", &Args::new())
-            .await?;
-        let reason = request
-            .reason
-            .unwrap_or_else(|| cx.t("tickets-close-request-approved-reason", &Args::new()));
-        let closed = match finish(ctx, channel, Some(cx.user().id), &reason, Some(request_id)).await
-        {
-            Ok(closed) => closed,
-            Err(error) => {
-                tracing::warn!(?error, channel = %channel, "could not close an approved ticket");
-                close_request_followup(&cx, channel, "tickets-failed").await;
-                return Ok(());
-            }
-        };
-        let message = match closed {
-            Closed::Done => "tickets-close-request-approved",
-            Closed::BusyUntil(_) => "tickets-closing",
-            Closed::Unknown | Closed::RequestChanged => "tickets-close-request-stale",
-        };
-        close_request_followup(&cx, channel, message).await;
-        return Ok(());
+        return approve_request(&cx, channel, request_id, request).await;
     }
     if ticket.closing.is_some() {
         return say(&cx, "tickets-closing", &Args::new()).await;
@@ -1031,6 +1047,30 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
         .map_err(|e| failed(&e))
 }
 
+async fn resend_close_request(
+    cx: &CommandCx,
+    channel: ChannelId,
+    opener: u64,
+    request: &CloseRequest,
+    reason: Option<&str>,
+) -> Result<(), UserError> {
+    if reason.is_some_and(|reason| request.reason.as_deref() != Some(reason)) {
+        return cx
+            .reply_private_t("tickets-close-request-pending", &Args::new())
+            .await;
+    }
+    match post_close_request_message(cx, cx.ctx(), channel, opener, request).await {
+        Ok(()) => {
+            cx.reply_private_t("tickets-close-request-sent", &Args::new())
+                .await
+        }
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, request_id = request.id, "could not resend a close request");
+            cx.reply_private_t("tickets-failed", &Args::new()).await
+        }
+    }
+}
+
 async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), UserError> {
     let config: Config = cx.config()?;
     cx.defer(true).await?;
@@ -1052,8 +1092,8 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
             return cx.reply_private_t("tickets-failed", &Args::new()).await;
         }
     };
-    let mut revision = entry.revision;
-    let mut ticket: Ticket = match serde_json::from_value(entry.value) {
+    let revision = entry.revision;
+    let ticket: Ticket = match serde_json::from_value(entry.value) {
         Ok(ticket) => ticket,
         Err(error) => {
             tracing::warn!(?error, channel = %channel, "could not read a ticket for a close request");
@@ -1067,25 +1107,21 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
     }
     let reason = args.reason.filter(|text| !text.trim().is_empty());
     if let Some(request) = ticket.close_request.clone() {
-        if reason
-            .as_ref()
-            .is_some_and(|reason| request.reason.as_ref() != Some(reason))
-        {
-            return cx
-                .reply_private_t("tickets-close-request-pending", &Args::new())
-                .await;
-        }
-        return match post_close_request_message(&cx, ctx, channel, ticket.opener, &request).await {
-            Ok(()) => {
-                cx.reply_private_t("tickets-close-request-sent", &Args::new())
-                    .await
-            }
-            Err(error) => {
-                tracing::warn!(?error, channel = %channel, request_id = request.id, "could not resend a close request");
-                cx.reply_private_t("tickets-failed", &Args::new()).await
-            }
-        };
+        return resend_close_request(&cx, channel, ticket.opener, &request, reason.as_deref())
+            .await;
     }
+    create_close_request(cx, ticket, revision, reason).await
+}
+
+async fn create_close_request(
+    cx: CommandCx,
+    mut ticket: Ticket,
+    mut revision: i64,
+    reason: Option<String>,
+) -> Result<(), UserError> {
+    let ctx = cx.ctx();
+    let channel = cx.invocation().channel_id;
+    let key = ticket_key(channel);
     let request_id = match ctx.store().score_add(CLOSE_REQUESTS, 0_u64, 1).await {
         Ok(id) if id > 0 => id,
         Ok(_) => return cx.reply_private_t("tickets-failed", &Args::new()).await,
@@ -1143,32 +1179,14 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
                         .await;
                 }
                 if let Some(existing) = ticket.close_request.clone() {
-                    if reason
-                        .as_ref()
-                        .is_some_and(|reason| existing.reason.as_ref() != Some(reason))
-                    {
-                        return cx
-                            .reply_private_t("tickets-close-request-pending", &Args::new())
-                            .await;
-                    }
-                    return match post_close_request_message(
+                    return resend_close_request(
                         &cx,
-                        ctx,
                         channel,
                         ticket.opener,
                         &existing,
+                        reason.as_deref(),
                     )
-                    .await
-                    {
-                        Ok(()) => {
-                            cx.reply_private_t("tickets-close-request-sent", &Args::new())
-                                .await
-                        }
-                        Err(error) => {
-                            tracing::warn!(?error, channel = %channel, request_id = existing.id, "could not resend a close request");
-                            cx.reply_private_t("tickets-failed", &Args::new()).await
-                        }
-                    };
+                    .await;
                 }
                 revision = next_revision;
             }
