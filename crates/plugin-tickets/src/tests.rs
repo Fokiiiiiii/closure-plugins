@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use closure_core::action::{Action, OverwriteTarget};
+use closure_core::action::{Action, MentionPolicy, OverwriteTarget};
 use closure_core::event::GuildId;
 use closure_sdk::testing::{Click, Harness, Invocation};
 use closure_sdk::{CommandOptionValue, Level};
@@ -44,6 +44,7 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         claimed_by: None,
         created: 0,
         closing: None,
+        close_request: None,
     };
     harness
         .store()
@@ -139,6 +140,21 @@ fn ticket_messages(harness: &Harness) -> Vec<String> {
 
 fn press(route: &str, user: u64) -> Click {
     Click::new(format!("tickets:{route}:*")).user(user)
+}
+
+fn close_request_command(user: u64, reason: Option<&str>) -> Invocation {
+    let command = Invocation::new("ticket")
+        .subcommand("close-request")
+        .roles([STAFF_ROLE])
+        .user(user);
+    match reason {
+        Some(reason) => command.option("reason", CommandOptionValue::String(reason.to_owned())),
+        None => command,
+    }
+}
+
+fn request_click(route: &str, request_id: i64, user: u64) -> Click {
+    Click::new(format!("tickets:{route}:*:{HERE}:{request_id}")).user(user)
 }
 
 fn rename_invocation(name: &str, staff: bool) -> Invocation {
@@ -666,6 +682,302 @@ async fn a_channel_edit_failure_does_not_return_rename_success() {
             .iter()
             .all(|action| !matches!(action, Action::EditChannel { .. }))
     );
+}
+
+#[tokio::test]
+async fn staff_close_request_can_only_be_rejected_by_the_opener() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let unauthorized = harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("close-request")
+                .user(OTHER),
+        )
+        .await
+        .unwrap();
+    assert!(
+        unauthorized
+            .last()
+            .unwrap()
+            .content
+            .contains("Only the staff"),
+        "{unauthorized:?}"
+    );
+    let reason = Some("The issue is resolved");
+    let sent = harness
+        .invoke(close_request_command(OTHER, reason))
+        .await
+        .unwrap();
+    assert!(
+        sent.last()
+            .unwrap()
+            .content
+            .contains("sent to the ticket opener"),
+        "{sent:?}"
+    );
+    let key = format!("ticket:{HERE}");
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    let request_id = ticket.close_request.as_ref().unwrap().id;
+    assert_eq!(ticket.close_request.as_ref().unwrap().requested_by, OTHER);
+    assert_eq!(
+        ticket.close_request.as_ref().unwrap().reason.as_deref(),
+        reason
+    );
+    let notify = harness
+        .actions()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::SendMessage {
+                channel_id,
+                content: Some(content),
+                mentions,
+                ..
+            } if channel_id.get() == HERE && content == format!("<@{MEMBER}>") => Some(mentions),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(notify, MentionPolicy::Users(vec![Id::new(MEMBER)]));
+    let resent = harness
+        .invoke(close_request_command(OTHER, reason))
+        .await
+        .unwrap();
+    assert!(
+        resent
+            .last()
+            .unwrap()
+            .content
+            .contains("sent to the ticket opener"),
+        "{resent:?}"
+    );
+    let changed = harness
+        .invoke(close_request_command(MODERATOR, Some("A different reason")))
+        .await
+        .unwrap();
+    assert!(
+        changed.last().unwrap().content.contains("already waiting"),
+        "{changed:?}"
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.close_request.as_ref().unwrap().id, request_id);
+    assert_eq!(
+        ticket.close_request.as_ref().unwrap().reason.as_deref(),
+        reason
+    );
+    for route in ["close-request-approve", "close-request-reject"] {
+        let denied = harness
+            .click(request_click(route, request_id, OTHER).roles([STAFF_ROLE]))
+            .await
+            .unwrap();
+        assert!(
+            denied
+                .last()
+                .unwrap()
+                .content
+                .contains("Only the member who opened"),
+            "{denied:?}"
+        );
+    }
+    let rejected = harness
+        .click(request_click("close-request-reject", request_id, MEMBER))
+        .await
+        .unwrap();
+    assert!(
+        rejected
+            .last()
+            .unwrap()
+            .content
+            .contains("kept the ticket open"),
+        "{rejected:?}"
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert!(ticket.close_request.is_none());
+    assert!(deleted(&harness).is_empty());
+    let stale = harness
+        .click(request_click("close-request-approve", request_id, MEMBER))
+        .await
+        .unwrap();
+    assert!(
+        stale.last().unwrap().content.contains("no longer active"),
+        "{stale:?}"
+    );
+    let new_request = harness
+        .invoke(close_request_command(MODERATOR, Some("A new reason")))
+        .await
+        .unwrap();
+    assert!(
+        new_request
+            .last()
+            .unwrap()
+            .content
+            .contains("sent to the ticket opener"),
+        "{new_request:?}"
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    let new_id = ticket.close_request.as_ref().unwrap().id;
+    assert_ne!(new_id, request_id);
+    let old_button = harness
+        .click(request_click("close-request-reject", request_id, MEMBER))
+        .await
+        .unwrap();
+    assert!(
+        old_button
+            .last()
+            .unwrap()
+            .content
+            .contains("no longer active"),
+        "{old_button:?}"
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.close_request.as_ref().unwrap().id, new_id);
+    assert!(deleted(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_close_request_approvals_close_the_ticket_once() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .invoke(close_request_command(OTHER, Some("The issue is resolved")))
+        .await
+        .unwrap();
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    let request_id = ticket.close_request.unwrap().id;
+    let (first, second) = tokio::join!(
+        harness.click(request_click("close-request-approve", request_id, MEMBER)),
+        harness.click(request_click("close-request-approve", request_id, MEMBER)),
+    );
+    assert!(first.is_ok(), "{first:?}");
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(deleted(&harness), [HERE]);
+    assert_eq!(transcripts(&harness).len(), 1);
+    let ticket: Option<Ticket> = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap();
+    assert!(ticket.is_none());
+}
+
+#[tokio::test]
+async fn a_failed_close_request_post_can_be_resent_with_the_same_id() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .api()
+        .fail_nth(1, closure_core::error::DiscordError::Fatal("down".into()));
+    let barrier = tokio::sync::Barrier::new(2);
+    let first = async {
+        barrier.wait().await;
+        harness
+            .invoke(close_request_command(OTHER, Some("The issue is resolved")))
+            .await
+    };
+    let second = async {
+        barrier.wait().await;
+        harness
+            .invoke(close_request_command(
+                MODERATOR,
+                Some("The issue is resolved"),
+            ))
+            .await
+    };
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let replies = [
+        first.last().unwrap().content.clone(),
+        second.last().unwrap().content.clone(),
+    ];
+    assert!(
+        replies.iter().any(|reply| reply.contains("did not work")),
+        "{replies:?}"
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|reply| reply.contains("sent to the ticket opener")),
+        "{replies:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    let request_id = ticket.close_request.as_ref().unwrap().id;
+    let posts: Vec<_> = harness
+        .actions()
+        .iter()
+        .filter(|action| {
+            matches!(
+                action,
+                Action::PostMessage { channel_id, .. } if channel_id.get() == HERE
+            )
+        })
+        .map(|action| serde_json::to_string(action).unwrap())
+        .collect();
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert!(
+        posts[0].contains(&format!(
+            "tickets:close-request-approve:*:{HERE}:{request_id}"
+        )),
+        "{posts:?}"
+    );
+    assert!(
+        posts[0].contains(&format!(
+            "tickets:close-request-reject:*:{HERE}:{request_id}"
+        )),
+        "{posts:?}"
+    );
+    let approved = harness
+        .click(request_click("close-request-approve", request_id, MEMBER))
+        .await
+        .unwrap();
+    assert!(
+        approved
+            .last()
+            .unwrap()
+            .content
+            .contains("approved the closure request"),
+        "{approved:?}"
+    );
+    assert_eq!(deleted(&harness), [HERE]);
+    assert_eq!(transcripts(&harness).len(), 1);
+}
+
+#[tokio::test]
+async fn a_close_request_can_be_added_to_a_legacy_ticket() {
+    let harness = harness();
+    harness
+        .store()
+        .set(
+            &format!("ticket:{HERE}"),
+            &json!({
+                "number": 3,
+                "opener": MEMBER,
+                "claimed_by": null,
+                "created": 0
+            }),
+        )
+        .await
+        .unwrap();
+    harness
+        .invoke(close_request_command(OTHER, None))
+        .await
+        .unwrap();
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.close_request.unwrap().id, 1);
 }
 
 #[tokio::test]

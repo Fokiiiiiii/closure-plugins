@@ -37,6 +37,7 @@ const IDLE: &str = "idle";
 /// How many tickets a member has open, and the last number given.
 const OPEN: &str = "open";
 const NUMBER: &str = "number";
+const CLOSE_REQUESTS: &str = "close-requests";
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
@@ -108,6 +109,15 @@ struct Ticket {
     /// close waits for the first, unless that one stopped long ago.
     #[serde(default)]
     closing: Option<i64>,
+    #[serde(default)]
+    close_request: Option<CloseRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloseRequest {
+    id: i64,
+    requested_by: u64,
+    reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,6 +137,13 @@ struct Panel {
 #[derive(CommandArgs)]
 struct Close {
     /// Why it is closed
+    #[arg(max_length = 300)]
+    reason: Option<String>,
+}
+
+#[derive(CommandArgs)]
+struct CloseRequestArgs {
+    /// Why the staff member asks to close it
     #[arg(max_length = 300)]
     reason: Option<String>,
 }
@@ -178,6 +195,84 @@ fn button(ctx: &EventContext, route: &str, style: ButtonStyle, label: &str) -> C
         ctx.t_in(ctx.locale, label, &Args::new()),
         CustomId::new(route).encode(&ctx.module),
     )
+}
+
+fn close_request_button(
+    ctx: &EventContext,
+    route: &str,
+    style: ButtonStyle,
+    label: &str,
+    channel: ChannelId,
+    request_id: i64,
+) -> Component {
+    ui::button(
+        style,
+        ctx.t_in(ctx.locale, label, &Args::new()),
+        CustomId::new(route)
+            .data(format!("{}:{request_id}", channel.get()))
+            .encode(&ctx.module),
+    )
+}
+
+async fn post_close_request_message(
+    cx: &CommandCx,
+    ctx: &EventContext,
+    channel: ChannelId,
+    opener: u64,
+    request: &CloseRequest,
+) -> Result<(), closure_core::error::DiscordError> {
+    let reason = request
+        .reason
+        .clone()
+        .unwrap_or_else(|| cx.t("tickets-close-request-no-reason", &Args::new()));
+    let content = cx.t(
+        "tickets-close-request-message",
+        &Args::new()
+            .with("staff", format!("<@{}>", request.requested_by))
+            .with("reason", reason),
+    );
+    ctx.api
+        .execute(Action::PostMessage {
+            channel_id: channel,
+            message_id: None,
+            reply_to: None,
+            content: Some(content),
+            embeds: Vec::new(),
+            components: vec![ui::row(vec![
+                close_request_button(
+                    ctx,
+                    "close-request-approve",
+                    ButtonStyle::Success,
+                    "tickets-close-request-approve-button",
+                    channel,
+                    request.id,
+                ),
+                close_request_button(
+                    ctx,
+                    "close-request-reject",
+                    ButtonStyle::Secondary,
+                    "tickets-close-request-reject-button",
+                    channel,
+                    request.id,
+                ),
+            ])],
+            files: Vec::new(),
+        })
+        .await?;
+    if let Err(error) = ctx
+        .api
+        .execute(Action::SendMessage {
+            channel_id: channel,
+            content: Some(format!("<@{opener}>")),
+            embeds: Vec::new(),
+            reply_to: None,
+            mentions: MentionPolicy::Users(vec![UserId::new(opener)]),
+        })
+        .await
+    {
+        tracing::warn!(?error, channel = %channel, opener, "could not notify the ticket opener");
+    }
+    Ok(())
 }
 
 /// Whether the member may act as staff: a role of the settings, or the permission to manage.
@@ -327,6 +422,7 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
         claimed_by: None,
         created: cx.now(),
         closing: None,
+        close_request: None,
     };
     ctx.store()
         .set_for(
@@ -476,7 +572,7 @@ async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
     let due = last + i64::from(config.close_after_days) * DAY;
     if ctx.now() >= due {
         let reason = ctx.t_in(ctx.locale, "tickets-idle-reason", &Args::new());
-        if let Closed::BusyUntil(until) = finish(ctx, channel, None, &reason).await? {
+        if let Closed::BusyUntil(until) = finish(ctx, channel, None, &reason, None).await? {
             watch(ctx, channel, until).await?;
         }
     } else {
@@ -491,6 +587,8 @@ enum Closed {
     Done,
     /// No such ticket.
     Unknown,
+    /// The confirmation no longer matches the pending request.
+    RequestChanged,
     /// Somebody else is closing it; nothing was done, and the close may be tried at this time
     /// (Unix seconds).
     BusyUntil(i64),
@@ -501,6 +599,7 @@ enum Claim {
     Taken(Ticket),
     Gone,
     Busy(i64),
+    RequestChanged,
 }
 
 /// The messages of the channel, the oldest first, as text.
@@ -573,13 +672,30 @@ const CLOSING_WAIT: i64 = 300;
 
 /// Takes the ticket for closing, against the revision read: whoever writes first closes it, and a
 /// claim that was read before it cannot be written after it.
-async fn begin_closing(ctx: &EventContext, key: &str) -> Result<Claim, ModuleError> {
+async fn begin_closing(
+    ctx: &EventContext,
+    key: &str,
+    request_id: Option<i64>,
+) -> Result<Claim, ModuleError> {
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(key).await.map_err(|e| stored(&e))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Ok(Claim::Gone);
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
             .map_err(|error| ModuleError::other(error.to_string()))?;
+        if request_id.is_some_and(|request_id| {
+            ticket
+                .close_request
+                .as_ref()
+                .is_none_or(|request| request.id != request_id)
+        }) {
+            return Ok(Claim::RequestChanged);
+        }
         if let Some(since) = ticket
             .closing
             .filter(|since| ctx.now() - *since < CLOSING_WAIT)
@@ -632,12 +748,14 @@ async fn finish(
     channel: ChannelId,
     closer: Option<UserId>,
     reason: &str,
+    request_id: Option<i64>,
 ) -> Result<Closed, ModuleError> {
     let key = ticket_key(channel);
-    let ticket = match begin_closing(ctx, &key).await? {
+    let ticket = match begin_closing(ctx, &key, request_id).await? {
         Claim::Taken(ticket) => ticket,
         Claim::Gone => return Ok(Closed::Unknown),
         Claim::Busy(until) => return Ok(Closed::BusyUntil(until)),
+        Claim::RequestChanged => return Ok(Closed::RequestChanged),
     };
     let config: Config = ctx.parse_config()?;
     let file = match config.log() {
@@ -736,10 +854,150 @@ async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
         "tickets-closed-by",
         &Args::new().with("user", cx.user().name.clone()),
     );
-    finish(ctx, channel, Some(cx.user().id), &reason)
+    finish(ctx, channel, Some(cx.user().id), &reason, None)
         .await
         .map(drop)
         .map_err(|e| failed(&e))
+}
+
+fn close_request_id(cx: &ComponentCx, channel: ChannelId) -> Option<i64> {
+    let data = cx.custom_id()?.data;
+    let (button_channel, request_id) = data.split_once(':')?;
+    if button_channel.parse::<u64>().ok()? != channel.get() {
+        return None;
+    }
+    request_id.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
+async fn close_request_followup(cx: &ComponentCx, channel: ChannelId, key: &str) {
+    if let Err(error) = cx.reply_private_t(key, &Args::new()).await {
+        tracing::warn!(?error, channel = %channel, "could not send a close request follow-up");
+    }
+}
+
+async fn close_request_decision(cx: ComponentCx, approve: bool) -> Result<(), UserError> {
+    let channel = cx.click().channel_id;
+    let Some(request_id) = close_request_id(&cx, channel) else {
+        return say(&cx, "tickets-close-request-stale", &Args::new()).await;
+    };
+    cx.defer(true).await?;
+    let ctx = cx.ctx();
+    let key = ticket_key(channel);
+    let entry = match ctx.store().entry(&key).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return say(&cx, "tickets-close-request-stale", &Args::new()).await,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not read a close request");
+            return say(&cx, "tickets-failed", &Args::new()).await;
+        }
+    };
+    let mut revision = entry.revision;
+    let mut ticket: Ticket = match serde_json::from_value(entry.value) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not read a close request");
+            return say(&cx, "tickets-failed", &Args::new()).await;
+        }
+    };
+    if cx.user().id.get() != ticket.opener {
+        return say(&cx, "tickets-close-request-opener-only", &Args::new()).await;
+    }
+    let Some(request) = ticket
+        .close_request
+        .as_ref()
+        .filter(|request| request.id == request_id)
+        .cloned()
+    else {
+        return say(&cx, "tickets-close-request-stale", &Args::new()).await;
+    };
+    if approve {
+        cx.reply_private_t("tickets-close-request-processing", &Args::new())
+            .await?;
+        let reason = request
+            .reason
+            .unwrap_or_else(|| cx.t("tickets-close-request-approved-reason", &Args::new()));
+        let closed = match finish(ctx, channel, Some(cx.user().id), &reason, Some(request_id)).await
+        {
+            Ok(closed) => closed,
+            Err(error) => {
+                tracing::warn!(?error, channel = %channel, "could not close an approved ticket");
+                close_request_followup(&cx, channel, "tickets-failed").await;
+                return Ok(());
+            }
+        };
+        let message = match closed {
+            Closed::Done => "tickets-close-request-approved",
+            Closed::BusyUntil(_) => "tickets-closing",
+            Closed::Unknown | Closed::RequestChanged => "tickets-close-request-stale",
+        };
+        close_request_followup(&cx, channel, message).await;
+        return Ok(());
+    }
+    if ticket.closing.is_some() {
+        return say(&cx, "tickets-closing", &Args::new()).await;
+    }
+    for _ in 0..5 {
+        ticket.close_request = None;
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &ticket,
+                Expect::Revision(revision),
+                Some(Duration::from_hours(24 * 365)),
+            )
+            .await
+        {
+            Ok(_) => {
+                return say(&cx, "tickets-close-request-rejected", &Args::new()).await;
+            }
+            Err(StorageError::Conflict) => {
+                let next = match ctx.store().entry(&key).await {
+                    Ok(Some(next)) => next,
+                    Ok(None) => return say(&cx, "tickets-close-request-stale", &Args::new()).await,
+                    Err(error) => {
+                        tracing::warn!(?error, channel = %channel, "could not reread a close request");
+                        return say(&cx, "tickets-failed", &Args::new()).await;
+                    }
+                };
+                let next_revision = next.revision;
+                ticket = match serde_json::from_value(next.value) {
+                    Ok(ticket) => ticket,
+                    Err(error) => {
+                        tracing::warn!(?error, channel = %channel, "could not reread a close request");
+                        return say(&cx, "tickets-failed", &Args::new()).await;
+                    }
+                };
+                if cx.user().id.get() != ticket.opener {
+                    return say(&cx, "tickets-close-request-opener-only", &Args::new()).await;
+                }
+                if ticket.closing.is_some() {
+                    return say(&cx, "tickets-closing", &Args::new()).await;
+                }
+                if ticket
+                    .close_request
+                    .as_ref()
+                    .is_none_or(|request| request.id != request_id)
+                {
+                    return say(&cx, "tickets-close-request-stale", &Args::new()).await;
+                }
+                revision = next_revision;
+            }
+            Err(error) => {
+                tracing::warn!(?error, channel = %channel, "could not reject a close request");
+                return say(&cx, "tickets-failed", &Args::new()).await;
+            }
+        }
+    }
+    say(&cx, "tickets-failed", &Args::new()).await
+}
+
+async fn approve_close_request(cx: ComponentCx) -> Result<(), UserError> {
+    close_request_decision(cx, true).await
+}
+
+async fn reject_close_request(cx: ComponentCx) -> Result<(), UserError> {
+    close_request_decision(cx, false).await
 }
 
 async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
@@ -767,10 +1025,172 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
                 &Args::new().with("user", cx.user().name.clone()),
             )
         });
-    finish(ctx, channel, Some(cx.user().id), &reason)
+    finish(ctx, channel, Some(cx.user().id), &reason, None)
         .await
         .map(drop)
         .map_err(|e| failed(&e))
+}
+
+async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), UserError> {
+    let config: Config = cx.config()?;
+    cx.defer(true).await?;
+    if !is_staff_command(&cx, &config).await {
+        return cx.reply_private_t("tickets-staff-only", &Args::new()).await;
+    }
+    let ctx = cx.ctx();
+    let channel = cx.invocation().channel_id;
+    let key = ticket_key(channel);
+    let entry = match ctx.store().entry(&key).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return cx
+                .reply_private_t("tickets-not-a-ticket", &Args::new())
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not read a ticket for a close request");
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+    };
+    let mut revision = entry.revision;
+    let mut ticket: Ticket = match serde_json::from_value(entry.value) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not read a ticket for a close request");
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+    };
+    if ticket.closing.is_some() {
+        return cx
+            .reply_private_t("tickets-not-a-ticket", &Args::new())
+            .await;
+    }
+    let reason = args.reason.filter(|text| !text.trim().is_empty());
+    if let Some(request) = ticket.close_request.clone() {
+        if reason
+            .as_ref()
+            .is_some_and(|reason| request.reason.as_ref() != Some(reason))
+        {
+            return cx
+                .reply_private_t("tickets-close-request-pending", &Args::new())
+                .await;
+        }
+        return match post_close_request_message(&cx, ctx, channel, ticket.opener, &request).await {
+            Ok(()) => {
+                cx.reply_private_t("tickets-close-request-sent", &Args::new())
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(?error, channel = %channel, request_id = request.id, "could not resend a close request");
+                cx.reply_private_t("tickets-failed", &Args::new()).await
+            }
+        };
+    }
+    let request_id = match ctx.store().score_add(CLOSE_REQUESTS, 0_u64, 1).await {
+        Ok(id) if id > 0 => id,
+        Ok(_) => return cx.reply_private_t("tickets-failed", &Args::new()).await,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not allocate a close request id");
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+    };
+    let request = CloseRequest {
+        id: request_id,
+        requested_by: cx.user().id.get(),
+        reason: reason.clone(),
+    };
+    let mut saved = false;
+    for _ in 0..5 {
+        ticket.close_request = Some(request.clone());
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &ticket,
+                Expect::Revision(revision),
+                Some(Duration::from_hours(24 * 365)),
+            )
+            .await
+        {
+            Ok(_) => {
+                saved = true;
+                break;
+            }
+            Err(StorageError::Conflict) => {
+                let next = match ctx.store().entry(&key).await {
+                    Ok(Some(next)) => next,
+                    Ok(None) => {
+                        return cx
+                            .reply_private_t("tickets-not-a-ticket", &Args::new())
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, channel = %channel, "could not reread a ticket for a close request");
+                        return cx.reply_private_t("tickets-failed", &Args::new()).await;
+                    }
+                };
+                let next_revision = next.revision;
+                ticket = match serde_json::from_value(next.value) {
+                    Ok(ticket) => ticket,
+                    Err(error) => {
+                        tracing::warn!(?error, channel = %channel, "could not reread a ticket for a close request");
+                        return cx.reply_private_t("tickets-failed", &Args::new()).await;
+                    }
+                };
+                if ticket.closing.is_some() {
+                    return cx
+                        .reply_private_t("tickets-not-a-ticket", &Args::new())
+                        .await;
+                }
+                if let Some(existing) = ticket.close_request.clone() {
+                    if reason
+                        .as_ref()
+                        .is_some_and(|reason| existing.reason.as_ref() != Some(reason))
+                    {
+                        return cx
+                            .reply_private_t("tickets-close-request-pending", &Args::new())
+                            .await;
+                    }
+                    return match post_close_request_message(
+                        &cx,
+                        ctx,
+                        channel,
+                        ticket.opener,
+                        &existing,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            cx.reply_private_t("tickets-close-request-sent", &Args::new())
+                                .await
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, channel = %channel, request_id = existing.id, "could not resend a close request");
+                            cx.reply_private_t("tickets-failed", &Args::new()).await
+                        }
+                    };
+                }
+                revision = next_revision;
+            }
+            Err(error) => {
+                tracing::warn!(?error, channel = %channel, "could not save a close request");
+                return cx.reply_private_t("tickets-failed", &Args::new()).await;
+            }
+        }
+    }
+    if !saved {
+        return cx.reply_private_t("tickets-failed", &Args::new()).await;
+    }
+    match post_close_request_message(&cx, ctx, channel, ticket.opener, &request).await {
+        Ok(()) => {
+            cx.reply_private_t("tickets-close-request-sent", &Args::new())
+                .await
+        }
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, request_id = request.id, "could not send a close request");
+            cx.reply_private_t("tickets-failed", &Args::new()).await
+        }
+    }
 }
 
 async fn claim(cx: ComponentCx) -> Result<(), UserError> {
@@ -1093,6 +1513,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<Close>::new("close")
                         .requires("tickets.use")
                         .handler(close_command),
+                    Command::<CloseRequestArgs>::new("close-request").handler(close_request),
                     Command::<Member>::new("add")
                         .requires("tickets.manage")
                         .handler(add),
@@ -1106,6 +1527,8 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             )
             .component("open", open)
             .component("close", close_button)
+            .component("close-request-approve", approve_close_request)
+            .component("close-request-reject", reject_close_request)
             .component("claim", claim)
             .job(IDLE, idle_job)
             .catalog(Locale::En, EN)
