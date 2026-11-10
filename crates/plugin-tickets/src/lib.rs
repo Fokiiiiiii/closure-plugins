@@ -869,7 +869,7 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
         if ticket.claimed_by.is_none() {
             return Err(UserError::message("tickets-not-assigned"));
         }
-        ticket.claimed_by = claimed_by.map(|user| user.get());
+        ticket.claimed_by = claimed_by.map(twilight_model::id::Id::get);
         let (message, args) = match claimed_by {
             Some(user) => (
                 "tickets-transferred",
