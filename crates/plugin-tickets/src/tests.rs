@@ -52,6 +52,30 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         .unwrap();
 }
 
+async fn assign_ticket(harness: &Harness, channel: u64, user: u64) {
+    let key = format!("ticket:{channel}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.claimed_by = Some(user);
+    harness.store().set(&key, &ticket).await.unwrap();
+}
+
+fn member(id: u64, roles: &[u64]) -> twilight_model::guild::Member {
+    serde_json::from_value(json!({
+        "deaf": false,
+        "mute": false,
+        "flags": 0,
+        "roles": roles.iter().map(u64::to_string).collect::<Vec<_>>(),
+        "user": {
+            "id": id.to_string(),
+            "username": "member",
+            "discriminator": "0",
+            "avatar": null,
+            "bot": false
+        }
+    }))
+    .unwrap()
+}
+
 type Rights = (OverwriteTarget, Permissions, Permissions);
 
 fn created(harness: &Harness) -> Vec<(String, Vec<Rights>)> {
@@ -93,6 +117,21 @@ fn transcripts(harness: &Harness) -> Vec<(String, String)> {
                 files[0].filename.clone(),
                 String::from_utf8_lossy(&files[0].data).into_owned(),
             )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ticket_messages(harness: &Harness) -> Vec<String> {
+    harness
+        .actions()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::SendMessage {
+                channel_id,
+                content: Some(content),
+                ..
+            } if channel_id.get() == HERE => Some(content),
             _ => None,
         })
         .collect()
@@ -294,6 +333,184 @@ async fn a_claim_and_a_close_at_once_leave_the_close() {
         late.last().unwrap().content.contains("not an open ticket"),
         "{late:?}"
     );
+}
+
+#[tokio::test]
+async fn staff_can_transfer_and_unclaim_an_assigned_ticket() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    harness
+        .api()
+        .set_member(Id::new(1), member(MEMBER, &[STAFF_ROLE]));
+    let transfer = Invocation::new("ticket")
+        .subcommand("transfer")
+        .option("user", CommandOptionValue::User(Id::new(MEMBER)))
+        .roles([STAFF_ROLE])
+        .user(MODERATOR);
+    harness.invoke(transfer).await.unwrap();
+    let key = format!("ticket:{HERE}");
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.claimed_by, Some(MEMBER));
+    let unclaim = Invocation::new("ticket")
+        .subcommand("unclaim")
+        .roles([STAFF_ROLE])
+        .user(MODERATOR);
+    harness.invoke(unclaim).await.unwrap();
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.claimed_by, None);
+    let messages = ticket_messages(&harness);
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages[0].contains(&format!("<@{MEMBER}>")),
+        "{messages:?}"
+    );
+    assert!(messages[1].contains("unassigned"), "{messages:?}");
+}
+
+#[tokio::test]
+async fn unclaim_and_transfer_require_staff_and_an_existing_assignee() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .api()
+        .set_member(Id::new(1), member(MEMBER, &[STAFF_ROLE]));
+    let unauthorized = harness
+        .invoke(Invocation::new("ticket").subcommand("unclaim").user(OTHER))
+        .await
+        .unwrap();
+    assert!(
+        unauthorized
+            .last()
+            .unwrap()
+            .content
+            .contains("Only the staff"),
+        "{unauthorized:?}"
+    );
+    let unclaim = Invocation::new("ticket")
+        .subcommand("unclaim")
+        .roles([STAFF_ROLE])
+        .user(MODERATOR);
+    let unclaimed = harness.invoke(unclaim).await.unwrap();
+    assert!(
+        unclaimed.last().unwrap().content.contains("no assignee"),
+        "{unclaimed:?}"
+    );
+    let transfer = Invocation::new("ticket")
+        .subcommand("transfer")
+        .option("user", CommandOptionValue::User(Id::new(MEMBER)))
+        .roles([STAFF_ROLE])
+        .user(MODERATOR);
+    let transferred = harness.invoke(transfer).await.unwrap();
+    assert!(
+        transferred.last().unwrap().content.contains("no assignee"),
+        "{transferred:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, None);
+    assert!(ticket_messages(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn a_transfer_is_rejected_when_the_target_is_not_ticket_staff() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    harness.api().set_member(Id::new(1), member(MEMBER, &[]));
+    let transfer = Invocation::new("ticket")
+        .subcommand("transfer")
+        .option("user", CommandOptionValue::User(Id::new(MEMBER)))
+        .roles([STAFF_ROLE])
+        .user(MODERATOR);
+    let refused = harness.invoke(transfer).await.unwrap();
+    assert!(
+        refused
+            .last()
+            .unwrap()
+            .content
+            .contains("not in a configured ticket staff role"),
+        "{refused:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(OTHER));
+    assert!(ticket_messages(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn a_ticket_closing_cannot_be_unclaimed_or_transferred() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.closing = Some(1);
+    harness.store().set(&key, &ticket).await.unwrap();
+    harness
+        .api()
+        .set_member(Id::new(1), member(MEMBER, &[STAFF_ROLE]));
+    for command in [
+        Invocation::new("ticket")
+            .subcommand("unclaim")
+            .roles([STAFF_ROLE])
+            .user(MODERATOR),
+        Invocation::new("ticket")
+            .subcommand("transfer")
+            .option("user", CommandOptionValue::User(Id::new(MEMBER)))
+            .roles([STAFF_ROLE])
+            .user(MODERATOR),
+    ] {
+        let refused = harness.invoke(command).await.unwrap();
+        assert!(
+            refused
+                .last()
+                .unwrap()
+                .content
+                .contains("not an open ticket"),
+            "{refused:?}"
+        );
+    }
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.claimed_by, Some(OTHER));
+    assert_eq!(ticket.closing, Some(1));
+    assert!(ticket_messages(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn a_close_and_transfer_at_once_leave_the_close() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    harness
+        .api()
+        .set_member(Id::new(1), member(MEMBER, &[STAFF_ROLE]));
+    let close = harness.click(press("close", MEMBER));
+    let transfer = harness.invoke(
+        Invocation::new("ticket")
+            .subcommand("transfer")
+            .option("user", CommandOptionValue::User(Id::new(MEMBER)))
+            .roles([STAFF_ROLE])
+            .user(MODERATOR),
+    );
+    let (closed, transferred) = tokio::join!(close, transfer);
+    assert!(closed.is_ok(), "{closed:?}");
+    let _ = transferred;
+    assert_eq!(deleted(&harness), [HERE]);
+    let ticket: Option<Ticket> = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap();
+    assert!(ticket.is_none());
 }
 
 #[tokio::test]

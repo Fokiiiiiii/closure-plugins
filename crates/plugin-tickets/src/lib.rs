@@ -14,7 +14,7 @@ use closure_core::action::{
     Action, ChannelKind, FileUpload, MentionPolicy, NewChannel, Outcome, OverwriteSpec,
     OverwriteTarget, Reason,
 };
-use closure_core::error::ModuleError;
+use closure_core::error::{DiscordError, ModuleError};
 use closure_core::event::{ChannelId, RoleId, UserId};
 use closure_core::module::EventContext;
 use closure_core::storage::{Expect, StorageError};
@@ -130,6 +130,9 @@ struct Close {
     #[arg(max_length = 300)]
     reason: Option<String>,
 }
+
+#[derive(CommandArgs)]
+struct Unclaim {}
 
 #[derive(CommandArgs)]
 struct Member {
@@ -825,6 +828,89 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
     say(&cx, "tickets-failed", &Args::new()).await
 }
 
+async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), UserError> {
+    let config: Config = cx.config()?;
+    if !is_staff_command(&cx, &config).await {
+        return Err(UserError::message("tickets-staff-only"));
+    }
+    let ctx = cx.ctx();
+    let staff = config.staff();
+    if let Some(user) = claimed_by {
+        let member = match ctx
+            .api
+            .execute(Action::GetMember {
+                guild_id: ctx.guild_id,
+                user_id: user,
+            })
+            .await
+        {
+            Ok(Outcome::Member(member)) => member,
+            Ok(_) | Err(DiscordError::NotFound) => {
+                return Err(UserError::message("tickets-transfer-not-staff"));
+            }
+            Err(error) => return Err(failed(&error)),
+        };
+        if !member.roles.iter().any(|role| staff.contains(role)) {
+            return Err(UserError::message("tickets-transfer-not-staff"));
+        }
+    }
+    let channel = cx.invocation().channel_id;
+    let key = ticket_key(channel);
+    // CAS lets a close that begins during the update win.
+    for _ in 0..5 {
+        let Some(entry) = ctx.store().entry(&key).await.map_err(|e| failed(&e))? else {
+            return Err(UserError::message("tickets-not-a-ticket"));
+        };
+        let mut ticket: Ticket =
+            serde_json::from_value(entry.value).map_err(|error| failed(&error))?;
+        if ticket.closing.is_some() {
+            return Err(UserError::message("tickets-not-a-ticket"));
+        }
+        if ticket.claimed_by.is_none() {
+            return Err(UserError::message("tickets-not-assigned"));
+        }
+        ticket.claimed_by = claimed_by.map(|user| user.get());
+        let (message, args) = match claimed_by {
+            Some(user) => (
+                "tickets-transferred",
+                Args::new().with("user", format!("<@{user}>")),
+            ),
+            None => ("tickets-unclaimed", Args::new()),
+        };
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &ticket,
+                Expect::Revision(entry.revision),
+                Some(Duration::from_hours(24 * 365)),
+            )
+            .await
+        {
+            Ok(_) => {
+                let content = cx.t(message, &args);
+                if let Err(error) = ctx
+                    .api
+                    .execute(Action::SendMessage {
+                        channel_id: channel,
+                        content: Some(content),
+                        embeds: Vec::new(),
+                        reply_to: None,
+                        mentions: MentionPolicy::None,
+                    })
+                    .await
+                {
+                    tracing::warn!(?error, channel = %channel, "could not announce a ticket assignment change");
+                }
+                return cx.reply_private_t(message, &args).await;
+            }
+            Err(StorageError::Conflict) => {}
+            Err(error) => return Err(failed(&error)),
+        }
+    }
+    Err(UserError::message("tickets-failed"))
+}
+
 /// Lets a member into the ticket, or takes them out of it.
 async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Result<(), UserError> {
     let channel = cx.invocation().channel_id;
@@ -874,6 +960,14 @@ async fn add(cx: CommandCx, args: Member) -> Result<(), UserError> {
 
 async fn remove(cx: CommandCx, args: Member) -> Result<(), UserError> {
     change_member(cx, args.user, false).await
+}
+
+async fn unclaim(cx: CommandCx, _: Unclaim) -> Result<(), UserError> {
+    set_claim(cx, None).await
+}
+
+async fn transfer(cx: CommandCx, args: Member) -> Result<(), UserError> {
+    set_claim(cx, Some(args.user)).await
 }
 
 /// # Errors
@@ -962,6 +1056,8 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<Member>::new("remove")
                         .requires("tickets.manage")
                         .handler(remove),
+                    Command::<Unclaim>::new("unclaim").handler(unclaim),
+                    Command::<Member>::new("transfer").handler(transfer),
                 ],
             )
             .component("open", open)
