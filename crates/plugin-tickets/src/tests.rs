@@ -1743,9 +1743,9 @@ async fn a_named_panel_form_collects_answers_into_the_ticket() {
                 MEMBER,
                 &named_form_config("support", &questions, PANEL_STAFF_ROLE),
             ))
-                .user(MEMBER)
-                .field("tickets:question-0", "I cannot sign in.")
-                .field("tickets:question-1", "This morning."),
+            .user(MEMBER)
+            .field("tickets:question-0", "I cannot sign in.")
+            .field("tickets:question-1", "This morning."),
         )
         .await
         .unwrap();
@@ -1803,8 +1803,8 @@ async fn a_ticket_form_cannot_be_submitted_by_another_member() {
                 MEMBER,
                 &named_form_config("support", &questions, PANEL_STAFF_ROLE),
             ))
-                .user(OTHER)
-                .field("tickets:question-0", "Not the opener."),
+            .user(OTHER)
+            .field("tickets:question-0", "Not the opener."),
         )
         .await
         .unwrap();
@@ -1819,7 +1819,10 @@ fn panel_questions_fit_discord_modal_limits() {
         &schema["properties"]["panels"]["items"]["properties"]["questions"],
     ] {
         assert_eq!(questions["maxItems"], json!(5));
-        assert_eq!(questions["items"]["maxLength"], json!(crate::MAX_FORM_QUESTION_CHARS));
+        assert_eq!(
+            questions["items"]["maxLength"],
+            json!(crate::MAX_FORM_QUESTION_CHARS)
+        );
         assert_eq!(questions["x-ui"]["widget"], json!("text-list"));
     }
     assert!(crate::valid_questions(&["Need help?".to_owned()]));
@@ -1965,7 +1968,6 @@ async fn saved_form_answers_can_be_resent_from_the_ticket() {
     assert!(posted.contains("I cannot sign in."));
 }
 
-
 #[tokio::test]
 async fn saved_answers_remain_available_to_ticket_staff_after_config_changes() {
     let harness = harness();
@@ -1987,12 +1989,10 @@ async fn saved_answers_remain_available_to_ticket_staff_after_config_changes() {
         .await
         .unwrap();
     assert!(replies.last().unwrap().ephemeral);
-    assert!(
-        harness.actions().into_iter().any(|action| matches!(
-            action,
-            Action::SendMessage { embeds, .. } if !embeds.is_empty()
-        ))
-    );
+    assert!(harness.actions().into_iter().any(|action| matches!(
+        action,
+        Action::SendMessage { embeds, .. } if !embeds.is_empty()
+    )));
 }
 
 #[tokio::test]
@@ -2009,12 +2009,10 @@ async fn another_member_cannot_resend_ticket_form_answers() {
         .await
         .unwrap();
     assert!(replies.last().unwrap().ephemeral);
-    assert!(
-        harness.actions().into_iter().all(|action| !matches!(
-            action,
-            Action::SendMessage { embeds, .. } if !embeds.is_empty()
-        ))
-    );
+    assert!(harness.actions().into_iter().all(|action| !matches!(
+        action,
+        Action::SendMessage { embeds, .. } if !embeds.is_empty()
+    )));
 }
 
 #[tokio::test]

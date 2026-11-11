@@ -22,14 +22,14 @@ use closure_core::storage::{Expect, StorageError};
 use closure_sdk::ui::{self, CustomId, text_input};
 use closure_sdk::{
     Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, Cx, EmbedBuilder,
-    InteractionRef, InteractionReply, JobCx, Level, Locale, ModalCx, ModuleBuilder,
-    PermissionSpec, SdkModule, UserError,
+    InteractionRef, InteractionReply, JobCx, Level, Locale, ModalCx, ModuleBuilder, PermissionSpec,
+    SdkModule, UserError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use twilight_model::channel::ChannelType;
-use twilight_model::channel::message::{Component, Embed};
 use twilight_model::channel::message::component::ButtonStyle;
+use twilight_model::channel::message::{Component, Embed};
 use twilight_model::guild::Permissions;
 
 const EN: &str = include_str!("../locales/en.ftl");
@@ -466,16 +466,20 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
     if config.questions.is_empty() {
         return create_ticket(cx, config, panel, Vec::new()).await;
     }
-    let inputs = config.questions.iter().enumerate().map(|(index, question)| {
-        text_input(
-            cx.module(),
-            &format!("question-{index}"),
-            question,
-            true,
-            true,
-            MAX_FORM_ANSWER_CHARS,
-        )
-    });
+    let inputs = config
+        .questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            text_input(
+                cx.module(),
+                &format!("question-{index}"),
+                question,
+                true,
+                true,
+                MAX_FORM_ANSWER_CHARS,
+            )
+        });
     cx.show_modal(ui::modal(
         CustomId::new(FORM)
             .only_for(cx.user().id)
@@ -1418,7 +1422,8 @@ async fn ticket_answers(cx: CommandCx, _: ()) -> Result<(), UserError> {
             .await;
     };
     send_form_answers(cx.ctx(), channel, embed).await?;
-    cx.reply_private_t("tickets-form-resent", &Args::new()).await
+    cx.reply_private_t("tickets-form-resent", &Args::new())
+        .await
 }
 
 async fn resend_close_request(
