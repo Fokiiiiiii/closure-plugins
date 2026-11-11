@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use closure_core::action::{Action, MentionPolicy, OverwriteTarget};
 use closure_core::event::GuildId;
-use closure_sdk::testing::{Click, Harness, Invocation};
+use closure_sdk::testing::{Click, Harness, Invocation, ReplyKind, Submit};
 use closure_sdk::{CommandOptionValue, Level};
 use serde_json::json;
 use twilight_model::guild::Permissions;
@@ -1683,6 +1683,97 @@ async fn panel_command_button_contains_the_selected_panel_id() {
         })
         .unwrap();
     assert!(post.contains("tickets:open:*:billing"), "{post}");
+}
+
+#[tokio::test]
+async fn a_named_panel_form_collects_answers_into_the_ticket() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "panels": [{
+            "id": "support",
+            "staff_roles": [PANEL_STAFF_ROLE.to_string()],
+            "questions": ["What do you need help with?", "When did this start?"]
+        }]
+    }));
+
+    let shown = harness.click(panel_press("support", MEMBER)).await.unwrap();
+    assert_eq!(shown[0].kind, ReplyKind::Modal);
+    assert_eq!(
+        shown[0].custom_ids(),
+        ["tickets:question-0", "tickets:question-1"]
+    );
+    assert!(created(&harness).is_empty());
+
+    harness
+        .submit(
+            Submit::new("tickets:form:7:support")
+                .user(MEMBER)
+                .field("tickets:question-0", "I cannot sign in.")
+                .field("tickets:question-1", "This morning."),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created(&harness).len(), 1);
+
+    let ticket_embed = harness
+        .actions()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::PostMessage {
+                embeds,
+                content: Some(_),
+                ..
+            } if !embeds.is_empty() => Some(serde_json::to_string(&embeds).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(ticket_embed.contains("What do you need help with?"));
+    assert!(ticket_embed.contains("I cannot sign in."));
+    assert!(ticket_embed.contains("When did this start?"));
+    assert!(ticket_embed.contains("This morning."));
+}
+
+#[tokio::test]
+async fn a_ticket_form_cannot_be_submitted_by_another_member() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "panels": [{
+            "id": "support",
+            "staff_roles": [PANEL_STAFF_ROLE.to_string()],
+            "questions": ["What do you need help with?"]
+        }]
+    }));
+
+    let shown = harness.click(panel_press("support", MEMBER)).await.unwrap();
+    assert_eq!(shown[0].kind, ReplyKind::Modal);
+    harness
+        .submit(
+            Submit::new("tickets:form:7:support")
+                .user(OTHER)
+                .field("tickets:question-0", "Not the opener."),
+        )
+        .await
+        .unwrap();
+    assert!(created(&harness).is_empty());
+}
+
+#[test]
+fn panel_questions_fit_discord_modal_limits() {
+    let schema = crate::schema();
+    for questions in [
+        &schema["properties"]["questions"],
+        &schema["properties"]["panels"]["items"]["properties"]["questions"],
+    ] {
+        assert_eq!(questions["maxItems"], json!(5));
+        assert_eq!(questions["items"]["maxLength"], json!(crate::MAX_FORM_QUESTION_CHARS));
+    }
+    assert!(crate::valid_questions(&["Need help?".to_owned()]));
+    let too_many_questions = ["Question"; 6].map(str::to_owned);
+    assert!(!crate::valid_questions(&too_many_questions));
+    assert!(!crate::valid_questions(&[" ".to_owned()]));
+    assert!(!crate::valid_questions(&["Q".repeat(46)]));
 }
 
 #[tokio::test]

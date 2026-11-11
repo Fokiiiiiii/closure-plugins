@@ -18,10 +18,11 @@ use closure_core::error::{DiscordError, ModuleError};
 use closure_core::event::{ChannelId, RoleId, UserId};
 use closure_core::module::EventContext;
 use closure_core::storage::{Expect, StorageError};
-use closure_sdk::ui::{self, CustomId};
+use closure_sdk::ui::{self, CustomId, text_input};
 use closure_sdk::{
-    Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, InteractionReply, JobCx, Level,
-    Locale, ModuleBuilder, PermissionSpec, SdkModule, UserError,
+    Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, Cx, EmbedBuilder,
+    InteractionRef, InteractionReply, JobCx, Level, Locale, ModalCx, ModuleBuilder,
+    PermissionSpec, SdkModule, UserError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -38,6 +39,10 @@ const IDLE: &str = "idle";
 const OPEN: &str = "open";
 const NUMBER: &str = "number";
 const CLOSE_REQUESTS: &str = "close-requests";
+const FORM: &str = "form";
+const MAX_FORM_QUESTIONS: usize = 5;
+const MAX_FORM_QUESTION_CHARS: usize = 45;
+const MAX_FORM_ANSWER_CHARS: u16 = 1024;
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
@@ -61,6 +66,7 @@ struct Config {
     max_open: u32,
     /// A ticket nobody writes in for this many days is closed; 0 never closes one.
     close_after_days: u32,
+    questions: Vec<String>,
     panels: Vec<NamedPanel>,
 }
 
@@ -72,6 +78,7 @@ struct NamedPanel {
     staff_roles: Vec<String>,
     log_channel: Option<String>,
     close_after_days: u32,
+    questions: Vec<String>,
 }
 
 impl Default for Config {
@@ -82,6 +89,7 @@ impl Default for Config {
             log_channel: None,
             max_open: 1,
             close_after_days: 0,
+            questions: Vec::new(),
             panels: Vec::new(),
         }
     }
@@ -112,6 +120,7 @@ impl Config {
             log_channel: panel.log_channel.clone(),
             max_open: self.max_open,
             close_after_days: panel.close_after_days,
+            questions: panel.questions.clone(),
             panels: Vec::new(),
         }
     }
@@ -239,7 +248,11 @@ fn stored(error: &impl ToString) -> ModuleError {
     ModuleError::other(error.to_string())
 }
 
-async fn say(cx: &ComponentCx, key: &str, args: &Args) -> Result<(), UserError> {
+async fn say<I: InteractionRef + 'static>(
+    cx: &Cx<I>,
+    key: &str,
+    args: &Args,
+) -> Result<(), UserError> {
     cx.reply_with(InteractionReply {
         content: Some(cx.t(key, args)),
         embeds: Vec::new(),
@@ -336,7 +349,7 @@ async fn post_close_request_message(
 }
 
 /// Whether the member may act as staff: a role of the settings, or the permission to manage.
-async fn is_staff(cx: &ComponentCx, config: &Config) -> bool {
+async fn is_staff<I: InteractionRef + 'static>(cx: &Cx<I>, config: &Config) -> bool {
     let actor = cx.actor().await;
     let roles = config.staff();
     actor.roles.iter().any(|role| roles.contains(role))
@@ -426,13 +439,7 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
     cx.reply_private_t("tickets-panel-done", &Args::new()).await
 }
 
-/// A member pressed the button: a private channel for them and the staff.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one flow: reserve a place, make the channel, greet, remember, schedule"
-)]
 async fn open(cx: ComponentCx) -> Result<(), UserError> {
-    // The button is not a way around what `/ticket` asks: the same permission.
     cx.require("tickets.use").await?;
     let original: Config = cx.config()?;
     let panel_id = cx.data();
@@ -444,16 +451,128 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
     let config = panel
         .as_ref()
         .map_or_else(|| original.clone(), |panel| original.with_panel(panel));
+    if let Some(key) = ticket_setup_error(&config, cx.ctx().guild_id.get()) {
+        return say(&cx, key, &Args::new()).await;
+    }
+    if !valid_questions(&config.questions) {
+        return say(&cx, "tickets-form-invalid", &Args::new()).await;
+    }
+    if config.questions.is_empty() {
+        return create_ticket(cx, config, panel, Vec::new()).await;
+    }
+    let inputs = config.questions.iter().enumerate().map(|(index, question)| {
+        text_input(
+            cx.module(),
+            &format!("question-{index}"),
+            question,
+            true,
+            true,
+            MAX_FORM_ANSWER_CHARS,
+        )
+    });
+    cx.show_modal(ui::modal(
+        CustomId::new(FORM)
+            .only_for(cx.user().id)
+            .data(panel_id)
+            .encode(cx.module()),
+        cx.t("tickets-form-title", &Args::new()),
+        inputs,
+    ))
+    .await
+}
+
+fn ticket_setup_error(config: &Config, guild_id: u64) -> Option<&'static str> {
+    let staff = config.staff();
+    if staff.is_empty() {
+        Some("tickets-not-set-up")
+    } else if staff.contains(&RoleId::new(guild_id)) {
+        Some("tickets-everyone-not-staff")
+    } else {
+        None
+    }
+}
+
+fn valid_questions(questions: &[String]) -> bool {
+    questions.len() <= MAX_FORM_QUESTIONS
+        && questions.iter().all(|question| {
+            !question.trim().is_empty() && question.chars().count() <= MAX_FORM_QUESTION_CHARS
+        })
+}
+
+async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
+    cx.require("tickets.use").await?;
+    let Some((module, form)) = CustomId::parse(&cx.submission().custom_id) else {
+        return Err(UserError::message("tickets-form-invalid"));
+    };
+    if &module != cx.module() || form.route != FORM || form.owner != Some(cx.user().id) {
+        return Err(UserError::message("tickets-form-invalid"));
+    }
+    let original: Config = cx.config()?;
+    let panel = if form.data.is_empty() {
+        None
+    } else {
+        Some(original.named(&form.data)?.clone())
+    };
+    let config = panel
+        .as_ref()
+        .map_or_else(|| original.clone(), |panel| original.with_panel(panel));
+    if config.questions.is_empty() || !valid_questions(&config.questions) {
+        return Err(UserError::message("tickets-form-invalid"));
+    }
+    let answers = config
+        .questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            cx.field(&format!("question-{index}"))
+                .map(|answer| (question.clone(), answer.to_owned()))
+                .ok_or_else(|| UserError::message("tickets-form-invalid"))
+        })
+        .collect::<Result<Vec<_>, UserError>>()?;
+    create_ticket(cx, config, panel, answers).await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flow: reserve a place, make the channel, greet, remember, schedule"
+)]
+async fn create_ticket<I: InteractionRef + 'static>(
+    cx: Cx<I>,
+    config: Config,
+    panel: Option<NamedPanel>,
+    answers: Vec<(String, String)>,
+) -> Result<(), UserError> {
+    if !valid_questions(&config.questions)
+        || answers.len() != config.questions.len()
+        || answers
+            .iter()
+            .zip(&config.questions)
+            .any(|((question, answer), expected)| {
+                question != expected
+                    || answer.trim().is_empty()
+                    || answer.chars().count() > usize::from(MAX_FORM_ANSWER_CHARS)
+            })
+    {
+        return Err(UserError::message("tickets-form-invalid"));
+    }
+    let embeds = if answers.is_empty() {
+        Vec::new()
+    } else {
+        let embed = answers.into_iter().fold(
+            EmbedBuilder::new().title(cx.t("tickets-form-answers-title", &Args::new())),
+            |embed, (question, answer)| embed.field(question, answer, false),
+        );
+        vec![embed
+            .build()
+            .map_err(|_| UserError::message("tickets-form-invalid"))?]
+    };
     let ctx = cx.ctx();
+    if let Some(key) = ticket_setup_error(&config, ctx.guild_id.get()) {
+        return say(&cx, key, &Args::new()).await;
+    }
     let mut staff = config.staff();
     staff.sort_unstable();
     staff.dedup();
-    if staff.is_empty() {
-        return say(&cx, "tickets-not-set-up", &Args::new()).await;
-    }
-    if staff.contains(&RoleId::new(ctx.guild_id.get())) {
-        return say(&cx, "tickets-everyone-not-staff", &Args::new()).await;
-    }
     let user = cx.user().id;
     if let Some(parent) = config.category() {
         ensure_category(ctx, parent).await?;
@@ -562,7 +681,7 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
                         .with("number", number),
                 ),
             ),
-            embeds: Vec::new(),
+            embeds,
             components: vec![ui::row(vec![
                 button(ctx, "claim", ButtonStyle::Secondary, "tickets-claim-button"),
                 button(ctx, "close", ButtonStyle::Danger, "tickets-close-button"),
@@ -1638,6 +1757,13 @@ fn schema() -> serde_json::Value {
                 "description": "config-tickets-close_after_days",
                 "x-ui": { "level": "basic" }
             },
+            "questions": {
+                "type": "array",
+                "maxItems": MAX_FORM_QUESTIONS,
+                "items": { "type": "string", "minLength": 1, "maxLength": MAX_FORM_QUESTION_CHARS, "description": "config-tickets-question" },
+                "description": "config-tickets-questions",
+                "x-ui": { "level": "basic" }
+            },
             "panels": {
                 "type": "array",
                 "description": "config-tickets-panels",
@@ -1651,7 +1777,8 @@ fn schema() -> serde_json::Value {
                         "category": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-category", "x-ui": { "widget": "channel", "channel_kinds": ["category"] } },
                         "staff_roles": { "type": "array", "maxItems": 20, "items": { "type": "string", "pattern": "^[0-9]{1,20}$" }, "description": "config-tickets-panel-staff" },
                         "log_channel": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-log_channel", "x-ui": { "widget": "channel" } },
-                        "close_after_days": { "type": "integer", "minimum": 0, "maximum": 365, "description": "config-tickets-close_after_days" }
+                        "close_after_days": { "type": "integer", "minimum": 0, "maximum": 365, "description": "config-tickets-close_after_days" },
+                        "questions": { "type": "array", "maxItems": MAX_FORM_QUESTIONS, "items": { "type": "string", "minLength": 1, "maxLength": MAX_FORM_QUESTION_CHARS, "description": "config-tickets-question" }, "description": "config-tickets-questions", "x-ui": { "level": "basic" } }
                     }
                 }
             }
@@ -1690,6 +1817,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     "log_channel": null,
                     "max_open": 1,
                     "close_after_days": 0,
+                    "questions": [],
                     "panels": []
                 }),
             )
@@ -1711,6 +1839,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                 ],
             )
             .component("open", open)
+            .modal(FORM, submit_form)
             .component("close", close_button)
             .component("close-request-approve", approve_close_request)
             .component("close-request-reject", reject_close_request)
