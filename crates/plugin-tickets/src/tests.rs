@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use closure_core::action::{Action, MentionPolicy, OverwriteTarget};
-use closure_core::event::GuildId;
+use closure_core::event::{Event, GuildId, UserInfo};
 use closure_sdk::testing::{Click, Harness, Invocation};
 use closure_sdk::{CommandOptionValue, Level};
 use serde_json::json;
@@ -176,6 +176,17 @@ fn ticket_messages(harness: &Harness) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+fn member_left(user: u64) -> Event {
+    Event::MemberLeft {
+        guild_id: Id::new(1),
+        user: UserInfo {
+            id: Id::new(user),
+            name: "member".into(),
+            bot: false,
+        },
+    }
 }
 
 fn press(route: &str, user: u64) -> Click {
@@ -1375,6 +1386,78 @@ async fn an_idle_close_that_meets_a_close_under_way_is_tried_again_after_it() {
     harness.advance(Duration::from_secs(295));
     harness.run_due_jobs().await;
     assert_eq!(deleted(&harness), [channel]);
+}
+
+#[tokio::test]
+async fn a_member_leaving_closes_only_their_ticket_when_enabled() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "close_when_opener_leaves": true
+    }));
+    harness.click(press("open", MEMBER)).await.unwrap();
+    harness.click(press("open", OTHER)).await.unwrap();
+
+    let mut member_channel = None;
+    let mut other_key = None;
+    for (key, _) in harness.store().list("ticket:", 10).await.unwrap() {
+        let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+        if ticket.opener == MEMBER {
+            member_channel = Some(key.trim_start_matches("ticket:").parse::<u64>().unwrap());
+        } else if ticket.opener == OTHER {
+            other_key = Some(key);
+        }
+    }
+    let member_channel = member_channel.unwrap();
+    let other_key = other_key.unwrap();
+
+    harness.emit(member_left(MEMBER)).await.unwrap();
+    harness.run_due_jobs().await;
+    harness.run_due_jobs().await;
+
+    assert_eq!(deleted(&harness), [member_channel]);
+    assert!(
+        harness.store().get::<Ticket>(&other_key).await.unwrap().is_some(),
+        "another member's ticket stays open"
+    );
+}
+
+#[tokio::test]
+async fn tickets_stay_open_on_member_leave_by_default() {
+    let harness = harness();
+    harness.click(press("open", MEMBER)).await.unwrap();
+
+    harness.emit(member_left(MEMBER)).await.unwrap();
+    harness.run_due_jobs().await;
+
+    assert!(deleted(&harness).is_empty());
+    assert_eq!(harness.jobs(), 0);
+}
+
+#[tokio::test]
+async fn a_member_leave_close_retries_after_a_close_already_in_progress() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "close_when_opener_leaves": true
+    }));
+    harness.click(press("open", MEMBER)).await.unwrap();
+    let (key, _) = harness.store().list("ticket:", 1).await.unwrap().remove(0);
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.closing = Some(ticket.created);
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    harness.emit(member_left(MEMBER)).await.unwrap();
+    harness.run_due_jobs().await;
+    harness.run_due_jobs().await;
+    assert!(deleted(&harness).is_empty());
+
+    harness.advance(Duration::from_secs(300));
+    harness.run_due_jobs().await;
+    assert_eq!(
+        deleted(&harness),
+        [key.trim_start_matches("ticket:").parse::<u64>().unwrap()]
+    );
 }
 
 #[tokio::test]

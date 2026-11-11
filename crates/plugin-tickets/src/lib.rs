@@ -15,13 +15,14 @@ use closure_core::action::{
     OverwriteSpec, OverwriteTarget, Reason,
 };
 use closure_core::error::{DiscordError, ModuleError};
-use closure_core::event::{ChannelId, RoleId, UserId};
+use closure_core::event::{ChannelId, Event, EventKind, RoleId, UserId};
 use closure_core::module::EventContext;
+use closure_core::subscription::Flow;
 use closure_core::storage::{Expect, StorageError};
 use closure_sdk::ui::{self, CustomId};
 use closure_sdk::{
-    Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, InteractionReply, JobCx, Level,
-    Locale, ModuleBuilder, PermissionSpec, SdkModule, UserError,
+    Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, Intents, InteractionReply,
+    JobCx, Level, Locale, ModuleBuilder, PermissionSpec, SdkModule, Subscription, UserError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,6 +35,8 @@ const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
 /// The job that closes a ticket nobody writes in.
 const IDLE: &str = "idle";
+const LEFT_SCAN: &str = "left-scan";
+const LEFT_CLOSE: &str = "left-close";
 /// How many tickets a member has open, and the last number given.
 const OPEN: &str = "open";
 const NUMBER: &str = "number";
@@ -61,6 +64,8 @@ struct Config {
     max_open: u32,
     /// A ticket nobody writes in for this many days is closed; 0 never closes one.
     close_after_days: u32,
+    /// Close the member's open tickets when they leave the server.
+    close_when_opener_leaves: bool,
     panels: Vec<NamedPanel>,
 }
 
@@ -82,6 +87,7 @@ impl Default for Config {
             log_channel: None,
             max_open: 1,
             close_after_days: 0,
+            close_when_opener_leaves: false,
             panels: Vec::new(),
         }
     }
@@ -112,6 +118,7 @@ impl Config {
             log_channel: panel.log_channel.clone(),
             max_open: self.max_open,
             close_after_days: panel.close_after_days,
+            close_when_opener_leaves: self.close_when_opener_leaves,
             panels: Vec::new(),
         }
     }
@@ -168,6 +175,17 @@ struct Idle {
     channel: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LeftScan {
+    opener: u64,
+    at: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LeftClose {
+    channel: u64,
+}
+
 #[derive(CommandArgs)]
 struct PanelArgs {
     /// The panel ID; omit for the default panel
@@ -215,6 +233,10 @@ fn ticket_key(channel: ChannelId) -> String {
 
 fn idle_key(channel: ChannelId) -> String {
     format!("idle-{}", channel.get())
+}
+
+fn left_close_key(channel: ChannelId) -> String {
+    format!("left-close-{}", channel.get())
 }
 
 async fn ticket_config(
@@ -643,6 +665,25 @@ async fn watch(ctx: &EventContext, channel: ChannelId, at: i64) -> Result<(), Mo
         .map_err(|e| stored(&e))
 }
 
+async fn close_left_later(
+    ctx: &EventContext,
+    channel: ChannelId,
+    at: i64,
+) -> Result<(), ModuleError> {
+    ctx.scheduler()
+        .job(
+            LEFT_CLOSE,
+            &LeftClose {
+                channel: channel.get(),
+            },
+        )
+        .map_err(|e| stored(&e))?
+        .key(&left_close_key(channel))
+        .at(at)
+        .await
+        .map_err(|e| stored(&e))
+}
+
 /// The time of a Discord id, in Unix seconds.
 fn made_at(id: u64) -> i64 {
     i64::try_from(((id >> 22) + 1_420_070_400_000) / 1000).unwrap_or(0)
@@ -694,6 +735,100 @@ async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
         }
     } else {
         watch(ctx, channel, due).await?;
+    }
+    Ok(())
+}
+
+async fn on_member_left(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
+    let Event::MemberLeft { guild_id, user } = event else {
+        return Ok(Flow::Continue);
+    };
+    if guild_id != ctx.guild_id {
+        return Ok(Flow::Continue);
+    }
+    let config: Config = ctx.parse_config()?;
+    if !config.close_when_opener_leaves {
+        return Ok(Flow::Continue);
+    }
+    let at = ctx.now();
+    ctx.scheduler()
+        .job(
+            LEFT_SCAN,
+            &LeftScan {
+                opener: user.id.get(),
+                at,
+            },
+        )
+        .map_err(|e| stored(&e))?
+        .key(&format!("left-scan-{}", user.id.get()))
+        .at(at)
+        .await
+        .map_err(|e| stored(&e))?;
+    Ok(Flow::Continue)
+}
+
+async fn left_scan_job(cx: JobCx) -> Result<(), ModuleError> {
+    let job: LeftScan = cx.payload()?;
+    let ctx = cx.ctx();
+    let config: Config = ctx.parse_config()?;
+    if !config.close_when_opener_leaves {
+        return Ok(());
+    }
+    let channels = match ctx
+        .api
+        .execute(Action::ListChannels {
+            guild_id: ctx.guild_id,
+        })
+        .await
+    {
+        Ok(Outcome::Channels(channels)) => channels,
+        Ok(_) => return Err(ModuleError::other("the ticket channels were not listed")),
+        Err(error) => return Err(error.into()),
+    };
+    for channel in channels {
+        let Some(ticket) = ctx
+            .store()
+            .get::<Ticket>(&ticket_key(channel.id))
+            .await
+            .map_err(|e| stored(&e))?
+        else {
+            continue;
+        };
+        if ticket.opener == job.opener && ticket.created <= job.at {
+            close_left_later(ctx, channel.id, ctx.now()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn left_close_job(cx: JobCx) -> Result<(), ModuleError> {
+    let job: LeftClose = cx.payload()?;
+    let ctx = cx.ctx();
+    let channel = ChannelId::new(job.channel);
+    let Some(ticket) = ctx
+        .store()
+        .get::<Ticket>(&ticket_key(channel))
+        .await
+        .map_err(|e| stored(&e))?
+    else {
+        return Ok(());
+    };
+    let config: Config = ctx.parse_config()?;
+    if !config.close_when_opener_leaves {
+        return Ok(());
+    }
+    match ctx.api.execute(Action::GetChannel { channel_id: channel }).await {
+        Ok(Outcome::Channel(_)) => {}
+        Ok(Outcome::None) | Err(DiscordError::NotFound) => {
+            forget(ctx, channel, &ticket).await?;
+            return Ok(());
+        }
+        Ok(_) => return Err(ModuleError::other("the ticket channel was not returned")),
+        Err(error) => return Err(error.into()),
+    }
+    let reason = ctx.t_in(ctx.locale, "tickets-opener-left-reason", &Args::new());
+    if let Closed::BusyUntil(until) = finish(ctx, channel, None, &reason, None).await? {
+        close_left_later(ctx, channel, until).await?;
     }
     Ok(())
 }
@@ -855,6 +990,7 @@ async fn forget(
         give_back(ctx, ticket.opener).await;
     }
     let _ = ctx.scheduler().cancel(&idle_key(channel)).await;
+    let _ = ctx.scheduler().cancel(&left_close_key(channel)).await;
     Ok(())
 }
 
@@ -1638,6 +1774,11 @@ fn schema() -> serde_json::Value {
                 "description": "config-tickets-close_after_days",
                 "x-ui": { "level": "basic" }
             },
+            "close_when_opener_leaves": {
+                "type": "boolean",
+                "description": "config-tickets-close_when_opener_leaves",
+                "x-ui": { "level": "basic" }
+            },
             "panels": {
                 "type": "array",
                 "description": "config-tickets-panels",
@@ -1672,6 +1813,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .capability(closure_sdk::Capability::ReadGuild)
             .capability(closure_sdk::Capability::ManageChannels)
             .capability(closure_sdk::Capability::RespondToInteractions)
+            .intents(Intents::GUILD_MEMBERS)
             .permission(PermissionSpec::new(
                 "tickets.manage",
                 Level::MODERATOR,
@@ -1690,6 +1832,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     "log_channel": null,
                     "max_open": 1,
                     "close_after_days": 0,
+                    "close_when_opener_leaves": false,
                     "panels": []
                 }),
             )
@@ -1715,7 +1858,10 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .component("close-request-approve", approve_close_request)
             .component("close-request-reject", reject_close_request)
             .component("claim", claim)
+            .on(Subscription::new(EventKind::MemberLeft), on_member_left)
             .job(IDLE, idle_job)
+            .job(LEFT_SCAN, left_scan_job)
+            .job(LEFT_CLOSE, left_close_job)
             .catalog(Locale::En, EN)
             .catalog(Locale::Ja, JA),
     )
