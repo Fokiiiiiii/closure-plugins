@@ -17,8 +17,8 @@ use closure_core::action::{
 use closure_core::error::{DiscordError, ModuleError};
 use closure_core::event::{ChannelId, Event, EventKind, RoleId, UserId};
 use closure_core::module::EventContext;
-use closure_core::subscription::Flow;
 use closure_core::storage::{Expect, StorageError};
+use closure_core::subscription::Flow;
 use closure_sdk::ui::{self, CustomId};
 use closure_sdk::{
     Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, Intents, InteractionReply,
@@ -831,11 +831,11 @@ async fn left_scan_job(cx: JobCx) -> Result<(), ModuleError> {
                 queue_left_close(ctx, &prefix, job.opener, job.at).await?;
             }
             if prefix.len() - "ticket:".len() >= CHANNEL_ID_DIGITS {
-                return Err(ModuleError::other("the ticket listing could not be divided further"));
+                return Err(ModuleError::other(
+                    "the ticket listing could not be divided further",
+                ));
             }
-            prefixes.extend(
-                (b'0'..=b'9').map(|digit| format!("{prefix}{}", char::from(digit))),
-            );
+            prefixes.extend((b'0'..=b'9').map(|digit| format!("{prefix}{}", char::from(digit))));
         } else {
             for (key, _) in tickets {
                 queue_left_close(ctx, &key, job.opener, job.at).await?;
@@ -861,7 +861,13 @@ async fn left_close_job(cx: JobCx) -> Result<(), ModuleError> {
     if !config.close_when_opener_leaves {
         return Ok(());
     }
-    match ctx.api.execute(Action::GetChannel { channel_id: channel }).await {
+    match ctx
+        .api
+        .execute(Action::GetChannel {
+            channel_id: channel,
+        })
+        .await
+    {
         Ok(Outcome::Channel(_)) => {}
         Ok(Outcome::None) | Err(DiscordError::NotFound) => {
             forget(ctx, channel, &ticket).await?;

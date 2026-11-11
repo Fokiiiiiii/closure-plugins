@@ -1417,7 +1417,12 @@ async fn a_member_leaving_closes_only_their_ticket_when_enabled() {
 
     assert_eq!(deleted(&harness), [member_channel]);
     assert!(
-        harness.store().get::<Ticket>(&other_key).await.unwrap().is_some(),
+        harness
+            .store()
+            .get::<Ticket>(&other_key)
+            .await
+            .unwrap()
+            .is_some(),
         "another member's ticket stays open"
     );
 }
