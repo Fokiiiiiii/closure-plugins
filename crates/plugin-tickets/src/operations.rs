@@ -326,6 +326,9 @@ async fn stage(
             .map_err(|error| failed(&error))?;
         set_lease(&mut operation, token, ctx.now() + OPERATION_LEASE_SECONDS);
         ticket.pending_operation = Some(operation.clone());
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket)
+            .await
+            .map_err(|error| failed(&error))?;
         match ctx
             .store()
             .replace(
@@ -363,6 +366,7 @@ async fn renew_operation(
             return Err(ModuleError::other("the ticket operation is no longer active"));
         }
         set_lease(operation, token, ctx.now() + OPERATION_LEASE_SECONDS);
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -397,6 +401,10 @@ async fn release_operation(ctx: &EventContext, channel: ChannelId, token: i64) {
             return;
         }
         set_lease(operation, token, ctx.now());
+        if let Err(error) = super::refresh_ticket_form_answer_ttl(ctx, &ticket).await {
+            tracing::warn!(?error, %channel, "could not refresh ticket answer TTL while releasing an operation");
+            return;
+        }
         match ctx
             .store()
             .replace(
@@ -444,6 +452,7 @@ pub(super) async fn resume_pending(
             .await
             .map_err(|error| stored(&error))?;
         set_lease(operation, token, ctx.now() + OPERATION_LEASE_SECONDS);
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -570,6 +579,7 @@ async fn save_panel_baselines(
         }
         *role_baselines = Some(baselines.to_vec());
         *lease_until = ctx.now() + OPERATION_LEASE_SECONDS;
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -615,6 +625,7 @@ async fn save_role_baseline(
         }
         *saved = Some(baseline);
         *lease_until = ctx.now() + OPERATION_LEASE_SECONDS;
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -686,6 +697,7 @@ async fn finish_panel(
         ticket.staff_roles = Some(staff_roles.to_vec());
         ticket.panel_role_baselines = baselines.to_vec();
         ticket.pending_operation = None;
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -741,6 +753,7 @@ async fn commit_role(
             ticket.participant_roles.sort_unstable_by_key(|access| access.role);
         }
         ticket.pending_operation = None;
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -875,6 +888,7 @@ async fn mark_panel_rollback(
         }
         *phase = PanelPhase::Rollback;
         *lease_until = ctx.now() + OPERATION_LEASE_SECONDS;
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -909,6 +923,7 @@ async fn clear_panel_operation(
             return Err(ModuleError::other("the panel operation is no longer active"));
         }
         ticket.pending_operation = None;
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
         match ctx
             .store()
             .replace(
@@ -1311,6 +1326,9 @@ pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), User
         }
         let changed = ticket.waiting_for_reply != args.waiting;
         ticket.waiting_for_reply = args.waiting;
+        super::refresh_ticket_form_answer_ttl(ctx, &ticket)
+            .await
+            .map_err(|error| failed(&error))?;
         match ctx
             .store()
             .replace(
