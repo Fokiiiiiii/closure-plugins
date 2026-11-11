@@ -52,6 +52,7 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         closing: None,
         close_request: None,
         panel: None,
+        form_answers: Vec::new(),
     };
     harness
         .store()
@@ -184,6 +185,13 @@ fn press(route: &str, user: u64) -> Click {
 
 fn panel_press(panel: &str, user: u64) -> Click {
     Click::new(format!("tickets:open:*:{panel}")).user(user)
+}
+
+fn form_submit_id(panel: &str, user: u64, questions: &[String]) -> String {
+    format!(
+        "tickets:form:{user}:{panel}:{:016x}",
+        crate::question_revision(questions)
+    )
 }
 
 fn close_request_command(user: u64, reason: Option<&str>) -> Invocation {
@@ -1688,12 +1696,16 @@ async fn panel_command_button_contains_the_selected_panel_id() {
 #[tokio::test]
 async fn a_named_panel_form_collects_answers_into_the_ticket() {
     let harness = harness();
+    let questions = vec![
+        "What do you need help with, and when?".to_owned(),
+        "When did this start?".to_owned(),
+    ];
     harness.set_config(json!({
         "staff_roles": [STAFF_ROLE.to_string()],
         "panels": [{
             "id": "support",
             "staff_roles": [PANEL_STAFF_ROLE.to_string()],
-            "questions": ["What do you need help with?", "When did this start?"]
+            "questions": questions.clone()
         }]
     }));
 
@@ -1707,7 +1719,7 @@ async fn a_named_panel_form_collects_answers_into_the_ticket() {
 
     harness
         .submit(
-            Submit::new("tickets:form:7:support")
+            Submit::new(form_submit_id("support", MEMBER, &questions))
                 .user(MEMBER)
                 .field("tickets:question-0", "I cannot sign in.")
                 .field("tickets:question-1", "This morning."),
@@ -1715,6 +1727,18 @@ async fn a_named_panel_form_collects_answers_into_the_ticket() {
         .await
         .unwrap();
     assert_eq!(created(&harness).len(), 1);
+
+    let key = harness.store().list("ticket:", 10).await.unwrap()[0]
+        .0
+        .clone();
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(
+        ticket.form_answers,
+        vec![
+            (questions[0].clone(), "I cannot sign in.".to_owned()),
+            (questions[1].clone(), "This morning.".to_owned()),
+        ]
+    );
 
     let ticket_embed = harness
         .actions()
@@ -1728,7 +1752,7 @@ async fn a_named_panel_form_collects_answers_into_the_ticket() {
             _ => None,
         })
         .unwrap();
-    assert!(ticket_embed.contains("What do you need help with?"));
+    assert!(ticket_embed.contains("What do you need help with, and when?"));
     assert!(ticket_embed.contains("I cannot sign in."));
     assert!(ticket_embed.contains("When did this start?"));
     assert!(ticket_embed.contains("This morning."));
@@ -1737,12 +1761,13 @@ async fn a_named_panel_form_collects_answers_into_the_ticket() {
 #[tokio::test]
 async fn a_ticket_form_cannot_be_submitted_by_another_member() {
     let harness = harness();
+    let questions = vec!["What do you need help with?".to_owned()];
     harness.set_config(json!({
         "staff_roles": [STAFF_ROLE.to_string()],
         "panels": [{
             "id": "support",
             "staff_roles": [PANEL_STAFF_ROLE.to_string()],
-            "questions": ["What do you need help with?"]
+            "questions": questions.clone()
         }]
     }));
 
@@ -1750,7 +1775,7 @@ async fn a_ticket_form_cannot_be_submitted_by_another_member() {
     assert_eq!(shown[0].kind, ReplyKind::Modal);
     harness
         .submit(
-            Submit::new("tickets:form:7:support")
+            Submit::new(form_submit_id("support", MEMBER, &questions))
                 .user(OTHER)
                 .field("tickets:question-0", "Not the opener."),
         )
@@ -1768,12 +1793,173 @@ fn panel_questions_fit_discord_modal_limits() {
     ] {
         assert_eq!(questions["maxItems"], json!(5));
         assert_eq!(questions["items"]["maxLength"], json!(crate::MAX_FORM_QUESTION_CHARS));
+        assert_eq!(questions["x-ui"]["widget"], json!("text-list"));
     }
     assert!(crate::valid_questions(&["Need help?".to_owned()]));
     let too_many_questions = ["Question"; 6].map(str::to_owned);
     assert!(!crate::valid_questions(&too_many_questions));
     assert!(!crate::valid_questions(&[" ".to_owned()]));
     assert!(!crate::valid_questions(&["Q".repeat(46)]));
+}
+
+#[test]
+fn saved_form_answers_are_counted_toward_the_ticket_storage_limit() {
+    let ticket = Ticket {
+        number: 1,
+        opener: MEMBER,
+        claimed_by: None,
+        created: 0,
+        closing: None,
+        close_request: None,
+        panel: None,
+        form_answers: vec![("Question".to_owned(), "x".repeat(crate::MAX_TICKET_BYTES))],
+    };
+    assert!(crate::ticket_storage_size(&ticket).unwrap() > crate::MAX_TICKET_BYTES);
+}
+
+
+#[test]
+fn old_ticket_records_load_without_form_answers() {
+    let ticket: Ticket = serde_json::from_value(json!({
+        "number": 1,
+        "opener": MEMBER,
+        "claimed_by": null,
+        "created": 0,
+        "closing": null,
+        "close_request": null,
+        "panel": null
+    }))
+    .unwrap();
+    assert!(ticket.form_answers.is_empty());
+}
+
+#[tokio::test]
+async fn a_changed_question_config_requires_a_new_form() {
+    let harness = harness();
+    let old_questions = vec!["What do you need help with?".to_owned()];
+    let new_questions = vec!["What changed?".to_owned()];
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "questions": old_questions.clone()
+    }));
+
+    let shown = harness.click(panel_press("", MEMBER)).await.unwrap();
+    assert_eq!(shown[0].kind, ReplyKind::Modal);
+    let custom_id = form_submit_id("", MEMBER, &old_questions);
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "questions": new_questions
+    }));
+    let replies = harness
+        .submit(
+            Submit::new(custom_id)
+                .user(MEMBER)
+                .field("tickets:question-0", "My answer."),
+        )
+        .await
+        .unwrap();
+
+    assert!(replies.last().unwrap().ephemeral);
+    assert!(created(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn saved_form_answers_can_be_resent_from_the_ticket() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.form_answers = vec![("What happened?".to_owned(), "I cannot sign in.".to_owned())];
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    let replies = harness
+        .invoke(Invocation::new("ticket").subcommand("answers").user(MEMBER))
+        .await
+        .unwrap();
+    assert!(replies.last().unwrap().ephemeral);
+    let posted = harness
+        .actions()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::SendMessage {
+                channel_id,
+                embeds,
+                content: None,
+                ..
+            } if channel_id.get() == HERE && !embeds.is_empty() => {
+                Some(serde_json::to_string(&embeds).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(posted.contains("What happened?"));
+    assert!(posted.contains("I cannot sign in."));
+}
+
+#[tokio::test]
+async fn another_member_cannot_resend_ticket_form_answers() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.form_answers = vec![("Question".to_owned(), "Private answer.".to_owned())];
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    let replies = harness
+        .invoke(Invocation::new("ticket").subcommand("answers").user(OTHER))
+        .await
+        .unwrap();
+    assert!(replies.last().unwrap().ephemeral);
+    assert!(
+        harness.actions().into_iter().all(|action| !matches!(
+            action,
+            Action::SendMessage { embeds, .. } if !embeds.is_empty()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn answers_are_saved_and_reposted_when_the_ticket_welcome_fails() {
+    let harness = harness();
+    let questions = vec!["What happened?".to_owned()];
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "questions": questions.clone()
+    }));
+
+    harness.click(panel_press("", MEMBER)).await.unwrap();
+    harness
+        .api()
+        .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
+    harness
+        .submit(
+            Submit::new(form_submit_id("", MEMBER, &questions))
+                .user(MEMBER)
+                .field("tickets:question-0", "I cannot sign in."),
+        )
+        .await
+        .unwrap();
+
+    let entries = harness.store().list("ticket:", 10).await.unwrap();
+    let ticket: Ticket = harness.store().get(&entries[0].0).await.unwrap().unwrap();
+    assert_eq!(
+        ticket.form_answers,
+        vec![("What happened?".to_owned(), "I cannot sign in.".to_owned())]
+    );
+    let fallback = harness
+        .actions()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::SendMessage {
+                embeds,
+                content: None,
+                ..
+            } if !embeds.is_empty() => Some(serde_json::to_string(&embeds).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(fallback.contains("What happened?"));
+    assert!(fallback.contains("I cannot sign in."));
 }
 
 #[tokio::test]

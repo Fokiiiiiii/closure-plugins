@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use closure_core::action::MessageCursor;
@@ -27,7 +28,7 @@ use closure_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use twilight_model::channel::ChannelType;
-use twilight_model::channel::message::Component;
+use twilight_model::channel::message::{Component, Embed};
 use twilight_model::channel::message::component::ButtonStyle;
 use twilight_model::guild::Permissions;
 
@@ -43,6 +44,7 @@ const FORM: &str = "form";
 const MAX_FORM_QUESTIONS: usize = 5;
 const MAX_FORM_QUESTION_CHARS: usize = 45;
 const MAX_FORM_ANSWER_CHARS: u16 = 1024;
+const MAX_TICKET_BYTES: usize = 32 * 1024;
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
@@ -163,6 +165,8 @@ struct Ticket {
     close_request: Option<CloseRequest>,
     #[serde(default)]
     panel: Option<NamedPanel>,
+    #[serde(default)]
+    form_answers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,7 +477,10 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
     cx.show_modal(ui::modal(
         CustomId::new(FORM)
             .only_for(cx.user().id)
-            .data(panel_id)
+            .data(format!(
+                "{panel_id}:{:016x}",
+                question_revision(&config.questions)
+            ))
             .encode(cx.module()),
         cx.t("tickets-form-title", &Args::new()),
         inputs,
@@ -495,8 +502,17 @@ fn ticket_setup_error(config: &Config, guild_id: u64) -> Option<&'static str> {
 fn valid_questions(questions: &[String]) -> bool {
     questions.len() <= MAX_FORM_QUESTIONS
         && questions.iter().all(|question| {
-            !question.trim().is_empty() && question.chars().count() <= MAX_FORM_QUESTION_CHARS
+            !question.trim().is_empty()
+                && !question.chars().any(char::is_control)
+                && question.chars().count() <= MAX_FORM_QUESTION_CHARS
         })
+}
+
+// shortcut: 64-bit question fingerprint, use a stored snapshot if collision risk grows.
+fn question_revision(questions: &[String]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    questions.hash(&mut hasher);
+    hasher.finish()
 }
 
 async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
@@ -507,17 +523,28 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
     if &module != cx.module() || form.route != FORM || form.owner != Some(cx.user().id) {
         return Err(UserError::message("tickets-form-invalid"));
     }
+    let Some((panel_id, revision)) = form.data.split_once(':') else {
+        return Err(UserError::message("tickets-form-invalid"));
+    };
+    let Ok(revision) = u64::from_str_radix(revision, 16) else {
+        return Err(UserError::message("tickets-form-invalid"));
+    };
     let original: Config = cx.config()?;
-    let panel = if form.data.is_empty() {
+    let panel = if panel_id.is_empty() {
         None
     } else {
-        Some(original.named(&form.data)?.clone())
+        Some(original.named(panel_id)?.clone())
     };
     let config = panel
         .as_ref()
         .map_or_else(|| original.clone(), |panel| original.with_panel(panel));
-    if config.questions.is_empty() || !valid_questions(&config.questions) {
+    if !valid_questions(&config.questions) {
         return Err(UserError::message("tickets-form-invalid"));
+    }
+    if config.questions.is_empty() || revision != question_revision(&config.questions) {
+        return cx
+            .reply_private_t("tickets-form-changed", &Args::new())
+            .await;
     }
     let answers = config
         .questions
@@ -530,6 +557,46 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
         })
         .collect::<Result<Vec<_>, UserError>>()?;
     create_ticket(cx, config, panel, answers).await
+}
+
+fn form_answers_embed<I: InteractionRef + 'static>(
+    cx: &Cx<I>,
+    answers: &[(String, String)],
+) -> Result<Option<Embed>, UserError> {
+    if answers.is_empty() {
+        return Ok(None);
+    }
+    let embed = answers.iter().fold(
+        EmbedBuilder::new().title(cx.t("tickets-form-answers-title", &Args::new())),
+        |embed, (question, answer)| embed.field(question.clone(), answer.clone(), false),
+    );
+    Ok(Some(
+        embed
+            .build()
+            .map_err(|_| UserError::message("tickets-form-invalid"))?,
+    ))
+}
+
+async fn send_form_answers(
+    ctx: &EventContext,
+    channel: ChannelId,
+    embed: Embed,
+) -> Result<(), UserError> {
+    ctx.api
+        .execute(Action::SendMessage {
+            channel_id: channel,
+            content: None,
+            embeds: vec![embed],
+            reply_to: None,
+            mentions: MentionPolicy::None,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| failed(&error))
+}
+
+fn ticket_storage_size(ticket: &Ticket) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec(ticket).map(|encoded| encoded.len())
 }
 
 #[allow(
@@ -555,17 +622,8 @@ async fn create_ticket<I: InteractionRef + 'static>(
     {
         return Err(UserError::message("tickets-form-invalid"));
     }
-    let embeds = if answers.is_empty() {
-        Vec::new()
-    } else {
-        let embed = answers.into_iter().fold(
-            EmbedBuilder::new().title(cx.t("tickets-form-answers-title", &Args::new())),
-            |embed, (question, answer)| embed.field(question, answer, false),
-        );
-        vec![embed
-            .build()
-            .map_err(|_| UserError::message("tickets-form-invalid"))?]
-    };
+    let form_embed = form_answers_embed(&cx, &answers)?;
+    let embeds: Vec<Embed> = form_embed.iter().cloned().collect();
     let ctx = cx.ctx();
     if let Some(key) = ticket_setup_error(&config, ctx.guild_id.get()) {
         return say(&cx, key, &Args::new()).await;
@@ -597,6 +655,27 @@ async fn create_ticket<I: InteractionRef + 'static>(
         .score_add(NUMBER, 0_u64, 1)
         .await
         .map_err(|e| failed(&e))?;
+    let ticket = Ticket {
+        number,
+        opener: user.get(),
+        claimed_by: None,
+        created: cx.now(),
+        closing: None,
+        close_request: None,
+        panel,
+        form_answers: answers.clone(),
+    };
+    let ticket_size = match ticket_storage_size(&ticket) {
+        Ok(encoded) => encoded.len(),
+        Err(error) => {
+            give_back(ctx, user.get()).await;
+            return Err(failed(&error));
+        }
+    };
+    if ticket_size > MAX_TICKET_BYTES {
+        give_back(ctx, user.get()).await;
+        return Err(UserError::message("tickets-form-too-large"));
+    }
     let everyone = RoleId::new(ctx.guild_id.get());
     let mut overwrites = vec![
         overwrite(
@@ -650,15 +729,6 @@ async fn create_ticket<I: InteractionRef + 'static>(
             };
         }
     };
-    let ticket = Ticket {
-        number,
-        opener: user.get(),
-        claimed_by: None,
-        created: cx.now(),
-        closing: None,
-        close_request: None,
-        panel,
-    };
     ctx.store()
         .set_for(
             &ticket_key(channel),
@@ -689,8 +759,15 @@ async fn create_ticket<I: InteractionRef + 'static>(
             files: Vec::new(),
         })
         .await;
+    let mut answers_need_retry = false;
     if let Err(error) = welcome {
         tracing::warn!(?error, guild = %ctx.guild_id, "could not greet in a new ticket");
+        if let Some(embed) = form_embed
+            && let Err(error) = send_form_answers(ctx, channel, embed).await
+        {
+            tracing::warn!(?error, guild = %ctx.guild_id, "could not post saved ticket answers");
+            answers_need_retry = true;
+        }
     }
     let _ = ctx
         .api
@@ -716,12 +793,21 @@ async fn create_ticket<I: InteractionRef + 'static>(
         )
         .await;
     }
-    say(
-        &cx,
-        "tickets-opened",
-        &Args::new().with("channel", format!("<#{channel}>")),
-    )
-    .await
+    if answers_need_retry {
+        say(
+            &cx,
+            "tickets-form-retry",
+            &Args::new().with("channel", format!("<#{channel}>")),
+        )
+        .await
+    } else {
+        say(
+            &cx,
+            "tickets-opened",
+            &Args::new().with("channel", format!("<#{channel}>")),
+        )
+        .await
+    }
 }
 
 /// A ticket made under anything but a category would fail at Discord, so a setting that is
@@ -1286,6 +1372,30 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
         .map_err(|e| failed(&e))
 }
 
+async fn ticket_answers(cx: CommandCx, _: ()) -> Result<(), UserError> {
+    let channel = cx.invocation().channel_id;
+    let Some(ticket) = cx
+        .store()
+        .get::<Ticket>(&ticket_key(channel))
+        .await
+        .map_err(|error| failed(&error))?
+    else {
+        return Err(UserError::message("tickets-not-a-ticket"));
+    };
+    let config: Config = cx.config()?;
+    let config = config.for_ticket(&ticket);
+    if cx.user().id.get() != ticket.opener && !is_staff(&cx, &config).await {
+        return Err(UserError::message("tickets-form-opener-only"));
+    }
+    let Some(embed) = form_answers_embed(&cx, &ticket.form_answers)? else {
+        return cx
+            .reply_private_t("tickets-form-no-answers", &Args::new())
+            .await;
+    };
+    send_form_answers(cx.ctx(), channel, embed).await?;
+    cx.reply_private_t("tickets-form-resent", &Args::new()).await
+}
+
 async fn resend_close_request(
     cx: &CommandCx,
     channel: ChannelId,
@@ -1762,7 +1872,7 @@ fn schema() -> serde_json::Value {
                 "maxItems": MAX_FORM_QUESTIONS,
                 "items": { "type": "string", "minLength": 1, "maxLength": MAX_FORM_QUESTION_CHARS, "description": "config-tickets-question" },
                 "description": "config-tickets-questions",
-                "x-ui": { "level": "basic" }
+                "x-ui": { "level": "basic", "widget": "text-list" }
             },
             "panels": {
                 "type": "array",
@@ -1778,7 +1888,7 @@ fn schema() -> serde_json::Value {
                         "staff_roles": { "type": "array", "maxItems": 20, "items": { "type": "string", "pattern": "^[0-9]{1,20}$" }, "description": "config-tickets-panel-staff" },
                         "log_channel": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-log_channel", "x-ui": { "widget": "channel" } },
                         "close_after_days": { "type": "integer", "minimum": 0, "maximum": 365, "description": "config-tickets-close_after_days" },
-                        "questions": { "type": "array", "maxItems": MAX_FORM_QUESTIONS, "items": { "type": "string", "minLength": 1, "maxLength": MAX_FORM_QUESTION_CHARS, "description": "config-tickets-question" }, "description": "config-tickets-questions", "x-ui": { "level": "basic" } }
+                        "questions": { "type": "array", "maxItems": MAX_FORM_QUESTIONS, "items": { "type": "string", "minLength": 1, "maxLength": MAX_FORM_QUESTION_CHARS, "description": "config-tickets-question" }, "description": "config-tickets-questions", "x-ui": { "level": "basic", "widget": "text-list" } }
                     }
                 }
             }
@@ -1830,6 +1940,9 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<Close>::new("close")
                         .requires("tickets.use")
                         .handler(close_command),
+                    Command::<()>::new("answers")
+                        .requires("tickets.use")
+                        .handler(ticket_answers),
                     Command::<CloseRequestArgs>::new("close-request").handler(close_request),
                     Command::<Member>::new("add").handler(add),
                     Command::<Member>::new("remove").handler(remove),
