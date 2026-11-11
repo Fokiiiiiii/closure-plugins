@@ -290,6 +290,43 @@ async fn is_staff_command(cx: &CommandCx, config: &Config) -> bool {
         || cx.require("tickets.manage").await.is_ok()
 }
 
+async fn is_guild_owner_or_admin(
+    ctx: &EventContext,
+    user: UserId,
+    member_roles: &[RoleId],
+) -> Result<bool, UserError> {
+    let guild = match ctx
+        .api
+        .execute(Action::GetGuild {
+            guild_id: ctx.guild_id,
+        })
+        .await
+    {
+        Ok(Outcome::Guild(guild)) => guild,
+        Ok(_) => return Err(UserError::message("tickets-failed")),
+        Err(error) => return Err(failed(&error)),
+    };
+    if guild.owner_id == user {
+        return Ok(true);
+    }
+    let roles = match ctx
+        .api
+        .execute(Action::ListRoles {
+            guild_id: ctx.guild_id,
+        })
+        .await
+    {
+        Ok(Outcome::Roles(roles)) => roles,
+        Ok(_) => return Err(UserError::message("tickets-failed")),
+        Err(error) => return Err(failed(&error)),
+    };
+    let everyone = RoleId::new(ctx.guild_id.get());
+    Ok(roles.iter().any(|role| {
+        (role.id == everyone || member_roles.contains(&role.id))
+            && role.permissions.contains(Permissions::ADMINISTRATOR)
+    }))
+}
+
 fn overwrite(target: OverwriteTarget, allow: Permissions, deny: Permissions) -> OverwriteSpec {
     OverwriteSpec {
         target,
@@ -1294,7 +1331,9 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
             }
             Err(error) => return Err(failed(&error)),
         };
-        if !member.roles.iter().any(|role| staff.contains(role)) {
+        if !member.roles.iter().any(|role| staff.contains(role))
+            && !is_guild_owner_or_admin(ctx, user, &member.roles).await?
+        {
             return Err(UserError::message("tickets-transfer-not-staff"));
         }
     }
@@ -1411,7 +1450,28 @@ async fn unclaim(cx: CommandCx, _: Unclaim) -> Result<(), UserError> {
 }
 
 async fn transfer(cx: CommandCx, args: Member) -> Result<(), UserError> {
-    set_claim(cx, Some(args.user)).await
+    cx.defer(true).await?;
+    match set_claim(cx.clone(), Some(args.user)).await {
+        Err(UserError::Module(error)) => {
+            tracing::warn!(
+                ?error,
+                channel = %cx.invocation().channel_id,
+                user = %args.user,
+                "could not transfer a ticket"
+            );
+            match error {
+                closure_core::error::ModuleError::Config(_) => {
+                    cx.reply_private(
+                        cx.ctx()
+                            .t_core(cx.locale(), "error-not-set-up", &Args::new()),
+                    )
+                    .await
+                }
+                _ => cx.reply_private_t("tickets-failed", &Args::new()).await,
+            }
+        }
+        result => result,
+    }
 }
 
 async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {

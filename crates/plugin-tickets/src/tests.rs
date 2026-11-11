@@ -16,6 +16,9 @@ const MODERATOR: u64 = 200;
 const LOG: u64 = 6;
 const MEMBER: u64 = 7;
 const OTHER: u64 = 8;
+const ADMIN_ROLE: u64 = 31;
+const ORDINARY_ROLE: u64 = 32;
+const GUILD_OWNER: u64 = 999_999_999;
 const HERE: u64 = 5;
 
 fn harness() -> Harness {
@@ -72,6 +75,29 @@ fn member(id: u64, roles: &[u64]) -> twilight_model::guild::Member {
             "discriminator": "0",
             "avatar": null,
             "bot": false
+        }
+    }))
+    .unwrap()
+}
+
+fn guild_role(id: u64, permissions: Permissions) -> twilight_model::guild::Role {
+    serde_json::from_value(json!({
+        "id": id.to_string(),
+        "name": format!("role-{id}"),
+        "color": 0,
+        "hoist": false,
+        "managed": false,
+        "mentionable": false,
+        "permissions": permissions.bits().to_string(),
+        "position": 1,
+        "flags": 0,
+        "icon": null,
+        "unicode_emoji": null,
+        "tags": null,
+        "colors": {
+            "primary_color": 0,
+            "secondary_color": null,
+            "tertiary_color": null
         }
     }))
     .unwrap()
@@ -155,6 +181,14 @@ fn close_request_command(user: u64, reason: Option<&str>) -> Invocation {
 
 fn request_click(route: &str, request_id: i64, user: u64) -> Click {
     Click::new(format!("tickets:{route}:*:{HERE}:{request_id}")).user(user)
+}
+
+fn transfer_invocation(target: u64, actor: u64) -> Invocation {
+    Invocation::new("ticket")
+        .subcommand("transfer")
+        .option("user", CommandOptionValue::User(Id::new(target)))
+        .roles([STAFF_ROLE])
+        .user(actor)
 }
 
 fn rename_invocation(name: &str, staff: bool) -> Invocation {
@@ -448,19 +482,14 @@ async fn a_transfer_is_rejected_when_the_target_is_not_ticket_staff() {
     let harness = harness();
     seed_ticket(&harness, HERE, MEMBER).await;
     assign_ticket(&harness, HERE, OTHER).await;
+    harness.api().set_guild_name(Id::new(1), "support");
     harness.api().set_member(Id::new(1), member(MEMBER, &[]));
-    let transfer = Invocation::new("ticket")
-        .subcommand("transfer")
-        .option("user", CommandOptionValue::User(Id::new(MEMBER)))
-        .roles([STAFF_ROLE])
-        .user(MODERATOR);
-    let refused = harness.invoke(transfer).await.unwrap();
+    let refused = harness
+        .invoke(transfer_invocation(MEMBER, MODERATOR))
+        .await
+        .unwrap();
     assert!(
-        refused
-            .last()
-            .unwrap()
-            .content
-            .contains("not in a configured ticket staff role"),
+        refused.last().unwrap().content.contains("not ticket staff"),
         "{refused:?}"
     );
     let ticket: Ticket = harness
@@ -471,6 +500,262 @@ async fn a_transfer_is_rejected_when_the_target_is_not_ticket_staff() {
         .unwrap();
     assert_eq!(ticket.claimed_by, Some(OTHER));
     assert!(ticket_messages(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn a_guild_owner_can_receive_a_ticket_transfer() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    let guild = Id::new(1);
+    harness.api().set_guild_name(guild, "support");
+    harness.api().set_member(guild, member(GUILD_OWNER, &[]));
+    let replies = harness
+        .invoke(transfer_invocation(GUILD_OWNER, OTHER))
+        .await
+        .unwrap();
+    assert!(
+        replies
+            .last()
+            .unwrap()
+            .content
+            .contains(&format!("<@{GUILD_OWNER}>")),
+        "{replies:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(GUILD_OWNER));
+}
+
+#[tokio::test]
+async fn a_discord_administrator_can_receive_a_ticket_transfer() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    let guild = Id::new(1);
+    harness.api().set_guild_name(guild, "support");
+    harness
+        .api()
+        .set_member(guild, member(MEMBER, &[ADMIN_ROLE]));
+    harness.api().set_roles(
+        guild,
+        vec![guild_role(ADMIN_ROLE, Permissions::ADMINISTRATOR)],
+    );
+    let replies = harness
+        .invoke(transfer_invocation(MEMBER, OTHER))
+        .await
+        .unwrap();
+    assert!(
+        replies
+            .last()
+            .unwrap()
+            .content
+            .contains(&format!("<@{MEMBER}>")),
+        "{replies:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(MEMBER));
+}
+
+#[tokio::test]
+async fn administrator_permission_on_everyone_allows_a_ticket_transfer() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    let guild = Id::new(1);
+    harness.api().set_guild_name(guild, "support");
+    harness.api().set_member(guild, member(MEMBER, &[]));
+    harness.api().set_roles(
+        guild,
+        vec![guild_role(guild.get(), Permissions::ADMINISTRATOR)],
+    );
+    let replies = harness
+        .invoke(transfer_invocation(MEMBER, OTHER))
+        .await
+        .unwrap();
+    assert!(
+        replies
+            .last()
+            .unwrap()
+            .content
+            .contains(&format!("<@{MEMBER}>")),
+        "{replies:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(MEMBER));
+}
+
+#[tokio::test]
+async fn a_tickets_manage_holder_without_discord_staff_rights_cannot_receive_a_ticket() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    let guild = Id::new(1);
+    harness.api().set_guild_name(guild, "support");
+    harness
+        .api()
+        .set_member(guild, member(MODERATOR, &[MODERATOR]));
+    harness
+        .api()
+        .set_roles(guild, vec![guild_role(MODERATOR, Permissions::empty())]);
+    let replies = harness
+        .invoke(transfer_invocation(MODERATOR, OTHER))
+        .await
+        .unwrap();
+    assert!(
+        replies.last().unwrap().content.contains("not ticket staff"),
+        "{replies:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(OTHER));
+}
+
+#[tokio::test]
+async fn a_nonmember_cannot_receive_a_ticket_transfer() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    harness.api().set_not_a_member(Id::new(1), Id::new(MEMBER));
+    let replies = harness
+        .invoke(transfer_invocation(MEMBER, OTHER))
+        .await
+        .unwrap();
+    assert!(
+        replies.last().unwrap().content.contains("not ticket staff"),
+        "{replies:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(OTHER));
+}
+
+#[tokio::test]
+async fn transfer_does_not_change_a_ticket_when_staff_authority_cannot_be_verified() {
+    for call in 1..=4 {
+        let harness = harness();
+        seed_ticket(&harness, HERE, MEMBER).await;
+        assign_ticket(&harness, HERE, OTHER).await;
+        let guild = Id::new(1);
+        harness.api().set_guild_name(guild, "support");
+        harness
+            .api()
+            .set_member(guild, member(MEMBER, &[ORDINARY_ROLE]));
+        harness
+            .api()
+            .set_roles(guild, vec![guild_role(ORDINARY_ROLE, Permissions::empty())]);
+        harness.api().fail_nth(
+            call,
+            closure_core::error::DiscordError::Fatal("down".into()),
+        );
+        let result = harness.invoke(transfer_invocation(MEMBER, OTHER)).await;
+        if call == 1 {
+            assert!(result.is_err(), "defer call {call}");
+        } else {
+            let replies = result.unwrap();
+            assert!(
+                replies.last().unwrap().ephemeral,
+                "call {call}: {replies:?}"
+            );
+            assert!(
+                replies.last().unwrap().content.contains("did not work"),
+                "call {call}: {replies:?}"
+            );
+        }
+        let ticket: Ticket = harness
+            .store()
+            .get(&format!("ticket:{HERE}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ticket.claimed_by, Some(OTHER));
+        assert!(ticket_messages(&harness).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_transfer_with_invalid_configuration_reports_that_it_is_not_set_up() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    harness.set_config(json!({"staff_roles": "not-a-role-list"}));
+
+    let replies = harness
+        .invoke(transfer_invocation(MEMBER, OTHER))
+        .await
+        .unwrap();
+    assert!(replies.last().unwrap().ephemeral, "{replies:?}");
+    assert!(
+        replies
+            .last()
+            .unwrap()
+            .content
+            .contains("not set up correctly"),
+        "{replies:?}"
+    );
+
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(OTHER));
+    assert!(ticket_messages(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn a_staff_role_target_does_not_need_extra_authority_lookups() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assign_ticket(&harness, HERE, OTHER).await;
+    harness
+        .api()
+        .set_member(Id::new(1), member(MEMBER, &[STAFF_ROLE]));
+    harness
+        .api()
+        .fail_nth(3, closure_core::error::DiscordError::Fatal("down".into()));
+    let replies = harness
+        .invoke(transfer_invocation(MEMBER, OTHER))
+        .await
+        .unwrap();
+    assert!(
+        replies
+            .last()
+            .unwrap()
+            .content
+            .contains(&format!("<@{MEMBER}>")),
+        "{replies:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(MEMBER));
 }
 
 #[tokio::test]
