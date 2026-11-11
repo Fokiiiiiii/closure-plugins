@@ -20,6 +20,9 @@ const ADMIN_ROLE: u64 = 31;
 const ORDINARY_ROLE: u64 = 32;
 const GUILD_OWNER: u64 = 999_999_999;
 const HERE: u64 = 5;
+const PANEL_STAFF_ROLE: u64 = 33;
+const OTHER_PANEL_STAFF_ROLE: u64 = 34;
+const PANEL_LOG: u64 = 9;
 
 fn harness() -> Harness {
     let harness = Harness::new(builder().unwrap()).unwrap();
@@ -48,6 +51,7 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         created: 0,
         closing: None,
         close_request: None,
+        panel: None,
     };
     harness
         .store()
@@ -122,6 +126,12 @@ fn created(harness: &Harness) -> Vec<(String, Vec<Rights>)> {
         .collect()
 }
 
+fn role_can_see(rights: &[Rights], role: u64) -> bool {
+    rights.iter().any(|(target, allow, _)| {
+        *target == OverwriteTarget::Role(Id::new(role)) && allow.contains(Permissions::VIEW_CHANNEL)
+    })
+}
+
 fn deleted(harness: &Harness) -> Vec<u64> {
     harness
         .actions()
@@ -134,13 +144,17 @@ fn deleted(harness: &Harness) -> Vec<u64> {
 }
 
 fn transcripts(harness: &Harness) -> Vec<(String, String)> {
+    transcripts_at(harness, LOG)
+}
+
+fn transcripts_at(harness: &Harness, log: u64) -> Vec<(String, String)> {
     harness
         .actions()
         .into_iter()
         .filter_map(|action| match action {
             Action::PostMessage {
                 channel_id, files, ..
-            } if channel_id.get() == LOG && !files.is_empty() => Some((
+            } if channel_id.get() == log && !files.is_empty() => Some((
                 files[0].filename.clone(),
                 String::from_utf8_lossy(&files[0].data).into_owned(),
             )),
@@ -166,6 +180,10 @@ fn ticket_messages(harness: &Harness) -> Vec<String> {
 
 fn press(route: &str, user: u64) -> Click {
     Click::new(format!("tickets:{route}:*")).user(user)
+}
+
+fn panel_press(panel: &str, user: u64) -> Click {
+    Click::new(format!("tickets:open:*:{panel}")).user(user)
 }
 
 fn close_request_command(user: u64, reason: Option<&str>) -> Invocation {
@@ -205,6 +223,15 @@ fn rename_invocation(name: &str, staff: bool) -> Invocation {
 #[tokio::test]
 async fn a_press_opens_a_private_channel_for_the_member_and_the_staff_and_only_one() {
     let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "max_open": 1,
+        "panels": [{
+            "id": "billing",
+            "staff_roles": [PANEL_STAFF_ROLE.to_string()]
+        }]
+    }));
     let replies = harness.click(press("open", MEMBER)).await.unwrap();
     assert!(
         replies.last().unwrap().content.contains("<#"),
@@ -226,6 +253,10 @@ async fn a_press_opens_a_private_channel_for_the_member_and_the_staff_and_only_o
     };
     assert!(sees(OverwriteTarget::Member(Id::new(MEMBER))));
     assert!(sees(OverwriteTarget::Role(Id::new(STAFF_ROLE))));
+    assert!(!sees(OverwriteTarget::Role(Id::new(PANEL_STAFF_ROLE))));
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    let ticket: Ticket = harness.store().get(&tickets[0].0).await.unwrap().unwrap();
+    assert!(ticket.panel.is_none());
     let again = harness.click(press("open", MEMBER)).await.unwrap();
     assert!(
         again.last().unwrap().content.contains("open already"),
@@ -1263,6 +1294,7 @@ async fn a_close_request_can_be_added_to_a_legacy_ticket() {
         .await
         .unwrap()
         .unwrap();
+    assert!(ticket.panel.is_none());
     assert_eq!(ticket.close_request.unwrap().id, 1);
 }
 
@@ -1343,4 +1375,189 @@ async fn an_idle_close_that_meets_a_close_under_way_is_tried_again_after_it() {
     harness.advance(Duration::from_secs(295));
     harness.run_due_jobs().await;
     assert_eq!(deleted(&harness), [channel]);
+}
+
+#[tokio::test]
+async fn a_named_panel_snapshot_keeps_its_staff_access_after_config_removal() {
+    let harness = harness();
+    let guild: GuildId = Id::new(1);
+    harness.api().add_channel(Id::new(PANEL_LOG), Some(guild));
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "panels": [
+            {
+                "id": "billing",
+                "staff_roles": [PANEL_STAFF_ROLE.to_string()],
+                "log_channel": PANEL_LOG.to_string(),
+                "close_after_days": 2
+            },
+            {
+                "id": "support",
+                "staff_roles": [OTHER_PANEL_STAFF_ROLE.to_string()]
+            }
+        ]
+    }));
+
+    harness.click(panel_press("billing", MEMBER)).await.unwrap();
+    let made = created(&harness);
+    assert_eq!(made.len(), 1);
+    assert!(role_can_see(&made[0].1, PANEL_STAFF_ROLE));
+    assert!(!role_can_see(&made[0].1, STAFF_ROLE));
+
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    let ticket: Ticket = harness.store().get(&tickets[0].0).await.unwrap().unwrap();
+    let snapshot = ticket.panel.as_ref().unwrap();
+    assert_eq!(snapshot.id, "billing");
+    assert_eq!(snapshot.staff_roles, [PANEL_STAFF_ROLE.to_string()]);
+    assert_eq!(
+        snapshot.log_channel.as_deref(),
+        Some(PANEL_LOG.to_string().as_str())
+    );
+    assert_eq!(snapshot.close_after_days, 2);
+
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "panels": []
+    }));
+    // shortcut: Click targets HERE only, use channel-aware clicks if the harness adds them.
+    harness
+        .store()
+        .set(&format!("ticket:{HERE}"), &ticket)
+        .await
+        .unwrap();
+    let other_panel_staff = harness
+        .click(press("claim", OTHER).roles([OTHER_PANEL_STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(
+        other_panel_staff
+            .last()
+            .unwrap()
+            .content
+            .contains("Only the staff"),
+        "{other_panel_staff:?}"
+    );
+    harness
+        .click(press("claim", OTHER).roles([PANEL_STAFF_ROLE]))
+        .await
+        .unwrap();
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.claimed_by, Some(OTHER));
+    harness
+        .click(press("close", OTHER).roles([PANEL_STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert_eq!(deleted(&harness), [HERE]);
+    assert_eq!(transcripts_at(&harness, PANEL_LOG).len(), 1);
+    assert!(transcripts(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn invalid_panel_references_and_everyone_staff_are_rejected_without_creating_channels() {
+    let cases = [
+        ("missing", json!([]), "This panel was not found."),
+        (
+            "duplicate",
+            json!([
+                {"id": "duplicate", "staff_roles": [PANEL_STAFF_ROLE.to_string()]},
+                {"id": "duplicate", "staff_roles": [OTHER_PANEL_STAFF_ROLE.to_string()]}
+            ]),
+            "This panel ID is used more than once.",
+        ),
+        (
+            "everyone",
+            json!([{"id": "everyone", "staff_roles": ["1"]}]),
+            "The @everyone role cannot be used as a staff role.",
+        ),
+    ];
+    for (panel_id, panels, expected) in cases {
+        let harness = harness();
+        harness.set_config(json!({
+            "staff_roles": [STAFF_ROLE.to_string()],
+            "panels": panels
+        }));
+        let replies = harness.click(panel_press(panel_id, MEMBER)).await.unwrap();
+        assert!(
+            replies.last().unwrap().content.contains(expected),
+            "{replies:?}"
+        );
+        assert!(created(&harness).is_empty(), "{panel_id}");
+    }
+}
+
+#[tokio::test]
+async fn panel_command_button_contains_the_selected_panel_id() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "panels": [{
+            "id": "billing",
+            "staff_roles": [PANEL_STAFF_ROLE.to_string()]
+        }]
+    }));
+    harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("panel")
+                .option("panel", CommandOptionValue::String("billing".to_owned()))
+                .roles([MODERATOR])
+                .user(MODERATOR),
+        )
+        .await
+        .unwrap();
+    let post = harness
+        .actions()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::PostMessage { components, .. } => {
+                Some(serde_json::to_string(&components).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(post.contains("tickets:open:*:billing"), "{post}");
+}
+
+#[tokio::test]
+async fn idle_close_uses_panel_settings_after_config_removal() {
+    let harness = harness();
+    let guild: GuildId = Id::new(1);
+    harness.api().add_channel(Id::new(PANEL_LOG), Some(guild));
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "close_after_days": 0,
+        "panels": [{
+            "id": "billing",
+            "staff_roles": [PANEL_STAFF_ROLE.to_string()],
+            "log_channel": PANEL_LOG.to_string(),
+            "close_after_days": 2
+        }]
+    }));
+    harness.click(panel_press("billing", MEMBER)).await.unwrap();
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    let channel: u64 = tickets[0].0.trim_start_matches("ticket:").parse().unwrap();
+    let ticket: Ticket = harness.store().get(&tickets[0].0).await.unwrap().unwrap();
+    assert_eq!(ticket.panel.as_ref().unwrap().close_after_days, 2);
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "close_after_days": 0,
+        "panels": []
+    }));
+
+    harness.advance(Duration::from_hours(24));
+    harness.run_due_jobs().await;
+    assert!(deleted(&harness).is_empty());
+    harness.advance(Duration::from_hours(48));
+    harness.run_due_jobs().await;
+    assert_eq!(deleted(&harness), [channel]);
+    assert_eq!(transcripts_at(&harness, PANEL_LOG).len(), 1);
+    assert!(transcripts(&harness).is_empty());
 }

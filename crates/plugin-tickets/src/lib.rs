@@ -49,7 +49,7 @@ const TICKET_PERMISSIONS: Permissions = Permissions::VIEW_CHANNEL
     .union(Permissions::ATTACH_FILES)
     .union(Permissions::EMBED_LINKS);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct Config {
     /// The category the tickets are made in; without one they are made at the top.
@@ -61,6 +61,17 @@ struct Config {
     max_open: u32,
     /// A ticket nobody writes in for this many days is closed; 0 never closes one.
     close_after_days: u32,
+    panels: Vec<NamedPanel>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct NamedPanel {
+    id: String,
+    category: Option<String>,
+    staff_roles: Vec<String>,
+    log_channel: Option<String>,
+    close_after_days: u32,
 }
 
 impl Default for Config {
@@ -71,6 +82,7 @@ impl Default for Config {
             log_channel: None,
             max_open: 1,
             close_after_days: 0,
+            panels: Vec::new(),
         }
     }
 }
@@ -93,6 +105,35 @@ impl Config {
         id_of(self.category.as_ref()).map(ChannelId::new)
     }
 
+    fn with_panel(&self, panel: &NamedPanel) -> Self {
+        Self {
+            category: panel.category.clone(),
+            staff_roles: panel.staff_roles.clone(),
+            log_channel: panel.log_channel.clone(),
+            max_open: self.max_open,
+            close_after_days: panel.close_after_days,
+            panels: Vec::new(),
+        }
+    }
+
+    fn for_ticket(&self, ticket: &Ticket) -> Self {
+        ticket
+            .panel
+            .as_ref()
+            .map_or_else(|| self.clone(), |panel| self.with_panel(panel))
+    }
+
+    fn named(&self, id: &str) -> Result<&NamedPanel, UserError> {
+        let mut matches = self.panels.iter().filter(|panel| panel.id == id);
+        let panel = matches
+            .next()
+            .ok_or_else(|| UserError::message("tickets-panel-unavailable"))?;
+        if matches.next().is_some() {
+            return Err(UserError::message("tickets-panel-duplicate"));
+        }
+        Ok(panel)
+    }
+
     fn log(&self) -> Option<ChannelId> {
         id_of(self.log_channel.as_ref()).map(ChannelId::new)
     }
@@ -111,6 +152,8 @@ struct Ticket {
     closing: Option<i64>,
     #[serde(default)]
     close_request: Option<CloseRequest>,
+    #[serde(default)]
+    panel: Option<NamedPanel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +170,9 @@ struct Idle {
 
 #[derive(CommandArgs)]
 struct Panel {
+    /// The panel ID; omit for the default panel
+    #[arg(max_length = 32)]
+    panel: Option<String>,
     /// Where the message with the button goes; this channel when left out
     channel: Option<ChannelId>,
     /// What the message says
@@ -169,6 +215,20 @@ fn ticket_key(channel: ChannelId) -> String {
 
 fn idle_key(channel: ChannelId) -> String {
     format!("idle-{}", channel.get())
+}
+
+async fn ticket_config(
+    ctx: &EventContext,
+    config: &Config,
+    channel: ChannelId,
+) -> Result<Config, UserError> {
+    let ticket = ctx
+        .store()
+        .get::<Ticket>(&ticket_key(channel))
+        .await
+        .map_err(|error| failed(&error))?
+        .ok_or_else(|| UserError::message("tickets-not-a-ticket"))?;
+    Ok(config.for_ticket(&ticket))
 }
 
 fn failed(error: &impl ToString) -> UserError {
@@ -336,6 +396,11 @@ fn overwrite(target: OverwriteTarget, allow: Permissions, deny: Permissions) -> 
 }
 
 async fn panel(cx: CommandCx, args: Panel) -> Result<(), UserError> {
+    let config: Config = cx.config()?;
+    let panel = args.panel.unwrap_or_default();
+    if !panel.is_empty() {
+        config.named(&panel)?;
+    }
     let ctx = cx.ctx();
     let channel = args.channel.unwrap_or(cx.invocation().channel_id);
     let text = args
@@ -349,11 +414,10 @@ async fn panel(cx: CommandCx, args: Panel) -> Result<(), UserError> {
             reply_to: None,
             content: Some(text),
             embeds: Vec::new(),
-            components: vec![ui::row(vec![button(
-                ctx,
-                "open",
+            components: vec![ui::row(vec![ui::button(
                 ButtonStyle::Primary,
-                "tickets-open-button",
+                ctx.t_in(ctx.locale, "tickets-open-button", &Args::new()),
+                CustomId::new("open").data(panel).encode(&ctx.module),
             )])],
             files: Vec::new(),
         })
@@ -370,12 +434,26 @@ async fn panel(cx: CommandCx, args: Panel) -> Result<(), UserError> {
 async fn open(cx: ComponentCx) -> Result<(), UserError> {
     // The button is not a way around what `/ticket` asks: the same permission.
     cx.require("tickets.use").await?;
-    let config: Config = cx.config()?;
-    let staff = config.staff();
+    let original: Config = cx.config()?;
+    let panel_id = cx.data();
+    let panel = if panel_id.is_empty() {
+        None
+    } else {
+        Some(original.named(&panel_id)?.clone())
+    };
+    let config = panel
+        .as_ref()
+        .map_or_else(|| original.clone(), |panel| original.with_panel(panel));
+    let ctx = cx.ctx();
+    let mut staff = config.staff();
+    staff.sort_unstable();
+    staff.dedup();
     if staff.is_empty() {
         return say(&cx, "tickets-not-set-up", &Args::new()).await;
     }
-    let ctx = cx.ctx();
+    if staff.contains(&RoleId::new(ctx.guild_id.get())) {
+        return say(&cx, "tickets-everyone-not-staff", &Args::new()).await;
+    }
     let user = cx.user().id;
     if let Some(parent) = config.category() {
         ensure_category(ctx, parent).await?;
@@ -460,6 +538,7 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
         created: cx.now(),
         closing: None,
         close_request: None,
+        panel,
     };
     ctx.store()
         .set_for(
@@ -584,6 +663,7 @@ async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
         return Ok(());
     };
     let config: Config = ctx.parse_config()?;
+    let config = config.for_ticket(&ticket);
     if config.close_after_days == 0 {
         return Ok(());
     }
@@ -795,6 +875,7 @@ async fn finish(
         Claim::RequestChanged => return Ok(Closed::RequestChanged),
     };
     let config: Config = ctx.parse_config()?;
+    let config = config.for_ticket(&ticket);
     let file = match config.log() {
         Some(log) => match transcript(ctx, channel, &ticket).await {
             Ok(text) => Some((log, text)),
@@ -883,6 +964,7 @@ async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
         return say(&cx, "tickets-not-a-ticket", &Args::new()).await;
     };
     let config: Config = cx.config()?;
+    let config = config.for_ticket(&ticket);
     if !may_close(&ticket, cx.user().id, is_staff(&cx, &config).await) {
         return say(&cx, "tickets-not-yours", &Args::new()).await;
     }
@@ -1065,6 +1147,7 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
         return Err(UserError::message("tickets-not-a-ticket"));
     };
     let config: Config = cx.config()?;
+    let config = config.for_ticket(&ticket);
     if !may_close(&ticket, cx.user().id, is_staff_command(&cx, &config).await) {
         return Err(UserError::message("tickets-not-yours"));
     }
@@ -1111,9 +1194,6 @@ async fn resend_close_request(
 async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), UserError> {
     let config: Config = cx.config()?;
     cx.defer(true).await?;
-    if !is_staff_command(&cx, &config).await {
-        return cx.reply_private_t("tickets-staff-only", &Args::new()).await;
-    }
     let ctx = cx.ctx();
     let channel = cx.invocation().channel_id;
     let key = ticket_key(channel);
@@ -1137,6 +1217,10 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
             return cx.reply_private_t("tickets-failed", &Args::new()).await;
         }
     };
+    let config = config.for_ticket(&ticket);
+    if !is_staff_command(&cx, &config).await {
+        return cx.reply_private_t("tickets-staff-only", &Args::new()).await;
+    }
     if ticket.closing.is_some() {
         return cx
             .reply_private_t("tickets-not-a-ticket", &Args::new())
@@ -1253,6 +1337,7 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let key = ticket_key(channel);
     let config: Config = cx.config()?;
+    let config = ticket_config(ctx, &config, channel).await?;
     if !is_staff(&cx, &config).await {
         return say(&cx, "tickets-staff-only", &Args::new()).await;
     }
@@ -1310,11 +1395,13 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
 }
 
 async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), UserError> {
+    let ctx = cx.ctx();
+    let channel = cx.invocation().channel_id;
     let config: Config = cx.config()?;
+    let config = ticket_config(ctx, &config, channel).await?;
     if !is_staff_command(&cx, &config).await {
         return Err(UserError::message("tickets-staff-only"));
     }
-    let ctx = cx.ctx();
     let staff = config.staff();
     if let Some(user) = claimed_by {
         let member = match ctx
@@ -1337,7 +1424,6 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
             return Err(UserError::message("tickets-transfer-not-staff"));
         }
     }
-    let channel = cx.invocation().channel_id;
     let key = ticket_key(channel);
     // CAS lets a close that begins during the update win.
     for _ in 0..5 {
@@ -1398,13 +1484,18 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
 async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Result<(), UserError> {
     let channel = cx.invocation().channel_id;
     let ctx = cx.ctx();
-    if ctx
+    let ticket = ctx
         .store()
         .get::<Ticket>(&ticket_key(channel))
         .await
         .map_err(|e| failed(&e))?
-        .is_none()
-    {
+        .ok_or_else(|| UserError::message("tickets-not-a-ticket"))?;
+    let config: Config = cx.config()?;
+    let config = config.for_ticket(&ticket);
+    if !is_staff_command(&cx, &config).await {
+        return Err(UserError::message("tickets-staff-only"));
+    }
+    if ticket.closing.is_some() {
         return Err(UserError::message("tickets-not-a-ticket"));
     }
     let reason = Reason::truncated(&cx.t("tickets-reason-member", &Args::new()));
@@ -1472,12 +1563,13 @@ async fn transfer(cx: CommandCx, args: Member) -> Result<(), UserError> {
 }
 
 async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
+    let ctx = cx.ctx();
+    let channel = cx.invocation().channel_id;
     let config: Config = cx.config()?;
+    let config = ticket_config(ctx, &config, channel).await?;
     if !is_staff_command(&cx, &config).await {
         return Err(UserError::message("tickets-staff-only"));
     }
-    let ctx = cx.ctx();
-    let channel = cx.invocation().channel_id;
     let Some(ticket) = ctx
         .store()
         .get::<Ticket>(&ticket_key(channel))
@@ -1508,10 +1600,8 @@ async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
         .await
 }
 
-/// # Errors
-/// The module declaration is refused by the SDK.
-pub fn builder() -> Result<ModuleBuilder, CoreError> {
-    let schema = json!({
+fn schema() -> serde_json::Value {
+    json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -1547,9 +1637,32 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                 "maximum": 365,
                 "description": "config-tickets-close_after_days",
                 "x-ui": { "level": "basic" }
+            },
+            "panels": {
+                "type": "array",
+                "description": "config-tickets-panels",
+                "x-ui": { "level": "basic" },
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,32}$", "description": "config-tickets-panel-id" },
+                        "category": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-category" },
+                        "staff_roles": { "type": "array", "maxItems": 20, "items": { "type": "string", "pattern": "^[0-9]{1,20}$" }, "description": "config-tickets-panel-staff" },
+                        "log_channel": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-log_channel" },
+                        "close_after_days": { "type": "integer", "minimum": 0, "maximum": 365, "description": "config-tickets-close_after_days" }
+                    }
+                }
             }
         }
-    });
+    })
+}
+
+/// # Errors
+/// The module declaration is refused by the SDK.
+pub fn builder() -> Result<ModuleBuilder, CoreError> {
+    let schema = schema();
     Ok(
         ModuleBuilder::new("tickets", "Tickets", env!("CARGO_PKG_VERSION"))?
             .capability(closure_sdk::Capability::Storage)
@@ -1576,7 +1689,8 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     "staff_roles": [],
                     "log_channel": null,
                     "max_open": 1,
-                    "close_after_days": 0
+                    "close_after_days": 0,
+                    "panels": []
                 }),
             )
             .group(
@@ -1589,12 +1703,8 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                         .requires("tickets.use")
                         .handler(close_command),
                     Command::<CloseRequestArgs>::new("close-request").handler(close_request),
-                    Command::<Member>::new("add")
-                        .requires("tickets.manage")
-                        .handler(add),
-                    Command::<Member>::new("remove")
-                        .requires("tickets.manage")
-                        .handler(remove),
+                    Command::<Member>::new("add").handler(add),
+                    Command::<Member>::new("remove").handler(remove),
                     Command::<Unclaim>::new("unclaim").handler(unclaim),
                     Command::<Member>::new("transfer").handler(transfer),
                     Command::<Rename>::new("rename").handler(rename),
