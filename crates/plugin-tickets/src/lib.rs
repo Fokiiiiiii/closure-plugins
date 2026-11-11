@@ -43,6 +43,8 @@ const NOTE_MAX_CHARS: usize = 300;
 const NOTE_PAGE_LIMIT: usize = 1_000;
 const NOTE_RETENTION: Duration = Duration::from_hours(24 * 365);
 const STATS_LIMIT: usize = 1_000;
+const LABEL_MAX_CHARS: usize = 64;
+const LABEL_LIST_UTF16_UNITS: usize = 1_700;
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
@@ -159,6 +161,8 @@ struct Ticket {
     close_request: Option<CloseRequest>,
     #[serde(default)]
     panel: Option<NamedPanel>,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +224,19 @@ struct Unclaim {}
 struct StatsArgs {}
 
 #[derive(CommandArgs)]
+struct LabelArgs {
+    /// The label name
+    #[arg(max_length = 64)]
+    label: String,
+}
+
+#[derive(CommandArgs)]
+struct LabelListArgs {
+    /// The page number
+    page: Option<i64>,
+}
+
+#[derive(CommandArgs)]
 struct Member {
     /// The member
     user: UserId,
@@ -249,6 +266,42 @@ struct NotesArgs {
 
 fn ticket_key(channel: ChannelId) -> String {
     format!("ticket:{}", channel.get())
+}
+
+fn display_label(value: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let label = value.trim();
+    (!label.is_empty() && label.chars().count() <= LABEL_MAX_CHARS).then(|| label.to_owned())
+}
+
+fn label_key(label: &str) -> String {
+    label.trim().to_lowercase()
+}
+
+fn label_pages(labels: &[String]) -> Vec<String> {
+    let mut pages = Vec::new();
+    let mut page = String::new();
+    let mut units = 0;
+    for label in labels {
+        let label = label.replace('@', "@\u{200b}");
+        let label_units = label.encode_utf16().count();
+        if !page.is_empty() && units + 2 + label_units > LABEL_LIST_UTF16_UNITS {
+            pages.push(std::mem::take(&mut page));
+            units = 0;
+        }
+        if !page.is_empty() {
+            page.push_str(", ");
+            units += 2;
+        }
+        page.push_str(&label);
+        units += label_units;
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    pages
 }
 
 fn note_pages_prefix(channel: ChannelId) -> String {
@@ -637,6 +690,7 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
         closing: None,
         close_request: None,
         panel,
+        labels: Vec::new(),
     };
     ctx.store()
         .set_for(
@@ -1634,6 +1688,129 @@ async fn remove(cx: CommandCx, args: Member) -> Result<(), UserError> {
     change_member(cx, args.user, false).await
 }
 
+async fn change_label(cx: CommandCx, value: String, add: bool) -> Result<(), UserError> {
+    let Some(label) = display_label(&value) else {
+        return cx
+            .reply_private_t("tickets-label-invalid", &Args::new())
+            .await;
+    };
+    let normalized = label_key(&label);
+    let ctx = cx.ctx();
+    let key = ticket_key(cx.invocation().channel_id);
+    let config: Config = cx.config()?;
+    for _ in 0..5 {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| failed(&error))?
+        else {
+            return Err(UserError::message("tickets-not-a-ticket"));
+        };
+        let mut ticket: Ticket =
+            serde_json::from_value(entry.value).map_err(|error| failed(&error))?;
+        if !is_staff_command(&cx, &config.for_ticket(&ticket)).await {
+            return Err(UserError::message("tickets-staff-only"));
+        }
+        if ticket.closing.is_some() {
+            return Err(UserError::message("tickets-not-a-ticket"));
+        }
+
+        if add {
+            if ticket
+                .labels
+                .iter()
+                .any(|existing| label_key(existing) == normalized)
+            {
+                return cx
+                    .reply_private_t("tickets-label-exists", &Args::new())
+                    .await;
+            }
+            ticket.labels.push(label.clone());
+            ticket.labels.sort_by_cached_key(|value| label_key(value));
+        } else {
+            let count = ticket.labels.len();
+            ticket
+                .labels
+                .retain(|existing| label_key(existing) != normalized);
+            if ticket.labels.len() == count {
+                return cx
+                    .reply_private_t("tickets-label-missing", &Args::new())
+                    .await;
+            }
+        }
+
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &ticket,
+                Expect::Revision(entry.revision),
+                Some(Duration::from_hours(24 * 365)),
+            )
+            .await
+        {
+            Ok(_) => {
+                return cx
+                    .reply_private_t(
+                        if add {
+                            "tickets-label-added"
+                        } else {
+                            "tickets-label-removed"
+                        },
+                        &Args::new(),
+                    )
+                    .await;
+            }
+            Err(StorageError::Conflict) => {}
+            Err(StorageError::TooLarge { .. }) => {
+                return cx
+                    .reply_private_t("tickets-label-storage-limit", &Args::new())
+                    .await;
+            }
+            Err(error) => return Err(failed(&error)),
+        }
+    }
+    Err(UserError::message("tickets-failed"))
+}
+
+async fn add_label(cx: CommandCx, args: LabelArgs) -> Result<(), UserError> {
+    change_label(cx, args.label, true).await
+}
+
+async fn remove_label(cx: CommandCx, args: LabelArgs) -> Result<(), UserError> {
+    change_label(cx, args.label, false).await
+}
+
+async fn list_labels(cx: CommandCx, args: LabelListArgs) -> Result<(), UserError> {
+    let channel = cx.invocation().channel_id;
+    let ctx = cx.ctx();
+    let ticket = staff_ticket(&cx, ctx, channel).await?;
+    if ticket.labels.is_empty() {
+        return cx
+            .reply_private_t("tickets-label-empty", &Args::new())
+            .await;
+    }
+    let page_index = usize::try_from(args.page.unwrap_or(1))
+        .ok()
+        .and_then(|page| page.checked_sub(1));
+    let Some(page_index) = page_index else {
+        return Err(UserError::message("tickets-label-page-not-found"));
+    };
+    let pages = label_pages(&ticket.labels);
+    let Some(labels) = pages.get(page_index) else {
+        return Err(UserError::message("tickets-label-page-not-found"));
+    };
+    cx.reply_private_t(
+        "tickets-label-list",
+        &Args::new()
+            .with("labels", labels.clone())
+            .with("page", (page_index + 1).to_string())
+            .with("pages", pages.len().to_string()),
+    )
+    .await
+}
+
 async fn unclaim(cx: CommandCx, _: Unclaim) -> Result<(), UserError> {
     set_claim(cx, None).await
 }
@@ -2081,6 +2258,9 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<Member>::new("transfer").handler(transfer),
                     Command::<Rename>::new("rename").handler(rename),
                     Command::<StatsArgs>::new("stats").handler(stats_command),
+                    Command::<LabelArgs>::new("label-add").handler(add_label),
+                    Command::<LabelArgs>::new("label-remove").handler(remove_label),
+                    Command::<LabelListArgs>::new("label-list").handler(list_labels),
                     Command::<NoteArgs>::new("note").handler(add_note),
                     Command::<NotesArgs>::new("notes").handler(list_notes),
                 ],

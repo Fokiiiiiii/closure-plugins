@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use closure_core::action::{Action, MentionPolicy, OverwriteTarget};
 use closure_core::event::{ChannelId, GuildId};
+use closure_core::storage::MAX_VALUE_BYTES;
 use closure_sdk::testing::{Click, Harness, Invocation};
 use closure_sdk::{CommandOptionValue, Level};
 use serde_json::json;
@@ -10,8 +11,9 @@ use twilight_model::id::Id;
 use twilight_model::id::marker::ChannelMarker;
 
 use crate::{
-    NOTE_MAX_CHARS, NOTE_PAGE_LIMIT, NOTE_RETENTION, NOTES_PER_PAGE, NamedPanel, StaffNote,
-    StaffNotePage, Ticket, builder, note_page_key, note_pages_prefix,
+    LABEL_LIST_UTF16_UNITS, NOTE_MAX_CHARS, NOTE_PAGE_LIMIT, NOTE_RETENTION, NOTES_PER_PAGE,
+    NamedPanel, StaffNote, StaffNotePage, Ticket, builder, label_pages, note_page_key,
+    note_pages_prefix,
 };
 
 const STAFF_ROLE: u64 = 30;
@@ -55,6 +57,7 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         closing: None,
         close_request: None,
         panel: None,
+        labels: Vec::new(),
     };
     harness
         .store()
@@ -240,6 +243,23 @@ fn notes_invocation(ticket: u64, page: Option<i64>, user: u64, roles: &[u64]) ->
         None => command,
     };
     command.roles(roles.iter().copied()).user(user)
+}
+
+fn label_invocation(subcommand: &str, label: Option<&str>, user: u64, roles: &[u64]) -> Invocation {
+    let command = Invocation::new("ticket").subcommand(subcommand);
+    let command = match label {
+        Some(label) => command.option("label", CommandOptionValue::String(label.to_owned())),
+        None => command,
+    };
+    command.roles(roles.iter().copied()).user(user)
+}
+
+fn label_page_invocation(page: i64, user: u64, roles: &[u64]) -> Invocation {
+    Invocation::new("ticket")
+        .subcommand("label-list")
+        .option("page", CommandOptionValue::Integer(page))
+        .roles(roles.iter().copied())
+        .user(user)
 }
 
 #[tokio::test]
@@ -2190,4 +2210,350 @@ async fn ticket_stats_omit_partial_counts_at_the_store_limit() {
     let content = &stats.last().unwrap().content;
     assert!(content.contains("At least 1,000 tickets"), "{stats:?}");
     assert!(!content.contains("Open:"), "{stats:?}");
+}
+
+#[tokio::test]
+async fn panel_staff_manage_labels_with_display_names_only_for_their_panel() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "panels": [
+            {
+                "id": "billing",
+                "staff_roles": [PANEL_STAFF_ROLE.to_string()]
+            },
+            {
+                "id": "support",
+                "staff_roles": [OTHER_PANEL_STAFF_ROLE.to_string()]
+            }
+        ]
+    }));
+
+    harness.click(panel_press("billing", MEMBER)).await.unwrap();
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    let ticket: Ticket = harness.store().get(&tickets[0].0).await.unwrap().unwrap();
+    assert_eq!(
+        ticket.panel.as_ref().map(|panel| panel.id.as_str()),
+        Some("billing")
+    );
+    harness
+        .store()
+        .set(&format!("ticket:{HERE}"), &ticket)
+        .await
+        .unwrap();
+
+    let empty = harness
+        .invoke(label_invocation(
+            "label-list",
+            None,
+            OTHER,
+            &[PANEL_STAFF_ROLE],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        empty
+            .last()
+            .unwrap()
+            .content
+            .contains("This ticket has no labels"),
+        "{empty:?}"
+    );
+
+    let added = harness
+        .invoke(label_invocation(
+            "label-add",
+            Some("  Urgent 日本語  "),
+            OTHER,
+            &[PANEL_STAFF_ROLE],
+        ))
+        .await
+        .unwrap();
+    assert!(added.last().unwrap().ephemeral, "{added:?}");
+    let listed = harness
+        .invoke(label_invocation(
+            "label-list",
+            None,
+            OTHER,
+            &[PANEL_STAFF_ROLE],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        listed.last().unwrap().content.contains("Urgent 日本語"),
+        "{listed:?}"
+    );
+
+    assert!(
+        harness
+            .invoke(label_invocation(
+                "label-add",
+                Some("other-panel"),
+                OTHER,
+                &[OTHER_PANEL_STAFF_ROLE],
+            ))
+            .await
+            .is_err()
+    );
+    assert!(
+        harness
+            .invoke(label_invocation(
+                "label-list",
+                None,
+                OTHER,
+                &[OTHER_PANEL_STAFF_ROLE],
+            ))
+            .await
+            .is_err()
+    );
+
+    let removed = harness
+        .invoke(label_invocation(
+            "label-remove",
+            Some("urgent 日本語"),
+            OTHER,
+            &[PANEL_STAFF_ROLE],
+        ))
+        .await
+        .unwrap();
+    assert!(removed.last().unwrap().ephemeral, "{removed:?}");
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ticket.labels.is_empty());
+}
+
+#[tokio::test]
+async fn ticket_managers_can_manage_labels() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+
+    harness
+        .invoke(label_invocation(
+            "label-add",
+            Some("Needs Review"),
+            MODERATOR,
+            &[MODERATOR],
+        ))
+        .await
+        .unwrap();
+    let duplicate = harness
+        .invoke(label_invocation(
+            "label-add",
+            Some(" needs review "),
+            MODERATOR,
+            &[MODERATOR],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        duplicate
+            .last()
+            .unwrap()
+            .content
+            .contains("already has that label"),
+        "{duplicate:?}"
+    );
+    let listed = harness
+        .invoke(label_invocation(
+            "label-list",
+            None,
+            MODERATOR,
+            &[MODERATOR],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        listed.last().unwrap().content.contains("Needs Review"),
+        "{listed:?}"
+    );
+    harness
+        .invoke(label_invocation(
+            "label-remove",
+            Some("needs review"),
+            MODERATOR,
+            &[MODERATOR],
+        ))
+        .await
+        .unwrap();
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ticket.labels.is_empty());
+}
+
+#[tokio::test]
+async fn label_list_paginates_within_discord_message_limits() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.labels = (0..40)
+        .map(|index| format!("label-{index}-{}", "日".repeat(50)))
+        .collect();
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    let first = harness
+        .invoke(label_page_invocation(1, MODERATOR, &[MODERATOR]))
+        .await
+        .unwrap();
+    let second = harness
+        .invoke(label_page_invocation(2, MODERATOR, &[MODERATOR]))
+        .await
+        .unwrap();
+    let first_content = &first.last().unwrap().content;
+    let second_content = &second.last().unwrap().content;
+    assert!(first_content.contains("page 1 of 2"), "{first:?}");
+    assert!(second_content.contains("page 2 of 2"), "{second:?}");
+    assert!(first_content.contains("label-0-"), "{first:?}");
+    assert!(second_content.contains("label-39-"), "{second:?}");
+    assert!(first_content.encode_utf16().count() <= 2_000, "{first:?}");
+    assert!(second_content.encode_utf16().count() <= 2_000, "{second:?}");
+}
+
+#[tokio::test]
+async fn ticket_labels_report_the_store_size_limit_without_partial_write() {
+    let harness = harness();
+    let key = format!("ticket:{HERE}");
+    let ticket_with_labels = |labels: Vec<String>| Ticket {
+        number: 3,
+        opener: MEMBER,
+        claimed_by: None,
+        created: 0,
+        closing: None,
+        close_request: None,
+        panel: None,
+        labels,
+    };
+    let mut labels = Vec::new();
+    for index in 0..MAX_VALUE_BYTES {
+        labels.push(format!("{index:04}-{}", "x".repeat(59)));
+        if serde_json::to_vec(&ticket_with_labels(labels.clone()))
+            .unwrap()
+            .len()
+            > MAX_VALUE_BYTES
+        {
+            labels.pop();
+            break;
+        }
+    }
+    let ticket = ticket_with_labels(labels);
+    assert!(ticket.labels.len() > 20);
+    let size = serde_json::to_vec(&ticket).unwrap().len();
+    assert!(size <= MAX_VALUE_BYTES);
+    let expected_labels = ticket.labels.clone();
+    let mut too_large = ticket_with_labels(expected_labels.clone());
+    let extra = "z".repeat(64);
+    too_large.labels.push(extra.clone());
+    assert!(serde_json::to_vec(&too_large).unwrap().len() > MAX_VALUE_BYTES);
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    let response = harness
+        .invoke(label_invocation(
+            "label-add",
+            Some(&extra),
+            MODERATOR,
+            &[MODERATOR],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        response
+            .last()
+            .unwrap()
+            .content
+            .contains("cannot store any more labels"),
+        "{response:?}"
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.labels, expected_labels);
+}
+
+#[tokio::test]
+async fn concurrent_label_changes_are_preserved_and_closing_blocks_changes() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.labels.push("Urgent".to_owned());
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    let (added, removed) = tokio::join!(
+        harness.invoke(label_invocation(
+            "label-add",
+            Some("Needs Review"),
+            MODERATOR,
+            &[MODERATOR],
+        )),
+        harness.invoke(label_invocation(
+            "label-remove",
+            Some("urgent"),
+            MODERATOR,
+            &[MODERATOR],
+        ))
+    );
+    assert!(added.is_ok(), "{added:?}");
+    assert!(removed.is_ok(), "{removed:?}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.labels, vec!["Needs Review".to_owned()]);
+
+    ticket.closing = Some(1);
+    harness.store().set(&key, &ticket).await.unwrap();
+    assert!(
+        harness
+            .invoke(label_invocation(
+                "label-add",
+                Some("after-close"),
+                MODERATOR,
+                &[MODERATOR],
+            ))
+            .await
+            .is_err()
+    );
+    let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(ticket.labels, vec!["Needs Review".to_owned()]);
+}
+
+#[test]
+fn legacy_tickets_default_to_no_labels_and_display_names_are_validated() {
+    let ticket: Ticket = serde_json::from_value(json!({
+        "number": 3,
+        "opener": MEMBER,
+        "claimed_by": null,
+        "created": 0
+    }))
+    .unwrap();
+    assert!(ticket.labels.is_empty());
+
+    assert_eq!(
+        display_label("  Urgent 日本語  "),
+        Some("Urgent 日本語".to_owned())
+    );
+    assert_eq!(label_key("Urgent 日本語"), label_key(" urgent 日本語 "));
+    assert_eq!(display_label(""), None);
+    assert_eq!(display_label(&"日".repeat(65)), None);
+    assert_eq!(display_label("line\nbreak"), None);
+}
+
+#[test]
+fn label_pages_fit_the_discord_budget_and_break_mentions() {
+    let mut labels: Vec<String> = (0..40)
+        .map(|index| format!("label-{index}-{}", "😀".repeat(40)))
+        .collect();
+    labels.push("@everyone".to_owned());
+
+    let pages = label_pages(&labels);
+    assert!(pages.len() > 1);
+    assert!(
+        pages
+            .iter()
+            .all(|page| page.encode_utf16().count() <= LABEL_LIST_UTF16_UNITS)
+    );
+    assert!(pages.iter().any(|page| page.contains("@\u{200b}everyone")));
 }
