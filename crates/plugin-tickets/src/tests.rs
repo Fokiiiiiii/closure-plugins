@@ -2004,7 +2004,7 @@ async fn mismatched_note_page_snapshots_never_authorize_a_mixed_archive() {
 }
 
 #[tokio::test]
-async fn a_closed_named_ticket_keeps_its_staff_snapshot_after_expiry_and_close_race() {
+async fn a_closed_named_ticket_keeps_staff_access_when_an_older_page_is_missing() {
     let harness = harness();
     seed_ticket(&harness, HERE, MEMBER).await;
     let key = format!("ticket:{HERE}");
@@ -2029,12 +2029,8 @@ async fn a_closed_named_ticket_keeps_its_staff_snapshot_after_expiry_and_close_r
             .unwrap();
     }
     let first_page_key = note_page_key(ChannelId::new(HERE), 1);
-    let first_page: StaffNotePage = harness.store().get(&first_page_key).await.unwrap().unwrap();
-    harness
-        .store()
-        .set_for(&first_page_key, &first_page, Duration::ZERO)
-        .await
-        .unwrap();
+    // Store.list omits expired entries; deletion makes that result deterministic.
+    harness.store().delete(&first_page_key).await.unwrap();
 
     let (raced_note, closed) = tokio::join!(
         harness.invoke(note_invocation("note 10", OTHER, &[PANEL_STAFF_ROLE])),
