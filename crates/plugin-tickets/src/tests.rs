@@ -9,7 +9,10 @@ use twilight_model::guild::Permissions;
 use twilight_model::id::Id;
 use twilight_model::id::marker::ChannelMarker;
 
-use crate::{Ticket, builder};
+use crate::{
+    HISTORY_PAGE_BYTES, HISTORY_PREFIX, HISTORY_VALUE_BYTES, HistoryStatus, Ticket, TicketHistory,
+    builder, history_content_key, history_id_key, history_key, transcript_page_ranges,
+};
 
 const STAFF_ROLE: u64 = 30;
 const MODERATOR: u64 = 200;
@@ -52,6 +55,8 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         closing: None,
         close_request: None,
         panel: None,
+        staff_roles: vec![STAFF_ROLE],
+        form_answers: Vec::new(),
     };
     harness
         .store()
@@ -220,6 +225,32 @@ fn rename_invocation(name: &str, staff: bool) -> Invocation {
     }
 }
 
+fn search_history_invocation(query: &str, staff: bool) -> Invocation {
+    let command = Invocation::new("ticket")
+        .subcommand("search")
+        .option("query", CommandOptionValue::String(query.to_owned()));
+    if staff {
+        command.roles([STAFF_ROLE]).user(MODERATOR)
+    } else {
+        command.user(OTHER)
+    }
+}
+
+fn view_history_invocation(number: i64, page: Option<u32>, staff: bool) -> Invocation {
+    let command = Invocation::new("ticket")
+        .subcommand("history")
+        .option("number", CommandOptionValue::Integer(number));
+    let command = match page {
+        Some(page) => command.option("page", CommandOptionValue::Integer(i64::from(page))),
+        None => command,
+    };
+    if staff {
+        command.roles([STAFF_ROLE]).user(MODERATOR)
+    } else {
+        command.user(OTHER)
+    }
+}
+
 #[tokio::test]
 async fn a_press_opens_a_private_channel_for_the_member_and_the_staff_and_only_one() {
     let harness = harness();
@@ -322,6 +353,22 @@ async fn a_category_setting_that_is_not_a_category_is_refused_before_any_place_i
     assert_eq!(harness.store().score("open", MEMBER).await.unwrap(), 0);
 }
 
+#[test]
+fn old_ticket_records_load_without_new_snapshot_fields() {
+    let ticket: Ticket = serde_json::from_value(json!({
+        "number": 3,
+        "opener": MEMBER,
+        "claimed_by": null,
+        "created": 0,
+        "closing": null,
+        "close_request": null,
+        "panel": null
+    }))
+    .unwrap();
+    assert!(ticket.staff_roles.is_empty());
+    assert!(ticket.form_answers.is_empty());
+}
+
 #[tokio::test]
 async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_place_back() {
     let harness = harness();
@@ -347,6 +394,177 @@ async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_pla
     assert_eq!(deleted(&harness), [HERE]);
     harness.click(press("open", MEMBER)).await.unwrap();
     assert_eq!(created(&harness).len(), 2);
+}
+
+#[tokio::test]
+async fn staff_can_search_and_read_closed_ticket_history_privately() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let ticket_key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&ticket_key).await.unwrap().unwrap();
+    ticket.form_answers = vec![("Order number".to_owned(), "42".to_owned())];
+    harness.store().set(&ticket_key, &ticket).await.unwrap();
+
+    harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("close")
+                .option(
+                    "reason",
+                    CommandOptionValue::String("billing follow up".to_owned()),
+                )
+                .user(MEMBER),
+        )
+        .await
+        .unwrap();
+
+    let logged = transcripts(&harness);
+    assert_eq!(logged.len(), 1);
+    assert!(!logged[0].1.contains("Order number"));
+    let key = history_key(3, Id::new(HERE));
+    let history: TicketHistory = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(history.status, HistoryStatus::Closed);
+    assert_eq!(history.staff_roles, [STAFF_ROLE]);
+    assert!(history.transcript_pages > 0);
+
+    let search = harness
+        .invoke(search_history_invocation("billing", true))
+        .await
+        .unwrap();
+    assert!(search.last().unwrap().content.contains("#3"), "{search:?}");
+    let messages = harness
+        .invoke(search_history_invocation("42", true))
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .last()
+            .unwrap()
+            .content
+            .contains("No matching ticket histories"),
+        "{messages:?}"
+    );
+
+    let view = harness
+        .invoke(view_history_invocation(3, None, true))
+        .await
+        .unwrap();
+    assert!(
+        view.last().unwrap().content.contains("Order number: 42"),
+        "{view:?}"
+    );
+    let denied = harness
+        .invoke(view_history_invocation(3, None, false))
+        .await
+        .unwrap();
+    assert!(
+        denied
+            .last()
+            .unwrap()
+            .content
+            .contains("not available to you"),
+        "{denied:?}"
+    );
+    assert!(
+        !denied.last().unwrap().content.contains("Order number"),
+        "{denied:?}"
+    );
+}
+
+#[tokio::test]
+async fn history_is_available_without_a_log_channel() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": null
+    }));
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let ticket_key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&ticket_key).await.unwrap().unwrap();
+    ticket.form_answers = vec![("Order number".to_owned(), "42".to_owned())];
+    harness.store().set(&ticket_key, &ticket).await.unwrap();
+
+    harness
+        .invoke(Invocation::new("ticket").subcommand("close").user(MEMBER))
+        .await
+        .unwrap();
+
+    let history: TicketHistory = harness
+        .store()
+        .get(&history_key(3, Id::new(HERE)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.status, HistoryStatus::Closed);
+    assert!(history.transcript_pages > 0);
+    assert_eq!(history.transcript_messages, 0);
+    assert!(transcripts(&harness).is_empty());
+    let view = harness
+        .invoke(view_history_invocation(3, None, true))
+        .await
+        .unwrap();
+    assert!(
+        view.last().unwrap().content.contains("Order number: 42"),
+        "{view:?}"
+    );
+}
+
+#[tokio::test]
+async fn closed_history_and_its_pages_expire_after_one_year() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .invoke(Invocation::new("ticket").subcommand("close").user(MEMBER))
+        .await
+        .unwrap();
+    let channel = Id::new(HERE);
+    let key = history_key(3, channel);
+    let history: TicketHistory = harness.store().get(&key).await.unwrap().unwrap();
+
+    harness.advance(Duration::from_secs(365 * 24 * 60 * 60 + 1));
+
+    assert!(
+        harness
+            .store()
+            .get::<TicketHistory>(&key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        harness
+            .store()
+            .get::<String>(&history_id_key(channel))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        harness
+            .store()
+            .get::<String>(&history_content_key(HERE, history.transcript_attempt, 0))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn transcript_pages_preserve_text_and_fit_the_storage_value_limit() {
+    let text = format!(
+        "{}{}",
+        "日本語😀".repeat(HISTORY_PAGE_BYTES),
+        "\u{0001}".repeat(HISTORY_PAGE_BYTES)
+    );
+    let pages = transcript_page_ranges(&text);
+    assert!(pages.len() > 2);
+    let mut rebuilt = String::new();
+    for (start, end) in &pages {
+        let page = &text[*start..*end];
+        rebuilt.push_str(page);
+        assert!(serde_json::to_vec(page).unwrap().len() <= HISTORY_VALUE_BYTES);
+    }
+    assert_eq!(rebuilt, text);
 }
 
 #[tokio::test]
@@ -392,9 +610,14 @@ async fn a_channel_that_could_not_be_deleted_is_still_a_ticket_and_closes_when_t
         kept.is_some(),
         "the ticket is not forgotten before its channel is gone: {first:?}"
     );
+    let history_key = history_key(3, Id::new(HERE));
+    let history: TicketHistory = harness.store().get(&history_key).await.unwrap().unwrap();
+    assert_eq!(history.status, HistoryStatus::Closing);
     harness.advance(Duration::from_secs(400));
     harness.click(press("close", MEMBER)).await.unwrap();
     assert!(deleted(&harness).contains(&HERE));
+    let history: TicketHistory = harness.store().get(&history_key).await.unwrap().unwrap();
+    assert_eq!(history.status, HistoryStatus::Closed);
     let gone: Option<Ticket> = harness.store().get(&key).await.unwrap();
     assert!(gone.is_none());
 }
@@ -1185,6 +1408,15 @@ async fn concurrent_close_request_approvals_close_the_ticket_once() {
     assert!(second.is_ok(), "{second:?}");
     assert_eq!(deleted(&harness), [HERE]);
     assert_eq!(transcripts(&harness).len(), 1);
+    let history_keys = harness.store().list(HISTORY_PREFIX, 10).await.unwrap();
+    assert_eq!(history_keys.len(), 1);
+    let history: TicketHistory = harness
+        .store()
+        .get(&history_keys[0].0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.status, HistoryStatus::Closed);
     let ticket: Option<Ticket> = harness
         .store()
         .get(&format!("ticket:{HERE}"))

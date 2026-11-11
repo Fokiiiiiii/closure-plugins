@@ -40,6 +40,16 @@ const NUMBER: &str = "number";
 const CLOSE_REQUESTS: &str = "close-requests";
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
 const TRANSCRIPT_PAGES: usize = 50;
+const HISTORY_PREFIX: &str = "ticket-history:";
+const HISTORY_CONTENT_PREFIX: &str = "ticket-history-content:";
+const HISTORY_INDEX_PREFIX: &str = "ticket-history-index:";
+const HISTORY_ID_PREFIX: &str = "ticket-history-id:";
+const HISTORY_LIMIT: usize = 1000;
+const HISTORY_RESULTS: usize = 8;
+const HISTORY_PAGE_BYTES: usize = 24 * 1024;
+const HISTORY_VALUE_BYTES: usize = 30 * 1024;
+const HISTORY_INDEX_SIZE: usize = 1000;
+const HISTORY_DISPLAY_CHARS: usize = 700;
 /// A ticket nobody writes in is looked at again after at most this long.
 const DAY: i64 = 86_400;
 /// What the member and the staff may do in a ticket.
@@ -56,7 +66,7 @@ struct Config {
     category: Option<String>,
     /// The roles that see every ticket. Tickets are off without one.
     staff_roles: Vec<String>,
-    /// The channel the transcripts go to. Without one no transcript is kept.
+    /// A channel to receive a copy of each transcript.
     log_channel: Option<String>,
     max_open: u32,
     /// A ticket nobody writes in for this many days is closed; 0 never closes one.
@@ -154,6 +164,41 @@ struct Ticket {
     close_request: Option<CloseRequest>,
     #[serde(default)]
     panel: Option<NamedPanel>,
+    #[serde(default)]
+    staff_roles: Vec<u64>,
+    #[serde(default)]
+    form_answers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HistoryStatus {
+    Closing,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TicketHistory {
+    version: u8,
+    channel_id: u64,
+    number: i64,
+    opener: u64,
+    claimed_by: Option<u64>,
+    created: i64,
+    closed: i64,
+    closer: Option<u64>,
+    reason: String,
+    panel: Option<NamedPanel>,
+    staff_roles: Vec<u64>,
+    status: HistoryStatus,
+    attempt: i64,
+    transcript_attempt: i64,
+    transcript_pages: u32,
+    transcript_index_pages: u32,
+    transcript_char_count: u64,
+    transcript_bytes: u64,
+    transcript_messages: u32,
+    transcript_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,8 +254,74 @@ struct Rename {
     name: String,
 }
 
+#[derive(CommandArgs)]
+struct SearchHistory {
+    /// Ticket number, member ID, or close reason
+    #[arg(max_length = 100)]
+    query: String,
+}
+
+#[derive(CommandArgs)]
+struct ViewHistory {
+    /// Ticket number
+    number: i64,
+    /// Transcript page
+    page: Option<i64>,
+}
+
 fn ticket_key(channel: ChannelId) -> String {
     format!("ticket:{}", channel.get())
+}
+
+fn history_number_prefix(number: i64) -> String {
+    format!(
+        "{HISTORY_PREFIX}{:019}:",
+        i64::MAX.saturating_sub(number.max(0))
+    )
+}
+
+fn history_key(number: i64, channel: ChannelId) -> String {
+    format!("{}{}", history_number_prefix(number), channel.get())
+}
+
+fn history_id_key(channel: ChannelId) -> String {
+    format!("{HISTORY_ID_PREFIX}{}", channel.get())
+}
+
+fn history_content_key(channel: u64, attempt: i64, page: usize) -> String {
+    format!("{HISTORY_CONTENT_PREFIX}{channel}:{attempt}:{page:04}")
+}
+
+fn history_index_key(channel: u64, attempt: i64, page: usize) -> String {
+    format!("{HISTORY_INDEX_PREFIX}{channel}:{attempt}:{page:04}")
+}
+
+fn transcript_page_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut pages = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = start.saturating_add(HISTORY_PAGE_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        while serde_json::to_vec(&text[start..end])
+            .map_or(true, |value| value.len() > HISTORY_VALUE_BYTES)
+        {
+            end = start + (end - start) * 3 / 4;
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                end = start + 1;
+                while end < text.len() && !text.is_char_boundary(end) {
+                    end += 1;
+                }
+            }
+        }
+        pages.push((start, end));
+        start = end;
+    }
+    pages
 }
 
 fn idle_key(channel: ChannelId) -> String {
@@ -539,6 +650,8 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
         closing: None,
         close_request: None,
         panel,
+        staff_roles: staff.iter().map(|role| role.get()).collect(),
+        form_answers: Vec::new(),
     };
     ctx.store()
         .set_for(
@@ -719,21 +832,16 @@ enum Claim {
     RequestChanged,
 }
 
-/// The messages of the channel, the oldest first, as text.
 async fn transcript(
     ctx: &EventContext,
     channel: ChannelId,
     ticket: &Ticket,
-) -> Result<String, ModuleError> {
+) -> Result<(String, bool, usize), DiscordError> {
     let mut messages = Vec::new();
     let mut cursor = None;
     let mut cut = false;
     for page_number in 0..TRANSCRIPT_PAGES {
-        let page = ctx
-            .api
-            .get_messages(channel, cursor, 100)
-            .await
-            .map_err(|e| stored(&e))?;
+        let page = ctx.api.get_messages(channel, cursor, 100).await?;
         let Some(oldest) = page.last().map(|message| message.id) else {
             break;
         };
@@ -743,7 +851,6 @@ async fn transcript(
             break;
         }
         if page_number + 1 == TRANSCRIPT_PAGES {
-            // The limit was reached with more behind it: the file says so.
             cut = true;
         }
         cursor = Some(MessageCursor::Before(oldest));
@@ -781,11 +888,418 @@ async fn transcript(
             message.content.replace('\n', " ")
         );
     }
-    Ok(text)
+    Ok((text, cut, messages.len()))
+}
+
+fn history_transcript(
+    ctx: &EventContext,
+    transcript: &str,
+    form_answers: &[(String, String)],
+) -> Option<String> {
+    if form_answers.is_empty() {
+        return None;
+    }
+    let mut text = transcript.to_owned();
+    let _ = writeln!(
+        text,
+        "\n{}",
+        ctx.t_in(ctx.locale, "tickets-transcript-answers-title", &Args::new(),)
+    );
+    for (question, answer) in form_answers {
+        let _ = writeln!(
+            text,
+            "- {}: {}",
+            question.replace('\n', " ").replace('\r', " "),
+            answer.replace('\n', " ").replace('\r', " "),
+        );
+    }
+    Some(text)
 }
 
 /// How long a close that began is waited for before another may take over.
 const CLOSING_WAIT: i64 = 300;
+
+fn history_staff_roles(ticket: &Ticket, config: &Config) -> Vec<u64> {
+    let mut roles = if ticket.staff_roles.is_empty() {
+        config.staff().into_iter().map(|role| role.get()).collect()
+    } else {
+        ticket.staff_roles.clone()
+    };
+    roles.sort_unstable();
+    roles.dedup();
+    roles
+}
+
+async fn remove_history_generation(
+    ctx: &EventContext,
+    channel: u64,
+    attempt: i64,
+    pages: u32,
+    index_pages: u32,
+) {
+    for page in 0..pages {
+        if let Err(error) = ctx
+            .store()
+            .delete(&history_content_key(channel, attempt, page as usize))
+            .await
+        {
+            tracing::warn!(
+                ?error,
+                channel,
+                page,
+                "could not remove an incomplete ticket transcript page"
+            );
+        }
+    }
+    for page in 0..index_pages {
+        if let Err(error) = ctx
+            .store()
+            .delete(&history_index_key(channel, attempt, page as usize))
+            .await
+        {
+            tracing::warn!(
+                ?error,
+                channel,
+                page,
+                "could not remove an incomplete ticket transcript index"
+            );
+        }
+    }
+}
+
+async fn save_history(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket: &Ticket,
+    config: &Config,
+    closer: Option<UserId>,
+    reason: &str,
+    attempt: i64,
+    transcript: Option<(&str, bool, usize)>,
+) -> Result<TicketHistory, ModuleError> {
+    let (text, transcript_truncated, transcript_messages) = transcript.unwrap_or(("", false, 0));
+    let pages = transcript_page_ranges(text);
+    let transcript_pages =
+        u32::try_from(pages.len()).map_err(|error| ModuleError::other(error.to_string()))?;
+    let mut page_chars = Vec::with_capacity(pages.len());
+    for (start, end) in &pages {
+        page_chars.push(
+            u32::try_from(text[*start..*end].chars().count())
+                .map_err(|error| ModuleError::other(error.to_string()))?,
+        );
+    }
+    let transcript_index_pages = u32::try_from(page_chars.chunks(HISTORY_INDEX_SIZE).len())
+        .map_err(|error| ModuleError::other(error.to_string()))?;
+    let transcript_char_count = page_chars.iter().try_fold(0_u64, |total, chars| {
+        total
+            .checked_add(u64::from(*chars))
+            .ok_or_else(|| ModuleError::other("ticket transcript is too long"))
+    })?;
+    let transcript_messages = u32::try_from(transcript_messages)
+        .map_err(|error| ModuleError::other(error.to_string()))?;
+    let history = TicketHistory {
+        version: 1,
+        channel_id: channel.get(),
+        number: ticket.number,
+        opener: ticket.opener,
+        claimed_by: ticket.claimed_by,
+        created: ticket.created,
+        closed: ctx.now(),
+        closer: closer.map(|user| user.get()),
+        reason: reason.to_owned(),
+        panel: ticket.panel.clone(),
+        staff_roles: history_staff_roles(ticket, config),
+        status: HistoryStatus::Closing,
+        attempt,
+        transcript_attempt: attempt,
+        transcript_pages,
+        transcript_index_pages,
+        transcript_char_count,
+        transcript_bytes: text.len() as u64,
+        transcript_messages,
+        transcript_truncated,
+    };
+    for (page, (start, end)) in pages.iter().enumerate() {
+        let page_text = text[*start..*end].to_owned();
+        if let Err(error) = ctx
+            .store()
+            .set_for(
+                &history_content_key(channel.get(), attempt, page),
+                &page_text,
+                Duration::from_hours(24 * 365),
+            )
+            .await
+        {
+            remove_history_generation(
+                ctx,
+                channel.get(),
+                attempt,
+                transcript_pages,
+                transcript_index_pages,
+            )
+            .await;
+            return Err(stored(&error));
+        }
+    }
+    for (page, counts) in page_chars.chunks(HISTORY_INDEX_SIZE).enumerate() {
+        let counts = counts.to_vec();
+        if let Err(error) = ctx
+            .store()
+            .set_for(
+                &history_index_key(channel.get(), attempt, page),
+                &counts,
+                Duration::from_hours(24 * 365),
+            )
+            .await
+        {
+            remove_history_generation(
+                ctx,
+                channel.get(),
+                attempt,
+                transcript_pages,
+                transcript_index_pages,
+            )
+            .await;
+            return Err(stored(&error));
+        }
+    }
+    let key = history_key(ticket.number, channel);
+    if let Err(error) = ctx
+        .store()
+        .set_for(
+            &history_id_key(channel),
+            &key,
+            Duration::from_hours(24 * 365),
+        )
+        .await
+    {
+        remove_history_generation(
+            ctx,
+            channel.get(),
+            attempt,
+            transcript_pages,
+            transcript_index_pages,
+        )
+        .await;
+        return Err(stored(&error));
+    }
+    if let Err(error) = store_history_record(ctx, &key, &history).await {
+        remove_history_generation(
+            ctx,
+            channel.get(),
+            attempt,
+            transcript_pages,
+            transcript_index_pages,
+        )
+        .await;
+        return Err(error);
+    }
+    Ok(history)
+}
+
+async fn store_history_record(
+    ctx: &EventContext,
+    key: &str,
+    history: &TicketHistory,
+) -> Result<(), ModuleError> {
+    for _ in 0..5 {
+        let current = ctx
+            .store()
+            .entry(key)
+            .await
+            .map_err(|error| stored(&error))?;
+        let result = match current {
+            Some(entry) => {
+                let latest: TicketHistory = serde_json::from_value(entry.value)
+                    .map_err(|error| ModuleError::other(error.to_string()))?;
+                if latest.status == HistoryStatus::Closed || latest.attempt > history.attempt {
+                    return Err(ModuleError::other("ticket history was superseded"));
+                }
+                ctx.store()
+                    .replace(
+                        key,
+                        history,
+                        Expect::Revision(entry.revision),
+                        Some(Duration::from_hours(24 * 365)),
+                    )
+                    .await
+            }
+            None => {
+                ctx.store()
+                    .replace(
+                        key,
+                        history,
+                        Expect::Missing,
+                        Some(Duration::from_hours(24 * 365)),
+                    )
+                    .await
+            }
+        };
+        match result {
+            Ok(_) => return Ok(()),
+            Err(StorageError::Conflict) => {}
+            Err(error) => return Err(stored(&error)),
+        }
+    }
+    Err(ModuleError::other(
+        "ticket history changed while it was being saved",
+    ))
+}
+
+async fn history_by_number(
+    ctx: &EventContext,
+    number: i64,
+) -> Result<Option<TicketHistory>, ModuleError> {
+    let Some((_, entry)) = ctx
+        .store()
+        .list(&history_number_prefix(number), 1)
+        .await
+        .map_err(|error| stored(&error))?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(entry.value)
+        .map(Some)
+        .map_err(|error| ModuleError::other(error.to_string()))
+}
+
+fn history_matches(history: &TicketHistory, query: &str) -> bool {
+    [
+        history.number.to_string(),
+        history.opener.to_string(),
+        history
+            .claimed_by
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        history.closer.map(|id| id.to_string()).unwrap_or_default(),
+    ]
+    .iter()
+    .any(|value| value.contains(query))
+        || history.reason.to_lowercase().contains(query)
+}
+
+fn may_view_history(roles: &[RoleId], can_manage: bool, history: &TicketHistory) -> bool {
+    can_manage
+        || roles
+            .iter()
+            .any(|role| history.staff_roles.contains(&role.get()))
+}
+
+async fn history_page(
+    ctx: &EventContext,
+    history: &TicketHistory,
+    page: u64,
+) -> Result<String, ModuleError> {
+    let start = (page - 1) * HISTORY_DISPLAY_CHARS as u64;
+    let end = start
+        .saturating_add(HISTORY_DISPLAY_CHARS as u64)
+        .min(history.transcript_char_count);
+    let mut chars_before = 0_u64;
+    let mut text = String::new();
+    for index_page in 0..history.transcript_index_pages {
+        let counts: Vec<u32> = ctx
+            .store()
+            .get(&history_index_key(
+                history.channel_id,
+                history.transcript_attempt,
+                index_page as usize,
+            ))
+            .await
+            .map_err(|error| stored(&error))?
+            .ok_or_else(|| ModuleError::other("ticket transcript index is missing"))?;
+        if counts.len() > HISTORY_INDEX_SIZE {
+            return Err(ModuleError::other("ticket transcript index is invalid"));
+        }
+        for (offset, count) in counts.iter().enumerate() {
+            let content_page = index_page as usize * HISTORY_INDEX_SIZE + offset;
+            if content_page >= history.transcript_pages as usize {
+                return Err(ModuleError::other("ticket transcript index is invalid"));
+            }
+            let page_end = chars_before + u64::from(*count);
+            if page_end > start && chars_before < end {
+                let content: String = ctx
+                    .store()
+                    .get(&history_content_key(
+                        history.channel_id,
+                        history.transcript_attempt,
+                        content_page,
+                    ))
+                    .await
+                    .map_err(|error| stored(&error))?
+                    .ok_or_else(|| ModuleError::other("ticket transcript page is missing"))?;
+                if content.chars().count() != *count as usize {
+                    return Err(ModuleError::other("ticket transcript page is invalid"));
+                }
+                let from = start.saturating_sub(chars_before) as usize;
+                let to = (end.min(page_end) - chars_before) as usize;
+                text.extend(content.chars().skip(from).take(to - from));
+            }
+            chars_before = page_end;
+            if chars_before >= end {
+                break;
+            }
+        }
+        if chars_before >= end {
+            break;
+        }
+    }
+    if text.chars().count() != (end - start) as usize {
+        return Err(ModuleError::other("ticket transcript is incomplete"));
+    }
+    Ok(text)
+}
+
+async fn mark_history_closed(
+    ctx: &EventContext,
+    history: &TicketHistory,
+) -> Result<(), ModuleError> {
+    let key = history_key(history.number, ChannelId::new(history.channel_id));
+    for _ in 0..5 {
+        let entry = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+            .ok_or_else(|| ModuleError::other("ticket history is missing"))?;
+        let mut latest: TicketHistory = serde_json::from_value(entry.value)
+            .map_err(|error| ModuleError::other(error.to_string()))?;
+        if latest.status == HistoryStatus::Closed {
+            return Ok(());
+        }
+        latest.status = HistoryStatus::Closed;
+        latest.closed = ctx.now();
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &latest,
+                Expect::Revision(entry.revision),
+                Some(Duration::from_hours(24 * 365)),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(StorageError::Conflict) => {}
+            Err(error) => return Err(stored(&error)),
+        }
+    }
+    Err(ModuleError::other(
+        "ticket history changed while it was closing",
+    ))
+}
+
+async fn discard_history_generation(ctx: &EventContext, history: &TicketHistory) {
+    remove_history_generation(
+        ctx,
+        history.channel_id,
+        history.transcript_attempt,
+        history.transcript_pages,
+        history.transcript_index_pages,
+    )
+    .await;
+}
 
 /// Takes the ticket for closing, against the revision read: whoever writes first closes it, and a
 /// claim that was read before it cannot be written after it.
@@ -858,8 +1372,6 @@ async fn forget(
     Ok(())
 }
 
-/// Saves the transcript, then deletes the channel; a failed deletion is tried again later.
-/// A transcript that cannot be sent keeps the ticket open.
 async fn finish(
     ctx: &EventContext,
     channel: ChannelId,
@@ -876,49 +1388,141 @@ async fn finish(
     };
     let config: Config = ctx.parse_config()?;
     let config = config.for_ticket(&ticket);
-    let file = match config.log() {
-        Some(log) => match transcript(ctx, channel, &ticket).await {
-            Ok(text) => Some((log, text)),
-            Err(error) => {
-                reopen(ctx, &key).await;
-                return Err(error);
-            }
-        },
-        None => None,
-    };
-    if let Some((log, text)) = file {
-        let note = ctx.t_in(
-            ctx.locale,
-            "tickets-closed-log",
-            &Args::new()
-                .with("number", ticket.number)
-                .with("opener", format!("<@{}>", ticket.opener))
-                .with(
-                    "closer",
-                    closer.map_or_else(|| "-".to_owned(), |user| format!("<@{user}>")),
-                )
-                .with("reason", reason.to_owned()),
-        );
-        let sent = ctx
+    let archive_key = history_key(ticket.number, channel);
+    let mut previous = ctx
+        .store()
+        .get::<TicketHistory>(&archive_key)
+        .await
+        .map_err(|error| stored(&error))?;
+    if previous
+        .as_ref()
+        .is_some_and(|history| history.status == HistoryStatus::Closed)
+    {
+        match ctx
             .api
-            .execute(Action::PostMessage {
-                channel_id: log,
-                message_id: None,
-                reply_to: None,
-                content: Some(note),
-                embeds: Vec::new(),
-                components: Vec::new(),
-                files: vec![FileUpload {
-                    filename: format!("ticket-{:04}.txt", ticket.number),
-                    data: text.into_bytes(),
-                }],
+            .execute(Action::DeleteChannel {
+                channel_id: channel,
+                reason: Reason::truncated(reason),
             })
-            .await;
-        if let Err(error) = sent {
-            // The transcript is not lost: the ticket stays open.
-            reopen(ctx, &key).await;
+            .await
+        {
+            Ok(_) | Err(DiscordError::NotFound) => {}
+            Err(error) => return Err(stored(&error)),
+        }
+        forget(ctx, channel, &ticket).await?;
+        return Ok(Closed::Done);
+    }
+    let attempt = ticket.closing.unwrap_or_else(|| ctx.now());
+    let history = match transcript(ctx, channel, &ticket).await {
+        Ok((text, transcript_truncated, transcript_messages)) => {
+            let history_text = history_transcript(ctx, &text, &ticket.form_answers);
+            let history_text = history_text.as_deref().unwrap_or(&text);
+            let history = match save_history(
+                ctx,
+                channel,
+                &ticket,
+                &config,
+                closer,
+                reason,
+                attempt,
+                Some((&history_text, transcript_truncated, transcript_messages)),
+            )
+            .await
+            {
+                Ok(history) => history,
+                Err(error) => {
+                    reopen(ctx, &key, attempt).await;
+                    return Err(error);
+                }
+            };
+            let current: Option<Ticket> = ctx
+                .store()
+                .get(&key)
+                .await
+                .map_err(|error| stored(&error))?;
+            let Some(current) = current else {
+                return Ok(Closed::Unknown);
+            };
+            if current.closing != Some(attempt) {
+                return Ok(Closed::BusyUntil(
+                    current
+                        .closing
+                        .map_or_else(|| ctx.now(), |since| since + CLOSING_WAIT),
+                ));
+            }
+            if let Some(old) = previous
+                .as_ref()
+                .filter(|old| old.transcript_attempt != history.transcript_attempt)
+            {
+                discard_history_generation(ctx, old).await;
+            }
+            if let Some(log) = config.log() {
+                let note = ctx.t_in(
+                    ctx.locale,
+                    "tickets-closed-log",
+                    &Args::new()
+                        .with("number", ticket.number)
+                        .with("opener", format!("<@{}>", ticket.opener))
+                        .with(
+                            "closer",
+                            closer.map_or_else(|| "-".to_owned(), |user| format!("<@{user}>")),
+                        )
+                        .with("reason", reason.to_owned()),
+                );
+                let sent = ctx
+                    .api
+                    .execute(Action::PostMessage {
+                        channel_id: log,
+                        message_id: None,
+                        reply_to: None,
+                        content: Some(note),
+                        embeds: Vec::new(),
+                        components: Vec::new(),
+                        files: vec![FileUpload {
+                            filename: format!("ticket-{:04}.txt", ticket.number),
+                            data: text.into_bytes(),
+                        }],
+                    })
+                    .await;
+                if let Err(error) = sent {
+                    reopen(ctx, &key, attempt).await;
+                    return Err(stored(&error));
+                }
+            }
+            history
+        }
+        Err(DiscordError::NotFound) => {
+            let Some(mut history) = previous
+                .take()
+                .filter(|history| history.status == HistoryStatus::Closing)
+            else {
+                reopen(ctx, &key, attempt).await;
+                return Err(stored(&DiscordError::NotFound));
+            };
+            history.attempt = attempt;
+            history.closed = ctx.now();
+            store_history_record(ctx, &archive_key, &history).await?;
+            history
+        }
+        Err(error) => {
+            reopen(ctx, &key, attempt).await;
             return Err(stored(&error));
         }
+    };
+    let current: Option<Ticket> = ctx
+        .store()
+        .get(&key)
+        .await
+        .map_err(|error| stored(&error))?;
+    let Some(current) = current else {
+        return Ok(Closed::Unknown);
+    };
+    if current.closing != Some(attempt) {
+        return Ok(Closed::BusyUntil(
+            current
+                .closing
+                .map_or_else(|| ctx.now(), |since| since + CLOSING_WAIT),
+        ));
     }
     match ctx
         .api
@@ -928,17 +1532,20 @@ async fn finish(
         })
         .await
     {
-        Ok(_) | Err(closure_core::error::DiscordError::NotFound) => {}
-        // The entry is kept (marked as closing): the close is tried again.
+        Ok(_) | Err(DiscordError::NotFound) => {}
         Err(error) => return Err(stored(&error)),
     }
+    mark_history_closed(ctx, &history).await?;
     forget(ctx, channel, &ticket).await?;
     Ok(Closed::Done)
 }
 
 /// A close that could not finish: the ticket is open again.
-async fn reopen(ctx: &EventContext, key: &str) {
+async fn reopen(ctx: &EventContext, key: &str, attempt: i64) {
     if let Ok(Some(mut ticket)) = ctx.store().get::<Ticket>(key).await {
+        if ticket.closing != Some(attempt) {
+            return;
+        }
         ticket.closing = None;
         let _ = ctx
             .store()
@@ -1133,6 +1740,180 @@ async fn approve_close_request(cx: ComponentCx) -> Result<(), UserError> {
 
 async fn reject_close_request(cx: ComponentCx) -> Result<(), UserError> {
     close_request_decision(cx, false).await
+}
+
+/// shortcut: searches metadata in the newest 1,000 tickets only; add transcript indexing for message-text search.
+
+async fn search_history(cx: CommandCx, args: SearchHistory) -> Result<(), UserError> {
+    let query = args.query.trim().to_lowercase();
+    if query.is_empty() {
+        return cx
+            .reply_private_t("tickets-history-search-empty", &Args::new())
+            .await;
+    }
+    let entries = cx
+        .ctx()
+        .store()
+        .list(HISTORY_PREFIX, HISTORY_LIMIT)
+        .await
+        .map_err(|error| failed(&error))?;
+    let roles = cx.actor().await.roles;
+    let can_manage = cx.require("tickets.manage").await.is_ok();
+    let mut matches = Vec::new();
+    for (_, entry) in entries {
+        let history: TicketHistory =
+            serde_json::from_value(entry.value).map_err(|error| failed(&error))?;
+        if history.version == 1
+            && history.status == HistoryStatus::Closed
+            && history_matches(&history, &query)
+            && may_view_history(&roles, can_manage, &history)
+        {
+            matches.push(history);
+        }
+    }
+    let shown = matches.len().min(HISTORY_RESULTS);
+    if matches.is_empty() {
+        return cx
+            .reply_private_t(
+                "tickets-history-search-none",
+                &Args::new().with("limit", HISTORY_LIMIT as u64),
+            )
+            .await;
+    }
+    let results = matches
+        .iter()
+        .take(HISTORY_RESULTS)
+        .map(|history| {
+            let reason = history.reason.replace('\n', " ").replace('\r', " ");
+            let reason = if reason.chars().count() > 32 {
+                format!("{}…", reason.chars().take(32).collect::<String>())
+            } else {
+                reason
+            };
+            cx.t(
+                "tickets-history-search-result",
+                &Args::new()
+                    .with("number", history.number)
+                    .with("opener", format!("<@{}>", history.opener))
+                    .with(
+                        "closer",
+                        history
+                            .closer
+                            .map_or_else(|| "-".to_owned(), |id| format!("<@{id}>")),
+                    )
+                    .with("closed", format!("<t:{}:R>", history.closed))
+                    .with("reason", reason),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    cx.reply_private_t(
+        "tickets-history-search-results",
+        &Args::new()
+            .with("limit", HISTORY_LIMIT as u64)
+            .with("count", matches.len() as u64)
+            .with("shown", shown as u64)
+            .with("results", results),
+    )
+    .await
+}
+
+async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError> {
+    if args.number <= 0 {
+        return cx
+            .reply_private_t("tickets-history-not-found", &Args::new())
+            .await;
+    }
+    let ctx = cx.ctx();
+    let history = match history_by_number(ctx, args.number).await {
+        Ok(Some(history))
+            if history.version == 1
+                && history.number == args.number
+                && history.status == HistoryStatus::Closed =>
+        {
+            history
+        }
+        Ok(_) => {
+            return cx
+                .reply_private_t("tickets-history-not-found", &Args::new())
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                number = args.number,
+                "could not read ticket history"
+            );
+            return cx
+                .reply_private_t("tickets-history-unavailable", &Args::new())
+                .await;
+        }
+    };
+    let roles = cx.actor().await.roles;
+    let can_manage = cx.require("tickets.manage").await.is_ok();
+    if !may_view_history(&roles, can_manage, &history) {
+        return cx
+            .reply_private_t("tickets-history-not-found", &Args::new())
+            .await;
+    }
+    if history.transcript_pages == 0 || history.transcript_char_count == 0 {
+        return cx
+            .reply_private_t(
+                "tickets-history-no-transcript",
+                &Args::new().with("number", history.number),
+            )
+            .await;
+    }
+    let requested_page = args.page.unwrap_or(1);
+    let total_pages = history
+        .transcript_char_count
+        .saturating_add(HISTORY_DISPLAY_CHARS as u64 - 1)
+        / HISTORY_DISPLAY_CHARS as u64;
+    if requested_page <= 0 || requested_page as u64 > total_pages {
+        return cx
+            .reply_private_t(
+                "tickets-history-page-invalid",
+                &Args::new().with("pages", total_pages),
+            )
+            .await;
+    }
+    let page = requested_page as u64;
+    let text = match history_page(ctx, &history, page).await {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                channel_id = history.channel_id,
+                page,
+                "could not read a ticket transcript page"
+            );
+            return cx
+                .reply_private_t("tickets-history-unavailable", &Args::new())
+                .await;
+        }
+    };
+    let notice = if history.transcript_truncated {
+        cx.t(
+            "tickets-history-incomplete",
+            &Args::new().with("count", u64::from(history.transcript_messages)),
+        )
+    } else {
+        String::new()
+    };
+    let content = if notice.is_empty() {
+        text
+    } else {
+        format!("{notice}\n{text}")
+    };
+    cx.reply_private_t(
+        "tickets-history-page",
+        &Args::new()
+            .with("number", history.number)
+            .with("page", page)
+            .with("pages", total_pages)
+            .with("content", content),
+    )
+    .await
 }
 
 async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
@@ -1699,6 +2480,8 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<PanelArgs>::new("panel")
                         .requires("tickets.manage")
                         .handler(panel),
+                    Command::<SearchHistory>::new("search").handler(search_history),
+                    Command::<ViewHistory>::new("history").handler(view_history),
                     Command::<Close>::new("close")
                         .requires("tickets.use")
                         .handler(close_command),
