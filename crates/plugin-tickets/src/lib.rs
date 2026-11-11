@@ -169,7 +169,7 @@ struct Idle {
 }
 
 #[derive(CommandArgs)]
-struct Panel {
+struct PanelArgs {
     /// The panel ID; omit for the default panel
     #[arg(max_length = 32)]
     panel: Option<String>,
@@ -395,7 +395,7 @@ fn overwrite(target: OverwriteTarget, allow: Permissions, deny: Permissions) -> 
     }
 }
 
-async fn panel(cx: CommandCx, args: Panel) -> Result<(), UserError> {
+async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
     let config: Config = cx.config()?;
     let panel = args.panel.unwrap_or_default();
     if !panel.is_empty() {
@@ -1696,7 +1696,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .group(
                 "ticket",
                 [
-                    Command::<Panel>::new("panel")
+                    Command::<PanelArgs>::new("panel")
                         .requires("tickets.manage")
                         .handler(panel),
                     Command::<Close>::new("close")
