@@ -1490,6 +1490,68 @@ async fn an_open_ticket_limit_is_shared_across_named_panels_per_user() {
 }
 
 #[tokio::test]
+async fn zero_max_open_is_unlimited_but_existing_open_tickets_count_when_limited() {
+    let harness = harness();
+    let schema = crate::schema();
+    assert_eq!(schema["properties"]["max_open"]["minimum"], 0);
+    assert_eq!(schema["properties"]["max_open"]["maximum"], u32::MAX);
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "max_open": 0
+    }));
+
+    harness.click(press("open", MEMBER)).await.unwrap();
+    harness.click(press("open", MEMBER)).await.unwrap();
+    assert_eq!(created(&harness).len(), 2);
+
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "max_open": 1
+    }));
+    let blocked = harness.click(press("open", MEMBER)).await.unwrap();
+    assert!(
+        blocked.last().unwrap().content.contains("open already"),
+        "{blocked:?}"
+    );
+    assert_eq!(created(&harness).len(), 2);
+
+    harness.click(press("open", OTHER)).await.unwrap();
+    assert_eq!(created(&harness).len(), 3);
+}
+
+#[tokio::test]
+async fn staff_can_open_over_the_limit_but_are_limited_after_losing_staff_status() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "max_open": 1
+    }));
+
+    harness
+        .click(press("open", MEMBER).roles([STAFF_ROLE]))
+        .await
+        .unwrap();
+    harness
+        .click(press("open", MEMBER).roles([STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert_eq!(created(&harness).len(), 2);
+
+    harness
+        .click(press("open", MEMBER).roles([MODERATOR]))
+        .await
+        .unwrap();
+    assert_eq!(created(&harness).len(), 3);
+
+    let blocked = harness.click(press("open", MEMBER)).await.unwrap();
+    assert!(
+        blocked.last().unwrap().content.contains("open already"),
+        "{blocked:?}"
+    );
+    assert_eq!(created(&harness).len(), 3);
+}
+
+#[tokio::test]
 async fn a_named_panel_ticket_uses_its_staff_roles_for_member_changes() {
     let harness = harness();
     harness.set_config(json!({

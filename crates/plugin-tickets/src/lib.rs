@@ -464,7 +464,7 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
         .score_add(OPEN, user.get(), 1)
         .await
         .map_err(|e| failed(&e))?;
-    if open > i64::from(config.max_open) {
+    if config.max_open > 0 && open > i64::from(config.max_open) && !is_staff(&cx, &config).await {
         give_back(ctx, user.get()).await;
         return say(
             &cx,
@@ -1626,8 +1626,8 @@ fn schema() -> serde_json::Value {
             },
             "max_open": {
                 "type": "integer",
-                "minimum": 1,
-                "maximum": 20,
+                "minimum": 0,
+                "maximum": u32::MAX,
                 "description": "config-tickets-max_open",
                 "x-ui": { "level": "basic" }
             },
