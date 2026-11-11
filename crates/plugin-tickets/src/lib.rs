@@ -1689,7 +1689,7 @@ async fn add_note(cx: CommandCx, args: NoteArgs) -> Result<(), UserError> {
             }
         };
         let note = StaffNote {
-            author: cx.user().id,
+            author: cx.user().id.get(),
             created: cx.now(),
             text: text.to_owned(),
         };
