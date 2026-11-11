@@ -166,6 +166,8 @@ struct Ticket {
     #[serde(default)]
     panel: Option<NamedPanel>,
     #[serde(default)]
+    staff_roles: Vec<u64>,
+    #[serde(default)]
     form_answers: Vec<(String, String)>,
 }
 
@@ -479,7 +481,7 @@ async fn open(cx: ComponentCx) -> Result<(), UserError> {
             .only_for(cx.user().id)
             .data(format!(
                 "{panel_id}:{:016x}",
-                question_revision(&config.questions)
+                ticket_config_revision(&config)
             ))
             .encode(cx.module()),
         cx.t("tickets-form-title", &Args::new()),
@@ -508,10 +510,18 @@ fn valid_questions(questions: &[String]) -> bool {
         })
 }
 
-// shortcut: 64-bit question fingerprint, use a stored snapshot if collision risk grows.
-fn question_revision(questions: &[String]) -> u64 {
+// shortcut: 64-bit fingerprint of effective ticket config, use a stored snapshot if collision risk grows.
+fn ticket_config_revision(config: &Config) -> u64 {
+    let mut staff = config.staff();
+    staff.sort_unstable();
+    staff.dedup();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    questions.hash(&mut hasher);
+    config.category().hash(&mut hasher);
+    staff.hash(&mut hasher);
+    config.log().hash(&mut hasher);
+    config.max_open.hash(&mut hasher);
+    config.close_after_days.hash(&mut hasher);
+    config.questions.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -541,7 +551,7 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
     if !valid_questions(&config.questions) {
         return Err(UserError::message("tickets-form-invalid"));
     }
-    if config.questions.is_empty() || revision != question_revision(&config.questions) {
+    if config.questions.is_empty() || revision != ticket_config_revision(&config) {
         return cx
             .reply_private_t("tickets-form-changed", &Args::new())
             .await;
@@ -663,6 +673,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
         closing: None,
         close_request: None,
         panel,
+        staff_roles: staff.iter().map(|role| role.get()).collect(),
         form_answers: answers.clone(),
     };
     let ticket_size = match ticket_storage_size(&ticket) {
@@ -1382,10 +1393,24 @@ async fn ticket_answers(cx: CommandCx, _: ()) -> Result<(), UserError> {
     else {
         return Err(UserError::message("tickets-not-a-ticket"));
     };
-    let config: Config = cx.config()?;
-    let config = config.for_ticket(&ticket);
-    if cx.user().id.get() != ticket.opener && !is_staff(&cx, &config).await {
-        return Err(UserError::message("tickets-form-opener-only"));
+    if cx.user().id.get() != ticket.opener {
+        let staff_roles = if ticket.staff_roles.is_empty() {
+            let config: Config = cx.config()?;
+            config.for_ticket(&ticket).staff()
+        } else {
+            ticket
+                .staff_roles
+                .iter()
+                .copied()
+                .map(RoleId::new)
+                .collect()
+        };
+        let actor = cx.actor().await;
+        if !actor.roles.iter().any(|role| staff_roles.contains(role))
+            && cx.require("tickets.manage").await.is_err()
+        {
+            return Err(UserError::message("tickets-form-opener-only"));
+        }
     }
     let Some(embed) = form_answers_embed(&cx, &ticket.form_answers)? else {
         return cx
