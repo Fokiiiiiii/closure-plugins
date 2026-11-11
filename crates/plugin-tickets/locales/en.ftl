@@ -17,6 +17,8 @@ subcommand-ticket-transfer = transfer
     .description = Give this ticket to another staff member
 subcommand-ticket-rename = rename
     .description = Rename this ticket channel
+subcommand-ticket-stats = stats
+    .description = Show the current ticket counts
 subcommand-ticket-note = note
     .description = Add a private staff note to this ticket
 subcommand-ticket-notes = notes
@@ -45,7 +47,7 @@ option-ticket-notes-ticket = ticket
     .description = The ticket channel ID
 option-ticket-notes-page = page
     .description = The page number to view
-permission-tickets-manage = Manage panels, ticket members, assignees and names
+permission-tickets-manage = Manage panels, ticket members, assignees and names; view stats
 permission-tickets-use = Close a ticket of your own
 config-tickets-panels = Named ticket panels.
 config-tickets-panel-id = Panel ID: up to 32 letters, numbers, underscores or hyphens.
@@ -87,6 +89,14 @@ tickets-notes-page-not-found = That staff notes page is not available.
 tickets-notes-page = Ticket #{ $number } notes · page { $page } of { $pages }
 tickets-note-entry = <t:{ $created }:f> · <@{ $author }>
 tickets-staff-only = Only the staff can do that.
+tickets-stats =
+    Total: { $total }
+    Open: { $open }
+    Closing: { $closing }
+    Assigned: { $assigned }
+    Unassigned: { $unassigned }
+tickets-stats-limited = At least 1,000 tickets are recorded; the breakdown is omitted.
+tickets-stats-manage-only = Only ticket managers can view these statistics.
 tickets-not-a-ticket = This is not an open ticket.
 tickets-not-yours = Only the member who opened this ticket, or the staff, can close it.
 tickets-closing = Closing the ticket.

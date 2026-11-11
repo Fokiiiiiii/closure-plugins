@@ -2119,3 +2119,75 @@ async fn staff_notes_can_be_added_to_a_ticket_with_the_older_saved_shape() {
         .unwrap();
     assert_eq!(page.notes[0].text, "legacy ticket note");
 }
+
+#[tokio::test]
+async fn ticket_stats_show_current_counts_only_to_managers() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    seed_ticket(&harness, HERE + 1, OTHER).await;
+    assign_ticket(&harness, HERE + 1, OTHER).await;
+    seed_ticket(&harness, HERE + 2, OTHER).await;
+    let closing_key = format!("ticket:{}", HERE + 2);
+    let mut closing: Ticket = harness.store().get(&closing_key).await.unwrap().unwrap();
+    closing.closing = Some(1);
+    harness.store().set(&closing_key, &closing).await.unwrap();
+
+    let denied = harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("stats")
+                .roles([STAFF_ROLE])
+                .user(OTHER),
+        )
+        .await
+        .unwrap();
+    assert!(
+        denied
+            .last()
+            .unwrap()
+            .content
+            .contains("Only ticket managers can view these statistics"),
+        "{denied:?}"
+    );
+
+    let stats = harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("stats")
+                .roles([MODERATOR])
+                .user(MODERATOR),
+        )
+        .await
+        .unwrap();
+    let content = &stats.last().unwrap().content;
+    for expected in [
+        "Total: 3",
+        "Open: 2",
+        "Closing: 1",
+        "Assigned: 1",
+        "Unassigned: 2",
+    ] {
+        assert!(content.contains(expected), "{stats:?}");
+    }
+}
+
+#[tokio::test]
+async fn ticket_stats_omit_partial_counts_at_the_store_limit() {
+    let harness = harness();
+    for channel in 100..1_100 {
+        seed_ticket(&harness, channel, MEMBER).await;
+    }
+
+    let stats = harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("stats")
+                .roles([MODERATOR])
+                .user(MODERATOR),
+        )
+        .await
+        .unwrap();
+    let content = &stats.last().unwrap().content;
+    assert!(content.contains("At least 1,000 tickets"), "{stats:?}");
+    assert!(!content.contains("Open:"), "{stats:?}");
+}

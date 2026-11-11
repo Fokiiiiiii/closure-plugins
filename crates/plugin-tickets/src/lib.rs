@@ -42,6 +42,7 @@ const NOTES_PER_PAGE: usize = 8;
 const NOTE_MAX_CHARS: usize = 300;
 const NOTE_PAGE_LIMIT: usize = 1_000;
 const NOTE_RETENTION: Duration = Duration::from_hours(24 * 365);
+const STATS_LIMIT: usize = 1_000;
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
@@ -214,6 +215,9 @@ struct CloseRequestArgs {
 
 #[derive(CommandArgs)]
 struct Unclaim {}
+
+#[derive(CommandArgs)]
+struct StatsArgs {}
 
 #[derive(CommandArgs)]
 struct Member {
@@ -394,6 +398,54 @@ async fn is_staff_command(cx: &CommandCx, config: &Config) -> bool {
     let roles = config.staff();
     actor.roles.iter().any(|role| roles.contains(role))
         || cx.require("tickets.manage").await.is_ok()
+}
+
+async fn stats_command(cx: CommandCx, _: StatsArgs) -> Result<(), UserError> {
+    if cx.require("tickets.manage").await.is_err() {
+        return cx
+            .reply_private_t("tickets-stats-manage-only", &Args::new())
+            .await;
+    }
+    let tickets = cx
+        .ctx()
+        .store()
+        .list("ticket:", STATS_LIMIT)
+        .await
+        .map_err(|error| failed(&error))?;
+    if tickets.len() >= STATS_LIMIT {
+        return cx
+            .reply_private_t("tickets-stats-limited", &Args::new())
+            .await;
+    }
+
+    let mut open = 0_i64;
+    let mut closing = 0_i64;
+    let mut assigned = 0_i64;
+    let mut unassigned = 0_i64;
+    for (_, entry) in tickets {
+        let ticket: Ticket = serde_json::from_value(entry.value).map_err(|error| failed(&error))?;
+        if ticket.closing.is_some() {
+            closing += 1;
+        } else {
+            open += 1;
+        }
+        if ticket.claimed_by.is_some() {
+            assigned += 1;
+        } else {
+            unassigned += 1;
+        }
+    }
+
+    cx.reply_private_t(
+        "tickets-stats",
+        &Args::new()
+            .with("total", open + closing)
+            .with("open", open)
+            .with("closing", closing)
+            .with("assigned", assigned)
+            .with("unassigned", unassigned),
+    )
+    .await
 }
 
 async fn is_guild_owner_or_admin(
@@ -2028,6 +2080,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<Unclaim>::new("unclaim").handler(unclaim),
                     Command::<Member>::new("transfer").handler(transfer),
                     Command::<Rename>::new("rename").handler(rename),
+                    Command::<StatsArgs>::new("stats").handler(stats_command),
                     Command::<NoteArgs>::new("note").handler(add_note),
                     Command::<NotesArgs>::new("notes").handler(list_notes),
                 ],

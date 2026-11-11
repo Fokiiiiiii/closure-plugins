@@ -17,6 +17,8 @@ subcommand-ticket-transfer = transfer
     .description = このチケットを別のスタッフに引き継ぐ
 subcommand-ticket-rename = rename
     .description = このチケットのチャンネル名を変更する
+subcommand-ticket-stats = stats
+    .description = 現在のチケット数を表示する
 subcommand-ticket-note = note
     .description = このチケットにスタッフ専用メモを追加する
 subcommand-ticket-notes = notes
@@ -45,7 +47,7 @@ option-ticket-notes-ticket = ticket
     .description = チケットのチャンネルID
 option-ticket-notes-page = page
     .description = 表示するページ番号
-permission-tickets-manage = パネルの投稿、担当・参加者・チケット名の管理
+permission-tickets-manage = パネルの投稿、担当・参加者・チケット名の管理、統計の閲覧
 permission-tickets-use = 自分のチケットを閉じる
 config-tickets-panels = 名前付きの受付パネル。
 config-tickets-panel-id = パネルID（半角英数字・_・-、32文字まで）。
@@ -87,6 +89,14 @@ tickets-notes-page-not-found = 指定したメモページはありません。
 tickets-notes-page = チケット #{ $number } のメモ · { $page } / { $pages } ページ
 tickets-note-entry = <t:{ $created }:f> · <@{ $author }>
 tickets-staff-only = スタッフだけが行えます。
+tickets-stats =
+    総数: { $total }件
+    オープン: { $open }件
+    クローズ処理中: { $closing }件
+    担当あり: { $assigned }件
+    未担当: { $unassigned }件
+tickets-stats-limited = チケットは1,000件以上あります。内訳は省略しました。
+tickets-stats-manage-only = 統計を見られるのはチケット管理者だけです。
 tickets-not-a-ticket = ここは開いているチケットではありません。
 tickets-not-yours = チケットを閉じられるのは、開いたメンバーかスタッフだけです。
 tickets-closing = チケットを閉じます。
