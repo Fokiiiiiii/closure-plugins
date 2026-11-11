@@ -1,8 +1,6 @@
 //! Ticket panel, participant-role, and reply-waiting operations.
 //! Ticket state changes are CAS-written and use ticket_ttl so close/history fences survive.
 
-use std::time::Duration;
-
 use closure_core::action::{
     Action, ChannelPatch, MentionPolicy, Outcome, OverwriteSpec, OverwriteTarget, Reason,
 };
@@ -18,7 +16,7 @@ use twilight_model::guild::Permissions;
 
 use super::{
     Config, NamedPanel, TICKET_PERMISSIONS, Ticket, ensure_category, failed, id_of,
-    is_staff_command, stored, thread, ticket_key, ticket_setup_error, ticket_ttl,
+    is_ticket_staff, stored, thread, ticket_key, ticket_setup_error, ticket_ttl,
 };
 
 const OPERATION_IDS: &str = "ticket-operation-ids";
@@ -1205,10 +1203,15 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
     if ticket.closed || ticket.closing.is_some() {
         return Err(UserError::message("tickets-not-a-ticket"));
     }
-    if !is_staff_command(&cx, &config.for_ticket(&ticket)).await {
+    if !is_ticket_staff(&cx, &ticket, &config.for_ticket(&ticket)).await {
         return Err(UserError::message("tickets-staff-only"));
     }
     cx.defer(true).await?;
+    if !super::teams_survey::valid_thread_staff_team_configuration(&config) {
+        return cx
+            .reply_private_t("tickets-team-thread-conflict", &Args::new())
+            .await;
+    }
     if resume_pending(ctx, channel)
         .await
         .map_err(|error| failed(&error))?
@@ -1228,7 +1231,7 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
         return Err(UserError::message("tickets-not-a-ticket"));
     }
     let current = config.for_ticket(&ticket);
-    if !is_staff_command(&cx, &current).await {
+    if !is_ticket_staff(&cx, &ticket, &current).await {
         return Err(UserError::message("tickets-staff-only"));
     }
     let (panel, settings) = if let Some(id) = args.panel {
@@ -1304,7 +1307,7 @@ async fn change_role(cx: CommandCx, args: RoleArgs, add: bool) -> Result<(), Use
     if ticket.closed || ticket.closing.is_some() {
         return Err(UserError::message("tickets-not-a-ticket"));
     }
-    if !is_staff_command(&cx, &config.for_ticket(&ticket)).await {
+    if !is_ticket_staff(&cx, &ticket, &config.for_ticket(&ticket)).await {
         return Err(UserError::message("tickets-staff-only"));
     }
     if ticket.thread {
@@ -1327,7 +1330,7 @@ async fn change_role(cx: CommandCx, args: RoleArgs, add: bool) -> Result<(), Use
         .map_err(|error| failed(&error))?
         .ok_or_else(|| UserError::message("tickets-not-a-ticket"))?;
     let current = config.for_ticket(&ticket);
-    if !is_staff_command(&cx, &current).await {
+    if !is_ticket_staff(&cx, &ticket, &current).await {
         return Err(UserError::message("tickets-staff-only"));
     }
     if ticket.closed || ticket.closing.is_some() {
@@ -1436,7 +1439,7 @@ pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), User
                 .reply_private_t("tickets-operation-pending", &Args::new())
                 .await;
         }
-        if !is_staff_command(&cx, &config.for_ticket(&ticket)).await {
+        if !is_ticket_staff(&cx, &ticket, &config.for_ticket(&ticket)).await {
             return Err(UserError::message("tickets-staff-only"));
         }
         let changed = ticket.waiting_for_reply != args.waiting;
