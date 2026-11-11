@@ -1648,9 +1648,9 @@ fn schema() -> serde_json::Value {
                     "required": ["id"],
                     "properties": {
                         "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,32}$", "description": "config-tickets-panel-id" },
-                        "category": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-category" },
+                        "category": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-category", "x-ui": { "widget": "channel", "channel_kinds": ["category"] } },
                         "staff_roles": { "type": "array", "maxItems": 20, "items": { "type": "string", "pattern": "^[0-9]{1,20}$" }, "description": "config-tickets-panel-staff" },
-                        "log_channel": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-log_channel" },
+                        "log_channel": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-log_channel", "x-ui": { "widget": "channel" } },
                         "close_after_days": { "type": "integer", "minimum": 0, "maximum": 365, "description": "config-tickets-close_after_days" }
                     }
                 }
