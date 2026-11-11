@@ -12,15 +12,13 @@ use closure_core::module::EventContext;
 use closure_core::storage::{Expect, StorageError};
 use closure_sdk::{Args, CommandArgs, CommandCx, UserError};
 use serde::{Deserialize, Serialize};
-use twilight_model::channel::permission_overwrite::{
-    PermissionOverwrite, PermissionOverwriteType,
-};
 use twilight_model::channel::ChannelType;
+use twilight_model::channel::permission_overwrite::{PermissionOverwrite, PermissionOverwriteType};
 use twilight_model::guild::Permissions;
 
 use super::{
-    Config, NamedPanel, Ticket, ensure_category, failed, id_of, is_staff_command, stored,
-    ticket_key, ticket_setup_error, ticket_ttl, thread, TICKET_PERMISSIONS,
+    Config, NamedPanel, TICKET_PERMISSIONS, Ticket, ensure_category, failed, id_of,
+    is_staff_command, stored, thread, ticket_key, ticket_setup_error, ticket_ttl,
 };
 
 const OPERATION_IDS: &str = "ticket-operation-ids";
@@ -90,8 +88,9 @@ pub(super) struct WaitingArgs {
 
 fn operation_token(operation: &PendingOperation) -> i64 {
     match operation {
-        PendingOperation::Panel { token, .. }
-        | PendingOperation::ParticipantRole { token, .. } => *token,
+        PendingOperation::Panel { token, .. } | PendingOperation::ParticipantRole { token, .. } => {
+            *token
+        }
     }
 }
 
@@ -132,8 +131,7 @@ fn role_access(overwrites: &[PermissionOverwrite], role: RoleId) -> Option<RoleA
     overwrites
         .iter()
         .find(|overwrite| {
-            overwrite.kind == PermissionOverwriteType::Role
-                && overwrite.id.get() == role.get()
+            overwrite.kind == PermissionOverwriteType::Role && overwrite.id.get() == role.get()
         })
         .map(|overwrite| RoleAccess {
             role: role.get(),
@@ -168,10 +166,8 @@ fn adjust_access(current: RoleAccess, baseline: RoleAccess, grant: bool) -> Role
         }
     } else {
         RoleAccess {
-            allow: (current.allow & !TICKET_PERMISSIONS)
-                | (baseline.allow & TICKET_PERMISSIONS),
-            deny: (current.deny & !TICKET_PERMISSIONS)
-                | (baseline.deny & TICKET_PERMISSIONS),
+            allow: (current.allow & !TICKET_PERMISSIONS) | (baseline.allow & TICKET_PERMISSIONS),
+            deny: (current.deny & !TICKET_PERMISSIONS) | (baseline.deny & TICKET_PERMISSIONS),
             ..current
         }
     }
@@ -181,7 +177,13 @@ async fn current_channel(
     ctx: &EventContext,
     channel: ChannelId,
 ) -> Result<twilight_model::channel::Channel, UserError> {
-    match ctx.api.execute(Action::GetChannel { channel_id: channel }).await {
+    match ctx
+        .api
+        .execute(Action::GetChannel {
+            channel_id: channel,
+        })
+        .await
+    {
         Ok(Outcome::Channel(found)) => Ok(*found),
         Ok(_) | Err(DiscordError::NotFound) => Err(UserError::message("tickets-not-a-ticket")),
         Err(error) => Err(failed(&error)),
@@ -218,7 +220,10 @@ async fn validate_panel(
     else {
         return Err(UserError::message("tickets-failed"));
     };
-    if roles.iter().any(|role| !known.iter().any(|known| known.id == *role)) {
+    if roles
+        .iter()
+        .any(|role| !known.iter().any(|known| known.id == *role))
+    {
         return Err(UserError::message("tickets-panel-role-unavailable"));
     }
 
@@ -233,10 +238,10 @@ async fn validate_panel(
         }
         let mut old_roles: Vec<_> = ticket.staff_roles.as_ref().map_or_else(
             || {
-                ticket.settings.as_ref().map_or_else(
-                    || panel_roles(settings),
-                    |saved| panel_roles(saved),
-                )
+                ticket
+                    .settings
+                    .as_ref()
+                    .map_or_else(|| panel_roles(settings), |saved| panel_roles(saved))
             },
             |saved| saved.iter().copied().map(RoleId::new).collect(),
         );
@@ -245,13 +250,7 @@ async fn validate_panel(
         if old_roles != roles {
             return Err(UserError::message("tickets-thread-staff-change"));
         }
-        thread::ensure_thread_parent(
-            ctx,
-            parent,
-            &roles,
-            UserId::new(ticket.opener),
-        )
-        .await?;
+        thread::ensure_thread_parent(ctx, parent, &roles, UserId::new(ticket.opener)).await?;
     } else {
         if target_thread.is_some() {
             return Err(UserError::message("tickets-panel-kind-change"));
@@ -267,11 +266,16 @@ async fn validate_panel(
         return Err(UserError::message("tickets-invalid-config"));
     }
     if let Some(log) = settings.log() {
-        match ctx.api.execute(Action::GetChannel { channel_id: log }).await {
+        match ctx
+            .api
+            .execute(Action::GetChannel { channel_id: log })
+            .await
+        {
             Ok(Outcome::Channel(found))
-                if matches!(found.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement) =>
-            {
-            }
+                if matches!(
+                    found.kind,
+                    ChannelType::GuildText | ChannelType::GuildAnnouncement
+                ) => {}
             Ok(_) | Err(DiscordError::NotFound) => {
                 return Err(UserError::message("tickets-log-unavailable"));
             }
@@ -308,7 +312,12 @@ async fn stage(
 ) -> Result<i64, UserError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| failed(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| failed(&error))?
+        else {
             return Err(UserError::message("tickets-not-a-ticket"));
         };
         let mut ticket: Ticket =
@@ -354,16 +363,25 @@ async fn renew_operation(
 ) -> Result<Ticket, ModuleError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Err(ModuleError::other("the ticket no longer exists"));
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
             .map_err(|error| ModuleError::other(error.to_string()))?;
         let Some(operation) = ticket.pending_operation.as_mut() else {
-            return Err(ModuleError::other("the ticket operation is no longer active"));
+            return Err(ModuleError::other(
+                "the ticket operation is no longer active",
+            ));
         };
         if operation_token(operation) != token || ticket.closed || ticket.closing.is_some() {
-            return Err(ModuleError::other("the ticket operation is no longer active"));
+            return Err(ModuleError::other(
+                "the ticket operation is no longer active",
+            ));
         }
         set_lease(operation, token, ctx.now() + OPERATION_LEASE_SECONDS);
         super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
@@ -382,7 +400,9 @@ async fn renew_operation(
             Err(error) => return Err(stored(&error)),
         }
     }
-    Err(ModuleError::other("the ticket changed during its operation"))
+    Err(ModuleError::other(
+        "the ticket changed during its operation",
+    ))
 }
 
 async fn release_operation(ctx: &EventContext, channel: ChannelId, token: i64) {
@@ -432,7 +452,12 @@ pub(super) async fn resume_pending(
     let key = ticket_key(channel);
     let mut claimed = None;
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Ok(None);
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
@@ -441,7 +466,9 @@ pub(super) async fn resume_pending(
             return Ok(None);
         };
         if ticket.closed || ticket.closing.is_some() {
-            return Err(ModuleError::other("a closing ticket has a pending operation"));
+            return Err(ModuleError::other(
+                "a closing ticket has a pending operation",
+            ));
         }
         if operation_lease(operation) > ctx.now() {
             return Ok(Some(operation_lease(operation)));
@@ -472,7 +499,9 @@ pub(super) async fn resume_pending(
         }
     }
     let Some(token) = claimed else {
-        return Err(ModuleError::other("the ticket kept changing during its operation"));
+        return Err(ModuleError::other(
+            "the ticket kept changing during its operation",
+        ));
     };
     run_owned(ctx, channel, token).await?;
     Ok(None)
@@ -498,7 +527,13 @@ async fn operation_channel(
     token: i64,
 ) -> Result<twilight_model::channel::Channel, ModuleError> {
     renew_operation(ctx, channel, token).await?;
-    match ctx.api.execute(Action::GetChannel { channel_id: channel }).await {
+    match ctx
+        .api
+        .execute(Action::GetChannel {
+            channel_id: channel,
+        })
+        .await
+    {
         Ok(Outcome::Channel(found)) => Ok(*found),
         Ok(_) => Err(ModuleError::other("the ticket channel is unavailable")),
         Err(error) => Err(stored(&error)),
@@ -516,7 +551,9 @@ async fn set_role_access(
 ) -> Result<(), ModuleError> {
     let found = operation_channel(ctx, channel, token).await?;
     if found.kind != ChannelType::GuildText {
-        return Err(ModuleError::other("role overwrites apply only to ticket text channels"));
+        return Err(ModuleError::other(
+            "role overwrites apply only to ticket text channels",
+        ));
     }
     let overwrites = found
         .permission_overwrites
@@ -560,7 +597,12 @@ async fn save_panel_baselines(
 ) -> Result<(), ModuleError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Err(ModuleError::other("the ticket no longer exists"));
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
@@ -595,7 +637,9 @@ async fn save_panel_baselines(
             Err(error) => return Err(stored(&error)),
         }
     }
-    Err(ModuleError::other("the ticket changed while saving panel permissions"))
+    Err(ModuleError::other(
+        "the ticket changed while saving panel permissions",
+    ))
 }
 
 async fn save_role_baseline(
@@ -606,7 +650,12 @@ async fn save_role_baseline(
 ) -> Result<(), ModuleError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Err(ModuleError::other("the ticket no longer exists"));
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
@@ -641,7 +690,9 @@ async fn save_role_baseline(
             Err(error) => return Err(stored(&error)),
         }
     }
-    Err(ModuleError::other("the ticket changed while saving role permissions"))
+    Err(ModuleError::other(
+        "the ticket changed while saving role permissions",
+    ))
 }
 
 async fn move_text_ticket(
@@ -653,7 +704,9 @@ async fn move_text_ticket(
 ) -> Result<(), ModuleError> {
     let found = operation_channel(ctx, channel, token).await?;
     if found.kind != ChannelType::GuildText {
-        return Err(ModuleError::other("the ticket channel is not a text channel"));
+        return Err(ModuleError::other(
+            "the ticket channel is not a text channel",
+        ));
     }
     if found.parent_id == parent {
         return Ok(());
@@ -684,12 +737,21 @@ async fn finish_panel(
 ) -> Result<(), ModuleError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Err(ModuleError::other("the ticket no longer exists"));
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
             .map_err(|error| ModuleError::other(error.to_string()))?;
-        if ticket.pending_operation.as_ref().is_none_or(|operation| operation_token(operation) != token) {
+        if ticket
+            .pending_operation
+            .as_ref()
+            .is_none_or(|operation| operation_token(operation) != token)
+        {
             return Err(ModuleError::other("the panel change is no longer active"));
         }
         ticket.panel = panel.clone();
@@ -726,7 +788,9 @@ async fn finish_panel(
             Err(error) => return Err(stored(&error)),
         }
     }
-    Err(ModuleError::other("the ticket changed while saving its panel"))
+    Err(ModuleError::other(
+        "the ticket changed while saving its panel",
+    ))
 }
 
 async fn commit_role(
@@ -739,18 +803,31 @@ async fn commit_role(
 ) -> Result<(), ModuleError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Err(ModuleError::other("the ticket no longer exists"));
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
             .map_err(|error| ModuleError::other(error.to_string()))?;
-        if ticket.pending_operation.as_ref().is_none_or(|operation| operation_token(operation) != token) {
+        if ticket
+            .pending_operation
+            .as_ref()
+            .is_none_or(|operation| operation_token(operation) != token)
+        {
             return Err(ModuleError::other("the role change is no longer active"));
         }
-        ticket.participant_roles.retain(|access| access.role != role.get());
+        ticket
+            .participant_roles
+            .retain(|access| access.role != role.get());
         if add {
             ticket.participant_roles.push(baseline);
-            ticket.participant_roles.sort_unstable_by_key(|access| access.role);
+            ticket
+                .participant_roles
+                .sort_unstable_by_key(|access| access.role);
         }
         ticket.pending_operation = None;
         super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
@@ -769,7 +846,9 @@ async fn commit_role(
             Err(error) => return Err(stored(&error)),
         }
     }
-    Err(ModuleError::other("the ticket changed while saving its participant role"))
+    Err(ModuleError::other(
+        "the ticket changed while saving its participant role",
+    ))
 }
 
 async fn apply_panel_forward(
@@ -824,7 +903,10 @@ async fn apply_panel_forward(
             .iter()
             .map(|role| {
                 if old_roles.contains(role)
-                    || ticket.participant_roles.iter().any(|access| access.role == role.get())
+                    || ticket
+                        .participant_roles
+                        .iter()
+                        .any(|access| access.role == role.get())
                 {
                     saved_role_access(&ticket, *role)
                 } else {
@@ -847,7 +929,11 @@ async fn apply_panel_forward(
     move_text_ticket(ctx, channel, settings.category(), token, &reason).await?;
 
     for role in old_roles.iter().filter(|role| !target_roles.contains(role)) {
-        if ticket.participant_roles.iter().any(|access| access.role == role.get()) {
+        if ticket
+            .participant_roles
+            .iter()
+            .any(|access| access.role == role.get())
+        {
             continue;
         }
         let baseline = ticket
@@ -858,9 +944,17 @@ async fn apply_panel_forward(
             .unwrap_or_else(|| empty_access(*role));
         set_role_access(ctx, channel, *role, baseline, false, token, &reason).await?;
     }
-    finish_panel(ctx, channel, token, panel, &settings, &staff_roles, &baselines).await
+    finish_panel(
+        ctx,
+        channel,
+        token,
+        panel,
+        &settings,
+        &staff_roles,
+        &baselines,
+    )
+    .await
 }
-
 
 async fn mark_panel_rollback(
     ctx: &EventContext,
@@ -869,7 +963,12 @@ async fn mark_panel_rollback(
 ) -> Result<(), ModuleError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Err(ModuleError::other("the ticket no longer exists"));
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
@@ -904,7 +1003,9 @@ async fn mark_panel_rollback(
             Err(error) => return Err(stored(&error)),
         }
     }
-    Err(ModuleError::other("the ticket changed while preparing its rollback"))
+    Err(ModuleError::other(
+        "the ticket changed while preparing its rollback",
+    ))
 }
 
 async fn clear_panel_operation(
@@ -914,13 +1015,24 @@ async fn clear_panel_operation(
 ) -> Result<(), ModuleError> {
     let key = ticket_key(channel);
     for _ in 0..5 {
-        let Some(entry) = ctx.store().entry(&key).await.map_err(|error| stored(&error))? else {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
             return Err(ModuleError::other("the ticket no longer exists"));
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
             .map_err(|error| ModuleError::other(error.to_string()))?;
-        if ticket.pending_operation.as_ref().is_none_or(|operation| operation_token(operation) != token) {
-            return Err(ModuleError::other("the panel operation is no longer active"));
+        if ticket
+            .pending_operation
+            .as_ref()
+            .is_none_or(|operation| operation_token(operation) != token)
+        {
+            return Err(ModuleError::other(
+                "the panel operation is no longer active",
+            ));
         }
         ticket.pending_operation = None;
         super::refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
@@ -939,7 +1051,9 @@ async fn clear_panel_operation(
             Err(error) => return Err(stored(&error)),
         }
     }
-    Err(ModuleError::other("the ticket changed while clearing its panel operation"))
+    Err(ModuleError::other(
+        "the ticket changed while clearing its panel operation",
+    ))
 }
 
 async fn apply_panel_rollback(
@@ -980,17 +1094,14 @@ async fn apply_panel_rollback(
             .unwrap_or_else(|| empty_access(*role));
         set_role_access(ctx, channel, *role, baseline, true, token, &reason).await?;
     }
-    move_text_ticket(
-        ctx,
-        channel,
-        old_parent.map(ChannelId::new),
-        token,
-        &reason,
-    )
-    .await?;
+    move_text_ticket(ctx, channel, old_parent.map(ChannelId::new), token, &reason).await?;
     let target_roles = panel_roles(&settings);
     for role in target_roles.iter().filter(|role| !old_roles.contains(role)) {
-        if ticket.participant_roles.iter().any(|access| access.role == role.get()) {
+        if ticket
+            .participant_roles
+            .iter()
+            .any(|access| access.role == role.get())
+        {
             continue;
         }
         let baseline = baselines
@@ -1016,16 +1127,13 @@ async fn apply_participant_role(
             staff_roles,
             baseline,
             ..
-        }) => (
-            RoleId::new(*role),
-            *add,
-            staff_roles.clone(),
-            *baseline,
-        ),
+        }) => (RoleId::new(*role), *add, staff_roles.clone(), *baseline),
         _ => return Err(ModuleError::other("the role change is no longer active")),
     };
     if ticket.thread {
-        return Err(ModuleError::other("role participants are not supported in private ticket threads"));
+        return Err(ModuleError::other(
+            "role participants are not supported in private ticket threads",
+        ));
     }
     let baseline = if let Some(baseline) = saved_baseline {
         baseline
@@ -1063,20 +1171,24 @@ async fn apply_pending(
             apply_panel_rollback(ctx, channel, token).await?;
             Ok(ApplyResult::RolledBack)
         }
-        Some(PendingOperation::Panel { .. }) => match apply_panel_forward(ctx, channel, token).await {
-            Ok(()) => Ok(ApplyResult::Done),
-            Err(error) => {
-                tracing::warn!(?error, %channel, "panel change failed; restoring the previous panel");
-                mark_panel_rollback(ctx, channel, token).await?;
-                apply_panel_rollback(ctx, channel, token).await?;
-                Ok(ApplyResult::RolledBack)
+        Some(PendingOperation::Panel { .. }) => {
+            match apply_panel_forward(ctx, channel, token).await {
+                Ok(()) => Ok(ApplyResult::Done),
+                Err(error) => {
+                    tracing::warn!(?error, %channel, "panel change failed; restoring the previous panel");
+                    mark_panel_rollback(ctx, channel, token).await?;
+                    apply_panel_rollback(ctx, channel, token).await?;
+                    Ok(ApplyResult::RolledBack)
+                }
             }
-        },
+        }
         Some(PendingOperation::ParticipantRole { .. }) => {
             apply_participant_role(ctx, channel, token).await?;
             Ok(ApplyResult::Done)
         }
-        None => Err(ModuleError::other("the ticket operation is no longer active")),
+        None => Err(ModuleError::other(
+            "the ticket operation is no longer active",
+        )),
     }
 }
 
@@ -1127,9 +1239,10 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
         (None, config.clone())
     };
     let staff = validate_panel(ctx, &ticket, &settings).await?;
-    let old_staff_roles = ticket.staff_roles.clone().unwrap_or_else(|| {
-        current.staff().iter().map(|role| role.get()).collect()
-    });
+    let old_staff_roles = ticket
+        .staff_roles
+        .clone()
+        .unwrap_or_else(|| current.staff().iter().map(|role| role.get()).collect());
     let old_parent = if ticket.thread {
         ticket.thread_parent
     } else {
@@ -1153,9 +1266,9 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
     .await?;
     match run_owned(ctx, channel, token).await {
         Ok(ApplyResult::Done) => {
-            let args = panel
-                .as_ref()
-                .map_or_else(Args::new, |panel| Args::new().with("panel", panel.id.clone()));
+            let args = panel.as_ref().map_or_else(Args::new, |panel| {
+                Args::new().with("panel", panel.id.clone())
+            });
             cx.reply_private_t(
                 if panel.is_some() {
                     "tickets-panel-changed"
@@ -1167,7 +1280,8 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
             .await
         }
         Ok(ApplyResult::RolledBack) => {
-            cx.reply_private_t("tickets-panel-restored", &Args::new()).await
+            cx.reply_private_t("tickets-panel-restored", &Args::new())
+                .await
         }
         Err(error) => {
             tracing::warn!(?error, %channel, "panel operation remains pending");
@@ -1235,9 +1349,10 @@ async fn change_role(cx: CommandCx, args: RoleArgs, add: bool) -> Result<(), Use
             .reply_private_t("tickets-role-not-added", &Args::new())
             .await;
     }
-    let staff_roles: Vec<u64> = ticket.staff_roles.clone().unwrap_or_else(|| {
-        current.staff().iter().map(|role| role.get()).collect()
-    });
+    let staff_roles: Vec<u64> = ticket
+        .staff_roles
+        .clone()
+        .unwrap_or_else(|| current.staff().iter().map(|role| role.get()).collect());
     let baseline = if add && staff_roles.contains(&args.role.get()) {
         Some(saved_role_access(&ticket, args.role))
     } else {

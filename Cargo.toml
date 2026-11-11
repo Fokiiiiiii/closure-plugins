@@ -28,6 +28,8 @@ plugin-tickets = { path = "crates/plugin-tickets" }
 anyhow = "1"
 fastrand = "2"
 async-trait = "0.1"
+chrono = "0.4"
+chrono-tz = "0.10"
 http-body-util = "0.1"
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "rustls-platform-verifier"] }
