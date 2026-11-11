@@ -38,6 +38,10 @@ const IDLE: &str = "idle";
 const OPEN: &str = "open";
 const NUMBER: &str = "number";
 const CLOSE_REQUESTS: &str = "close-requests";
+const NOTES_PER_PAGE: usize = 8;
+const NOTE_MAX_CHARS: usize = 300;
+const NOTE_PAGE_LIMIT: usize = 1_000;
+const NOTE_RETENTION: Duration = Duration::from_hours(24 * 365);
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
@@ -64,7 +68,7 @@ struct Config {
     panels: Vec<NamedPanel>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct NamedPanel {
     id: String,
@@ -157,6 +161,20 @@ struct Ticket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaffNote {
+    author: u64,
+    created: i64,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaffNotePage {
+    ticket_number: i64,
+    panel: Option<NamedPanel>,
+    notes: Vec<StaffNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CloseRequest {
     id: i64,
     requested_by: u64,
@@ -209,8 +227,36 @@ struct Rename {
     name: String,
 }
 
+#[derive(CommandArgs)]
+struct NoteArgs {
+    /// The note text
+    #[arg(max_length = 300)]
+    text: String,
+}
+
+#[derive(CommandArgs)]
+struct NotesArgs {
+    /// The ticket channel ID
+    #[arg(max_length = 20)]
+    ticket: String,
+    /// The page number
+    page: Option<i64>,
+}
+
 fn ticket_key(channel: ChannelId) -> String {
     format!("ticket:{}", channel.get())
+}
+
+fn note_pages_prefix(channel: ChannelId) -> String {
+    format!("ticket-notes:{}:", channel.get())
+}
+
+fn note_page_key(channel: ChannelId, page: usize) -> String {
+    format!("{}{:04}", note_pages_prefix(channel), page)
+}
+
+fn note_page_number(key: &str, prefix: &str) -> Option<usize> {
+    key.strip_prefix(prefix)?.parse().ok()
 }
 
 fn idle_key(channel: ChannelId) -> String {
@@ -1600,6 +1646,244 @@ async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
         .await
 }
 
+async fn add_note(cx: CommandCx, args: NoteArgs) -> Result<(), UserError> {
+    let text = args.text.trim();
+    if text.is_empty() || text.chars().count() > NOTE_MAX_CHARS || text.contains('\0') {
+        return cx
+            .reply_private_t("tickets-note-invalid", &Args::new())
+            .await;
+    }
+
+    let ctx = cx.ctx();
+    let channel = cx.invocation().channel_id;
+    let Some(ticket) = ctx
+        .store()
+        .get::<Ticket>(&ticket_key(channel))
+        .await
+        .map_err(|error| failed(&error))?
+    else {
+        return cx
+            .reply_private_t("tickets-not-a-ticket", &Args::new())
+            .await;
+    };
+    let config: Config = cx.config()?;
+    let config = config.for_ticket(&ticket);
+    if !is_staff_command(&cx, &config).await {
+        return cx.reply_private_t("tickets-staff-only", &Args::new()).await;
+    }
+    if ticket.closing.is_some() {
+        return cx
+            .reply_private_t("tickets-not-a-ticket", &Args::new())
+            .await;
+    }
+
+    // An accepted note stays in its staff-only archive if closure races the write.
+    cx.defer(true).await?;
+    let prefix = note_pages_prefix(channel);
+    for _ in 0..5 {
+        let pages = match ctx.store().list(&prefix, NOTE_PAGE_LIMIT).await {
+            Ok(pages) => pages,
+            Err(error) => {
+                tracing::warn!(?error, channel = %channel, "could not read ticket notes");
+                return cx.reply_private_t("tickets-failed", &Args::new()).await;
+            }
+        };
+        let note = StaffNote {
+            author: cx.user().id,
+            created: cx.now(),
+            text: text.to_owned(),
+        };
+        let (key, page, expect) = if let Some((last_key, last_entry)) = pages.last() {
+            let Some(last_number) = note_page_number(last_key, &prefix)
+                .filter(|number| (1..=NOTE_PAGE_LIMIT).contains(number))
+            else {
+                return cx.reply_private_t("tickets-failed", &Args::new()).await;
+            };
+            let mut page: StaffNotePage = match serde_json::from_value(last_entry.value.clone()) {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(?error, channel = %channel, "could not read a ticket note page");
+                    return cx.reply_private_t("tickets-failed", &Args::new()).await;
+                }
+            };
+            if page.notes.len() < NOTES_PER_PAGE {
+                page.notes.push(note);
+                (
+                    last_key.clone(),
+                    page,
+                    Expect::Revision(last_entry.revision),
+                )
+            } else {
+                let next_page = last_number + 1;
+                if next_page > NOTE_PAGE_LIMIT {
+                    return cx
+                        .reply_private_t("tickets-notes-limit", &Args::new())
+                        .await;
+                }
+                (
+                    note_page_key(channel, next_page),
+                    StaffNotePage {
+                        ticket_number: ticket.number,
+                        panel: ticket.panel.clone(),
+                        notes: vec![note],
+                    },
+                    Expect::Missing,
+                )
+            }
+        } else {
+            (
+                note_page_key(channel, 1),
+                StaffNotePage {
+                    ticket_number: ticket.number,
+                    panel: ticket.panel.clone(),
+                    notes: vec![note],
+                },
+                Expect::Missing,
+            )
+        };
+
+        match ctx
+            .store()
+            .replace(&key, &page, expect, Some(NOTE_RETENTION))
+            .await
+        {
+            Ok(_) => {
+                return cx.reply_private_t("tickets-note-saved", &Args::new()).await;
+            }
+            Err(StorageError::Conflict) => {}
+            Err(error) => {
+                tracing::warn!(?error, channel = %channel, "could not save a ticket note");
+                return cx.reply_private_t("tickets-failed", &Args::new()).await;
+            }
+        }
+    }
+
+    cx.reply_private_t("tickets-failed", &Args::new()).await
+}
+
+async fn list_notes(cx: CommandCx, args: NotesArgs) -> Result<(), UserError> {
+    let Some(channel) = id_of(Some(&args.ticket)).map(ChannelId::new) else {
+        return cx
+            .reply_private_t("tickets-notes-empty", &Args::new())
+            .await;
+    };
+    let config: Config = cx.config()?;
+    cx.defer(true).await?;
+    let ctx = cx.ctx();
+    let prefix = note_pages_prefix(channel);
+    let live_ticket = match ctx.store().get::<Ticket>(&ticket_key(channel)).await {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not read a ticket");
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+    };
+    let first_page = match ctx.store().list(&prefix, 1).await {
+        Ok(pages) => pages,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not read ticket note access");
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+    };
+    let Some((_, first_entry)) = first_page.first() else {
+        return cx
+            .reply_private_t("tickets-notes-empty", &Args::new())
+            .await;
+    };
+    let first_page: StaffNotePage = match serde_json::from_value(first_entry.value.clone()) {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not read a ticket note page");
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+    };
+    let panel_snapshot = live_ticket
+        .as_ref()
+        .map_or_else(|| first_page.panel.clone(), |ticket| ticket.panel.clone());
+    let access_config = live_ticket.as_ref().map_or_else(
+        || {
+            panel_snapshot
+                .as_ref()
+                .map_or_else(|| config.clone(), |panel| config.with_panel(panel))
+        },
+        |ticket| config.for_ticket(ticket),
+    );
+    if !is_staff_command(&cx, &access_config).await {
+        return cx.reply_private_t("tickets-staff-only", &Args::new()).await;
+    }
+    if live_ticket
+        .as_ref()
+        .is_some_and(|ticket| ticket.panel.as_ref() != first_page.panel.as_ref())
+    {
+        return cx.reply_private_t("tickets-failed", &Args::new()).await;
+    }
+
+    let requested_page = args.page.unwrap_or(1);
+    let Ok(page_index) = usize::try_from(requested_page) else {
+        return cx
+            .reply_private_t("tickets-notes-page-not-found", &Args::new())
+            .await;
+    };
+    let pages = match ctx.store().list(&prefix, NOTE_PAGE_LIMIT).await {
+        Ok(pages) => pages,
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "could not list ticket notes");
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+    };
+    let mut note_pages = Vec::with_capacity(pages.len());
+    for (_, entry) in &pages {
+        let page: StaffNotePage = match serde_json::from_value(entry.value.clone()) {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(?error, channel = %channel, "could not read a ticket note page");
+                return cx.reply_private_t("tickets-failed", &Args::new()).await;
+            }
+        };
+        if page.panel.as_ref() != panel_snapshot.as_ref()
+            || page.ticket_number != first_page.ticket_number
+            || page.notes.is_empty()
+            || page.notes.len() > NOTES_PER_PAGE
+            || page
+                .notes
+                .iter()
+                .any(|note| note.text.chars().count() > NOTE_MAX_CHARS || note.text.contains('\0'))
+        {
+            return cx.reply_private_t("tickets-failed", &Args::new()).await;
+        }
+        note_pages.push(page);
+    }
+    let Some(page) = page_index
+        .checked_sub(1)
+        .and_then(|index| note_pages.get(index))
+    else {
+        return cx
+            .reply_private_t("tickets-notes-page-not-found", &Args::new())
+            .await;
+    };
+    let mut content = cx.t(
+        "tickets-notes-page",
+        &Args::new()
+            .with("number", page.ticket_number.to_string())
+            .with("page", page_index.to_string())
+            .with("pages", note_pages.len().to_string()),
+    );
+    for note in &page.notes {
+        content.push('\n');
+        content.push_str(
+            &cx.t(
+                "tickets-note-entry",
+                &Args::new()
+                    .with("created", note.created.to_string())
+                    .with("author", note.author.to_string()),
+            ),
+        );
+        content.push('\n');
+        content.push_str(&note.text);
+    }
+    cx.reply_private(content).await
+}
+
 fn schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -1708,6 +1992,8 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<Unclaim>::new("unclaim").handler(unclaim),
                     Command::<Member>::new("transfer").handler(transfer),
                     Command::<Rename>::new("rename").handler(rename),
+                    Command::<NoteArgs>::new("note").handler(add_note),
+                    Command::<NotesArgs>::new("notes").handler(list_notes),
                 ],
             )
             .component("open", open)

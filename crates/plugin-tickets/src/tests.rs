@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use closure_core::action::{Action, MentionPolicy, OverwriteTarget};
-use closure_core::event::GuildId;
+use closure_core::event::{ChannelId, GuildId};
 use closure_sdk::testing::{Click, Harness, Invocation};
 use closure_sdk::{CommandOptionValue, Level};
 use serde_json::json;
@@ -9,7 +9,10 @@ use twilight_model::guild::Permissions;
 use twilight_model::id::Id;
 use twilight_model::id::marker::ChannelMarker;
 
-use crate::{Ticket, builder};
+use crate::{
+    NOTE_MAX_CHARS, NOTE_PAGE_LIMIT, NOTE_RETENTION, NOTES_PER_PAGE, NamedPanel, StaffNote,
+    StaffNotePage, Ticket, builder, note_page_key, note_pages_prefix,
+};
 
 const STAFF_ROLE: u64 = 30;
 const MODERATOR: u64 = 200;
@@ -218,6 +221,25 @@ fn rename_invocation(name: &str, staff: bool) -> Invocation {
     } else {
         command.user(OTHER)
     }
+}
+
+fn note_invocation(text: &str, user: u64, roles: &[u64]) -> Invocation {
+    Invocation::new("ticket")
+        .subcommand("note")
+        .option("text", CommandOptionValue::String(text.to_owned()))
+        .roles(roles.iter().copied())
+        .user(user)
+}
+
+fn notes_invocation(ticket: u64, page: Option<i64>, user: u64, roles: &[u64]) -> Invocation {
+    let command = Invocation::new("ticket")
+        .subcommand("notes")
+        .option("ticket", CommandOptionValue::String(ticket.to_string()));
+    let command = match page {
+        Some(page) => command.option("page", CommandOptionValue::Integer(page)),
+        None => command,
+    };
+    command.roles(roles.iter().copied()).user(user)
 }
 
 #[tokio::test]
@@ -1721,4 +1743,383 @@ async fn idle_close_uses_panel_settings_after_config_removal() {
     assert_eq!(deleted(&harness), [channel]);
     assert_eq!(transcripts_at(&harness, PANEL_LOG).len(), 1);
     assert!(transcripts(&harness).is_empty());
+}
+
+#[tokio::test]
+async fn ticket_notes_are_private_and_staff_only_after_close() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+
+    let denied = harness
+        .invoke(note_invocation("private note", OTHER, &[]))
+        .await
+        .unwrap();
+    assert!(denied.last().unwrap().ephemeral, "{denied:?}");
+    assert!(!denied.last().unwrap().content.contains("private note"));
+    assert!(
+        harness
+            .store()
+            .list(&note_pages_prefix(ChannelId::new(HERE)), NOTE_PAGE_LIMIT)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let saved = harness
+        .invoke(note_invocation("private note", MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(saved.last().unwrap().ephemeral, "{saved:?}");
+    assert!(saved.last().unwrap().content.contains("Staff note saved"));
+    assert!(ticket_messages(&harness).is_empty());
+
+    harness
+        .store()
+        .delete(&format!("ticket:{HERE}"))
+        .await
+        .unwrap();
+    let shown = harness
+        .invoke(notes_invocation(HERE, Some(1), MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(shown.last().unwrap().ephemeral, "{shown:?}");
+    assert!(shown.last().unwrap().content.contains("private note"));
+
+    let denied = harness
+        .invoke(notes_invocation(HERE, Some(1), OTHER, &[]))
+        .await
+        .unwrap();
+    assert!(denied.last().unwrap().ephemeral, "{denied:?}");
+    assert!(denied.last().unwrap().content.contains("Only the staff"));
+    assert!(!denied.last().unwrap().content.contains("private note"));
+}
+
+#[tokio::test]
+async fn staff_note_pages_fit_storage_and_embed_limits_at_the_utf8_boundary() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let text = "🧭".repeat(NOTE_MAX_CHARS);
+
+    for _ in 0..NOTES_PER_PAGE {
+        harness
+            .invoke(note_invocation(&text, MODERATOR, &[STAFF_ROLE]))
+            .await
+            .unwrap();
+    }
+
+    let key = note_page_key(ChannelId::new(HERE), 1);
+    let page: StaffNotePage = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(page.notes.len(), NOTES_PER_PAGE);
+    let encoded = serde_json::to_vec(&page).unwrap();
+    assert!(encoded.len() <= closure_core::storage::MAX_VALUE_BYTES);
+
+    let listed = harness
+        .invoke(notes_invocation(HERE, Some(1), MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    let content = &listed.last().unwrap().content;
+    assert!(listed.last().unwrap().ephemeral, "{listed:?}");
+    assert!(content.chars().count() <= 4096);
+    assert!(content.contains(&text));
+
+    let too_long = "x".repeat(NOTE_MAX_CHARS + 1);
+    harness
+        .invoke(note_invocation(&too_long, MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    harness
+        .invoke(note_invocation("bad\0note", MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    let unchanged: StaffNotePage = harness.store().get(&key).await.unwrap().unwrap();
+    assert_eq!(unchanged.notes.len(), NOTES_PER_PAGE);
+}
+
+#[tokio::test]
+async fn a_stale_staff_note_page_write_cannot_replace_a_newer_revision() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .invoke(note_invocation("first", MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+
+    let key = note_page_key(ChannelId::new(HERE), 1);
+    let entry = harness.store().entry(&key).await.unwrap().unwrap();
+    let original: StaffNotePage = serde_json::from_value(entry.value).unwrap();
+    let mut newer = original.clone();
+    newer.notes.push(StaffNote {
+        author: OTHER,
+        created: 1,
+        text: "newer".to_owned(),
+    });
+    harness
+        .store()
+        .replace(
+            &key,
+            &newer,
+            closure_core::storage::Expect::Revision(entry.revision),
+            Some(NOTE_RETENTION),
+        )
+        .await
+        .unwrap();
+
+    let mut stale = original;
+    stale.notes.push(StaffNote {
+        author: MEMBER,
+        created: 2,
+        text: "stale".to_owned(),
+    });
+    let conflict = harness
+        .store()
+        .replace(
+            &key,
+            &stale,
+            closure_core::storage::Expect::Revision(entry.revision),
+            Some(NOTE_RETENTION),
+        )
+        .await;
+    assert!(matches!(
+        conflict,
+        Err(closure_core::storage::StorageError::Conflict)
+    ));
+
+    let stored: StaffNotePage = harness.store().get(&key).await.unwrap().unwrap();
+    assert!(stored.notes.iter().any(|note| note.text == "newer"));
+    assert!(!stored.notes.iter().any(|note| note.text == "stale"));
+}
+
+#[tokio::test]
+async fn concurrent_staff_notes_survive_a_page_revision_conflict() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+
+    let (first, second) = tokio::join!(
+        harness.invoke(note_invocation("first", MODERATOR, &[STAFF_ROLE])),
+        harness.invoke(note_invocation("second", MODERATOR, &[STAFF_ROLE]))
+    );
+    assert!(first.unwrap().last().unwrap().ephemeral);
+    assert!(second.unwrap().last().unwrap().ephemeral);
+
+    let page: StaffNotePage = harness
+        .store()
+        .get(&note_page_key(ChannelId::new(HERE), 1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.notes.len(), 2);
+    assert!(page.notes.iter().any(|note| note.text == "first"));
+    assert!(page.notes.iter().any(|note| note.text == "second"));
+}
+
+#[tokio::test]
+async fn note_history_has_no_small_per_ticket_count_limit() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+
+    for page_number in 1..=13 {
+        let note_count = if page_number == 13 { 4 } else { NOTES_PER_PAGE };
+        let page = StaffNotePage {
+            ticket_number: 3,
+            panel: None,
+            notes: (0..note_count)
+                .map(|index| StaffNote {
+                    author: MODERATOR,
+                    created: i64::try_from(index).unwrap(),
+                    text: format!("old note {page_number}-{index}"),
+                })
+                .collect(),
+        };
+        harness
+            .store()
+            .set_for(
+                &note_page_key(ChannelId::new(HERE), page_number),
+                &page,
+                NOTE_RETENTION,
+            )
+            .await
+            .unwrap();
+    }
+
+    harness
+        .invoke(note_invocation("note 101", MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    let last: StaffNotePage = harness
+        .store()
+        .get(&note_page_key(ChannelId::new(HERE), 13))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.notes.len(), 5);
+    assert_eq!(last.notes.last().unwrap().text, "note 101");
+
+    let listed = harness
+        .invoke(notes_invocation(HERE, Some(13), MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(listed.last().unwrap().content.contains("note 101"));
+    assert!(listed.last().unwrap().content.contains("13 of 13"));
+}
+
+#[tokio::test]
+async fn mismatched_note_page_snapshots_never_authorize_a_mixed_archive() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    for number in 1..=9 {
+        harness
+            .invoke(note_invocation(
+                &format!("note {number}"),
+                MODERATOR,
+                &[STAFF_ROLE],
+            ))
+            .await
+            .unwrap();
+    }
+
+    let second_key = note_page_key(ChannelId::new(HERE), 2);
+    let mut second: StaffNotePage = harness.store().get(&second_key).await.unwrap().unwrap();
+    second.panel = Some(NamedPanel {
+        id: "different".to_owned(),
+        category: None,
+        staff_roles: vec![PANEL_STAFF_ROLE.to_string()],
+        log_channel: None,
+        close_after_days: 0,
+    });
+    harness.store().set(&second_key, &second).await.unwrap();
+    harness
+        .store()
+        .delete(&format!("ticket:{HERE}"))
+        .await
+        .unwrap();
+
+    let replies = harness
+        .invoke(notes_invocation(HERE, Some(1), MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(replies.last().unwrap().ephemeral, "{replies:?}");
+    assert!(replies.last().unwrap().content.contains("did not work"));
+    assert!(!replies.last().unwrap().content.contains("note 1"));
+    assert!(!replies.last().unwrap().content.contains("note 9"));
+}
+
+#[tokio::test]
+async fn a_closed_named_ticket_keeps_its_staff_snapshot_after_expiry_and_close_race() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.panel = Some(NamedPanel {
+        id: "support".to_owned(),
+        category: None,
+        staff_roles: vec![PANEL_STAFF_ROLE.to_string()],
+        log_channel: None,
+        close_after_days: 0,
+    });
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    for number in 1..=9 {
+        harness
+            .invoke(note_invocation(
+                &format!("note {number}"),
+                OTHER,
+                &[PANEL_STAFF_ROLE],
+            ))
+            .await
+            .unwrap();
+    }
+    let first_page_key = note_page_key(ChannelId::new(HERE), 1);
+    let first_page: StaffNotePage = harness.store().get(&first_page_key).await.unwrap().unwrap();
+    harness
+        .store()
+        .set_for(&first_page_key, &first_page, Duration::ZERO)
+        .await
+        .unwrap();
+
+    let (raced_note, closed) = tokio::join!(
+        harness.invoke(note_invocation("note 10", OTHER, &[PANEL_STAFF_ROLE])),
+        harness.click(press("close", MEMBER))
+    );
+    let raced_note = raced_note.unwrap();
+    closed.unwrap();
+    assert_eq!(deleted(&harness), [HERE]);
+    let note_was_saved = raced_note
+        .last()
+        .unwrap()
+        .content
+        .contains("Staff note saved");
+    assert!(
+        note_was_saved
+            || raced_note
+                .last()
+                .unwrap()
+                .content
+                .contains("not an open ticket"),
+        "{raced_note:?}"
+    );
+    harness.set_config(json!({"staff_roles": [STAFF_ROLE.to_string()], "panels": []}));
+
+    let allowed = harness
+        .invoke(notes_invocation(HERE, Some(1), OTHER, &[PANEL_STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(allowed.last().unwrap().ephemeral, "{allowed:?}");
+    assert!(allowed.last().unwrap().content.contains("note 9"));
+    assert!(allowed.last().unwrap().content.contains("1 of 1"));
+    assert_eq!(
+        allowed.last().unwrap().content.contains("note 10"),
+        note_was_saved
+    );
+
+    let wrong_staff_role = harness
+        .invoke(notes_invocation(HERE, Some(1), MEMBER, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(
+        wrong_staff_role.last().unwrap().ephemeral,
+        "{wrong_staff_role:?}"
+    );
+    assert!(
+        wrong_staff_role
+            .last()
+            .unwrap()
+            .content
+            .contains("Only the staff")
+    );
+    assert!(!wrong_staff_role.last().unwrap().content.contains("note 9"));
+}
+
+#[tokio::test]
+async fn staff_notes_can_be_added_to_a_ticket_with_the_older_saved_shape() {
+    let harness = harness();
+    harness
+        .store()
+        .set(
+            &format!("ticket:{HERE}"),
+            &json!({
+                "number": 3,
+                "opener": MEMBER,
+                "claimed_by": null,
+                "created": 0
+            }),
+        )
+        .await
+        .unwrap();
+
+    let saved = harness
+        .invoke(note_invocation(
+            "legacy ticket note",
+            MODERATOR,
+            &[STAFF_ROLE],
+        ))
+        .await
+        .unwrap();
+    assert!(saved.last().unwrap().ephemeral, "{saved:?}");
+    let page: StaffNotePage = harness
+        .store()
+        .get(&note_page_key(ChannelId::new(HERE), 1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.notes[0].text, "legacy ticket note");
 }
