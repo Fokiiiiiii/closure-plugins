@@ -1435,6 +1435,52 @@ async fn tickets_stay_open_on_member_leave_by_default() {
 }
 
 #[tokio::test]
+async fn a_member_without_tickets_does_not_schedule_a_scan() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "close_when_opener_leaves": true
+    }));
+
+    harness.emit(member_left(MEMBER)).await.unwrap();
+
+    assert_eq!(harness.jobs(), 0);
+}
+
+#[tokio::test]
+async fn a_member_leave_finds_ticket_records_past_the_store_list_limit() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "close_when_opener_leaves": true
+    }));
+    for channel in 10_000..11_000 {
+        seed_ticket(&harness, channel, OTHER).await;
+    }
+    const DELETED_CHANNEL: u64 = 999_999;
+    seed_ticket(&harness, DELETED_CHANNEL, MEMBER).await;
+    harness
+        .store()
+        .score_add(crate::OPEN, MEMBER, 1)
+        .await
+        .unwrap();
+
+    harness.emit(member_left(MEMBER)).await.unwrap();
+    harness.run_due_jobs().await;
+    harness.run_due_jobs().await;
+
+    assert!(
+        harness
+            .store()
+            .get::<Ticket>(&format!("ticket:{DELETED_CHANNEL}"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(harness.store().score(crate::OPEN, MEMBER).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn a_member_leave_close_retries_after_a_close_already_in_progress() {
     let harness = harness();
     harness.set_config(json!({

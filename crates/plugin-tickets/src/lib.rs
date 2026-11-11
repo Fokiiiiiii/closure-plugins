@@ -45,6 +45,9 @@ const CLOSE_REQUESTS: &str = "close-requests";
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
 const DAY: i64 = 86_400;
+/// Store::list caps results; ticket keys can be partitioned by channel ID digits.
+const TICKET_LIST_LIMIT: usize = 1000;
+const CHANNEL_ID_DIGITS: usize = 20;
 /// What the member and the staff may do in a ticket.
 const TICKET_PERMISSIONS: Permissions = Permissions::VIEW_CHANNEL
     .union(Permissions::SEND_MESSAGES)
@@ -750,6 +753,15 @@ async fn on_member_left(ctx: EventContext, event: Event) -> Result<Flow, ModuleE
     if !config.close_when_opener_leaves {
         return Ok(Flow::Continue);
     }
+    if ctx
+        .store()
+        .score(OPEN, user.id.get())
+        .await
+        .map_err(|e| stored(&e))?
+        <= 0
+    {
+        return Ok(Flow::Continue);
+    }
     let at = ctx.now();
     ctx.scheduler()
         .job(
@@ -767,35 +779,67 @@ async fn on_member_left(ctx: EventContext, event: Event) -> Result<Flow, ModuleE
     Ok(Flow::Continue)
 }
 
+async fn queue_left_close(
+    ctx: &EventContext,
+    key: &str,
+    opener: u64,
+    at: i64,
+) -> Result<(), ModuleError> {
+    let Some(ticket) = ctx
+        .store()
+        .get::<Ticket>(key)
+        .await
+        .map_err(|e| stored(&e))?
+    else {
+        return Ok(());
+    };
+    if ticket.opener != opener || ticket.created > at {
+        return Ok(());
+    }
+    let channel = key
+        .strip_prefix("ticket:")
+        .and_then(|id| id.parse::<u64>().ok())
+        .map(ChannelId::new)
+        .ok_or_else(|| ModuleError::other("the ticket key has no valid channel ID"))?;
+    close_left_later(ctx, channel, ctx.now()).await
+}
+
 async fn left_scan_job(cx: JobCx) -> Result<(), ModuleError> {
     let job: LeftScan = cx.payload()?;
     let ctx = cx.ctx();
     let config: Config = ctx.parse_config()?;
-    if !config.close_when_opener_leaves {
-        return Ok(());
-    }
-    let channels = match ctx
-        .api
-        .execute(Action::ListChannels {
-            guild_id: ctx.guild_id,
-        })
-        .await
-    {
-        Ok(Outcome::Channels(channels)) => channels,
-        Ok(_) => return Err(ModuleError::other("the ticket channels were not listed")),
-        Err(error) => return Err(error.into()),
-    };
-    for channel in channels {
-        let Some(ticket) = ctx
+    if !config.close_when_opener_leaves
+        || ctx
             .store()
-            .get::<Ticket>(&ticket_key(channel.id))
+            .score(OPEN, job.opener)
             .await
             .map_err(|e| stored(&e))?
-        else {
-            continue;
-        };
-        if ticket.opener == job.opener && ticket.created <= job.at {
-            close_left_later(ctx, channel.id, ctx.now()).await?;
+            <= 0
+    {
+        return Ok(());
+    }
+
+    let mut prefixes = vec!["ticket:".to_owned()];
+    while let Some(prefix) = prefixes.pop() {
+        let tickets = ctx
+            .store()
+            .list(&prefix, TICKET_LIST_LIMIT)
+            .await
+            .map_err(|e| stored(&e))?;
+        if tickets.len() == TICKET_LIST_LIMIT {
+            if tickets.iter().any(|(key, _)| key == &prefix) {
+                queue_left_close(ctx, &prefix, job.opener, job.at).await?;
+            }
+            if prefix.len() - "ticket:".len() >= CHANNEL_ID_DIGITS {
+                return Err(ModuleError::other("the ticket listing could not be divided further"));
+            }
+            prefixes.extend(
+                (b'0'..=b'9').map(|digit| format!("{prefix}{}", char::from(digit))),
+            );
+        } else {
+            for (key, _) in tickets {
+                queue_left_close(ctx, &key, job.opener, job.at).await?;
+            }
         }
     }
     Ok(())
@@ -975,7 +1019,7 @@ async fn begin_closing(
     ))
 }
 
-/// Stops tracking a ticket whose channel is gone: its entry, its idle job and its place.
+/// Stops tracking a ticket whose channel is gone: its entry, its jobs and its place.
 async fn forget(
     ctx: &EventContext,
     channel: ChannelId,
