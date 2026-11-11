@@ -933,7 +933,7 @@ enum Closed {
 
 /// What taking a ticket for closing found.
 enum Claim {
-    Taken(Ticket),
+    Taken(Box<Ticket>),
     Gone,
     Busy(i64),
     RequestChanged,
@@ -1050,7 +1050,7 @@ async fn begin_closing(
             )
             .await
         {
-            Ok(_) => return Ok(Claim::Taken(ticket)),
+            Ok(_) => return Ok(Claim::Taken(Box::new(ticket))),
             Err(StorageError::Conflict) => {}
             Err(error) => return Err(stored(&error)),
         }
@@ -1089,7 +1089,7 @@ async fn finish(
 ) -> Result<Closed, ModuleError> {
     let key = ticket_key(channel);
     let ticket = match begin_closing(ctx, &key, request_id).await? {
-        Claim::Taken(ticket) => ticket,
+        Claim::Taken(ticket) => *ticket,
         Claim::Gone => return Ok(Closed::Unknown),
         Claim::Busy(until) => return Ok(Closed::BusyUntil(until)),
         Claim::RequestChanged => return Ok(Closed::RequestChanged),
@@ -1387,7 +1387,7 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
         .map_err(|e| failed(&e))
 }
 
-async fn ticket_answers(cx: CommandCx, _: ()) -> Result<(), UserError> {
+async fn ticket_answers(cx: CommandCx, (): ()) -> Result<(), UserError> {
     let channel = cx.invocation().channel_id;
     let Some(ticket) = cx
         .store()
