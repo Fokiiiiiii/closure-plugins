@@ -681,7 +681,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
         form_answers: answers.clone(),
     };
     let ticket_size = match ticket_storage_size(&ticket) {
-        Ok(encoded) => encoded.len(),
+        Ok(size) => size,
         Err(error) => {
             give_back(ctx, user.get()).await;
             return Err(failed(&error));
