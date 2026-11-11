@@ -48,6 +48,7 @@ tickets-panel-done = The message with the button is posted.
 tickets-not-set-up = Tickets are not set up here: no staff role is chosen.
 tickets-limit = You have { $max } open already. Close one first.
 tickets-failed = That did not work just now. Try again in a moment.
+tickets-invalid-config = Check the ticket settings.
 tickets-opened = Your ticket is open: { $channel }
 tickets-welcome = { $user }, this is ticket #{ $number }. Tell us what you need; the staff will be with you.
 tickets-claimed = { $user } takes this ticket.

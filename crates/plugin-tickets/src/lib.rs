@@ -1461,11 +1461,8 @@ async fn transfer(cx: CommandCx, args: Member) -> Result<(), UserError> {
             );
             match error {
                 closure_core::error::ModuleError::Config(_) => {
-                    cx.reply_private(
-                        cx.ctx()
-                            .t_core(cx.locale(), "error-not-set-up", &Args::new()),
-                    )
-                    .await
+                    cx.reply_private_t("tickets-invalid-config", &Args::new())
+                        .await
                 }
                 _ => cx.reply_private_t("tickets-failed", &Args::new()).await,
             }

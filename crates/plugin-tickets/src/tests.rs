@@ -712,7 +712,7 @@ async fn a_transfer_with_invalid_configuration_reports_that_it_is_not_set_up() {
             .last()
             .unwrap()
             .content
-            .contains("not set up correctly"),
+            .contains("Check the ticket settings"),
         "{replies:?}"
     );
 

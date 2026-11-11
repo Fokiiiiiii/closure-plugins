@@ -48,6 +48,7 @@ tickets-panel-done = ボタン付きのメッセージを投稿しました。
 tickets-not-set-up = チケットは未設定です。スタッフのロールが選ばれていません。
 tickets-limit = すでに { $max } 件開いています。先に閉じてください。
 tickets-failed = 今は処理できませんでした。少し待ってからもう一度お試しください。
+tickets-invalid-config = チケットの設定を確認してください。
 tickets-opened = チケットを開きました: { $channel }
 tickets-welcome = { $user } さん、チケット #{ $number } です。ご用件を書いてください。スタッフが対応します。
 tickets-claimed = { $user } がこのチケットを担当します。
