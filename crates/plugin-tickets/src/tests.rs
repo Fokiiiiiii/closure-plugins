@@ -1459,6 +1459,105 @@ async fn a_named_panel_snapshot_keeps_its_staff_access_after_config_removal() {
 }
 
 #[tokio::test]
+async fn an_open_ticket_limit_is_shared_across_named_panels_per_user() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "max_open": 1,
+        "panels": [
+            {
+                "id": "billing",
+                "staff_roles": [PANEL_STAFF_ROLE.to_string()]
+            },
+            {
+                "id": "support",
+                "staff_roles": [OTHER_PANEL_STAFF_ROLE.to_string()]
+            }
+        ]
+    }));
+
+    harness.click(panel_press("billing", MEMBER)).await.unwrap();
+    assert_eq!(created(&harness).len(), 1);
+    let blocked = harness.click(panel_press("support", MEMBER)).await.unwrap();
+    assert!(
+        blocked.last().unwrap().content.contains("open already"),
+        "{blocked:?}"
+    );
+    assert_eq!(created(&harness).len(), 1);
+
+    harness.click(panel_press("support", OTHER)).await.unwrap();
+    assert_eq!(created(&harness).len(), 2);
+}
+
+#[tokio::test]
+async fn a_named_panel_ticket_uses_its_staff_roles_for_member_changes() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "panels": [
+            {
+                "id": "billing",
+                "staff_roles": [PANEL_STAFF_ROLE.to_string()]
+            },
+            {
+                "id": "support",
+                "staff_roles": [OTHER_PANEL_STAFF_ROLE.to_string()]
+            }
+        ]
+    }));
+
+    harness.click(panel_press("billing", MEMBER)).await.unwrap();
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    let ticket: Ticket = harness.store().get(&tickets[0].0).await.unwrap().unwrap();
+    assert_eq!(
+        ticket.panel.as_ref().map(|panel| panel.id.as_str()),
+        Some("billing")
+    );
+    harness
+        .store()
+        .set(&format!("ticket:{HERE}"), &ticket)
+        .await
+        .unwrap();
+
+    let change = |sub: &str, role: u64| {
+        Invocation::new("ticket")
+            .subcommand(sub)
+            .option("user", CommandOptionValue::User(Id::new(MODERATOR)))
+            .roles([role])
+            .user(OTHER)
+    };
+    let touched = |h: &Harness| {
+        h.actions()
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    Action::SetPermissionOverwrite { .. }
+                        | Action::DeletePermissionOverwrite { .. }
+                )
+            })
+            .count()
+    };
+
+    for sub in ["add", "remove"] {
+        let denied = harness
+            .invoke(change(sub, OTHER_PANEL_STAFF_ROLE))
+            .await
+            .unwrap();
+        assert!(
+            denied.last().unwrap().content.contains("Only the staff"),
+            "{denied:?}"
+        );
+    }
+    assert_eq!(touched(&harness), 0);
+
+    for sub in ["add", "remove"] {
+        harness.invoke(change(sub, PANEL_STAFF_ROLE)).await.unwrap();
+    }
+    assert_eq!(touched(&harness), 2);
+}
+
+#[tokio::test]
 async fn invalid_panel_references_and_everyone_staff_are_rejected_without_creating_channels() {
     let cases = [
         ("missing", json!([]), "This panel was not found."),
