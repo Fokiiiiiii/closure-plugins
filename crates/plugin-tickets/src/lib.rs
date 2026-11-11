@@ -45,7 +45,7 @@ const CLOSE_REQUESTS: &str = "close-requests";
 const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
 const DAY: i64 = 86_400;
-/// Store::list caps results; ticket keys can be partitioned by channel ID digits.
+/// `Store::list` caps results; ticket keys can be partitioned by channel ID digits.
 const TICKET_LIST_LIMIT: usize = 1000;
 const CHANNEL_ID_DIGITS: usize = 20;
 /// What the member and the staff may do in a ticket.
