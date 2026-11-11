@@ -1454,6 +1454,7 @@ async fn a_member_without_tickets_does_not_schedule_a_scan() {
 
 #[tokio::test]
 async fn a_member_leave_finds_ticket_records_past_the_store_list_limit() {
+    const DELETED_CHANNEL: u64 = 999_999;
     let harness = harness();
     harness.set_config(json!({
         "staff_roles": [STAFF_ROLE.to_string()],
@@ -1462,7 +1463,6 @@ async fn a_member_leave_finds_ticket_records_past_the_store_list_limit() {
     for channel in 10_000..11_000 {
         seed_ticket(&harness, channel, OTHER).await;
     }
-    const DELETED_CHANNEL: u64 = 999_999;
     seed_ticket(&harness, DELETED_CHANNEL, MEMBER).await;
     harness
         .store()
