@@ -43,9 +43,22 @@ const PANEL_LOG: u64 = 9;
 fn harness() -> Harness {
     let harness = Harness::new(builder().unwrap()).unwrap();
     let guild: GuildId = Id::new(1);
-    for channel in [HERE, LOG] {
-        harness.api().add_channel(Id::new(channel), Some(guild));
-    }
+    let channels: Vec<twilight_model::channel::Channel> = [HERE, LOG]
+        .into_iter()
+        .map(|channel| {
+            serde_json::from_value(json!({
+                "id": channel.to_string(),
+                "type": 0,
+                "guild_id": guild.get().to_string(),
+                "name": format!("ticket-test-{channel}"),
+                "topic": null,
+                "parent_id": null,
+                "permission_overwrites": []
+            }))
+            .unwrap()
+        })
+        .collect();
+    harness.api().set_channels(guild, channels);
     harness.set_config(json!({
         "staff_roles": [STAFF_ROLE.to_string()],
         "log_channel": LOG.to_string(),
@@ -316,7 +329,6 @@ fn existing_panel_message(
                 "custom_id": "tickets:open:*:billing",
                 "disabled": false,
                 "emoji": null,
-                "id": null,
                 "label": "Billing",
                 "style": 1,
                 "url": null,
@@ -385,7 +397,13 @@ fn rating_dm_count(harness: &Harness) -> usize {
     harness
         .actions()
         .iter()
-        .filter(|action| matches!(action, Action::SendDirectMessage { .. }))
+        .filter(|action| {
+            matches!(action, Action::SendDirectMessage { .. })
+                && action
+                    .custom_ids()
+                    .into_iter()
+                    .any(|custom_id| custom_id.starts_with("tickets:rate:"))
+        })
         .count()
 }
 
@@ -576,7 +594,8 @@ fn notes_invocation(ticket: u64, page: Option<i64>, user: u64, roles: &[u64]) ->
 }
 
 fn label_invocation(subcommand: &str, label: Option<&str>, user: u64, roles: &[u64]) -> Invocation {
-    let command = Invocation::new("ticket").subcommand(subcommand);
+    let route = subcommand.strip_prefix("label-").unwrap_or(subcommand);
+    let command = Invocation::new("ticket").subcommand(&format!("label {route}"));
     let command = match label {
         Some(label) => command.option("label", CommandOptionValue::String(label.to_owned())),
         None => command,
@@ -586,7 +605,7 @@ fn label_invocation(subcommand: &str, label: Option<&str>, user: u64, roles: &[u
 
 fn label_page_invocation(page: i64, user: u64, roles: &[u64]) -> Invocation {
     Invocation::new("ticket")
-        .subcommand("label-list")
+        .subcommand("label list")
         .option("page", CommandOptionValue::Integer(page))
         .roles(roles.iter().copied())
         .user(user)
@@ -594,7 +613,7 @@ fn label_page_invocation(page: i64, user: u64, roles: &[u64]) -> Invocation {
 
 fn reply_search_invocation(query: &str, page: Option<i64>, user: u64, roles: &[u64]) -> Invocation {
     let command = Invocation::new("ticket")
-        .subcommand("reply-search")
+        .subcommand("reply search")
         .option("query", CommandOptionValue::String(query.to_owned()));
     let command = match page {
         Some(page) => command.option("page", CommandOptionValue::Integer(page)),
@@ -605,7 +624,7 @@ fn reply_search_invocation(query: &str, page: Option<i64>, user: u64, roles: &[u
 
 fn reply_add_invocation(id: &str, title: &str, body: &str, user: u64, roles: &[u64]) -> Invocation {
     Invocation::new("ticket")
-        .subcommand("reply-add")
+        .subcommand("reply add")
         .option("id", CommandOptionValue::String(id.to_owned()))
         .option("title", CommandOptionValue::String(title.to_owned()))
         .option("body", CommandOptionValue::String(body.to_owned()))
@@ -621,7 +640,7 @@ fn reply_edit_invocation(
     roles: &[u64],
 ) -> Invocation {
     Invocation::new("ticket")
-        .subcommand("reply-edit")
+        .subcommand("reply edit")
         .option("id", CommandOptionValue::String(id.to_owned()))
         .option("title", CommandOptionValue::String(title.to_owned()))
         .option("body", CommandOptionValue::String(body.to_owned()))
@@ -631,7 +650,7 @@ fn reply_edit_invocation(
 
 fn reply_delete_invocation(id: &str, user: u64, roles: &[u64]) -> Invocation {
     Invocation::new("ticket")
-        .subcommand("reply-delete")
+        .subcommand("reply delete")
         .option("id", CommandOptionValue::String(id.to_owned()))
         .roles(roles.iter().copied())
         .user(user)
