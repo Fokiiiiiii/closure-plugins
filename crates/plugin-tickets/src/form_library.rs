@@ -39,6 +39,7 @@ pub(crate) fn schema() -> Value {
                     "pattern": "^[a-z0-9_-]+$"
                 },
                 "title": {
+                    "title": "config-tickets-form-title-label",
                     "type": "string",
                     "minLength": 1,
                     "maxLength": FORM_TITLE_MAX_CHARS,

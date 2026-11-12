@@ -10748,6 +10748,10 @@ fn schema() -> serde_json::Value {
             "panel_display": {
                 "type": "string",
                 "enum": ["buttons", "select"],
+                "x-enum-labels": {
+                    "buttons": "config-tickets-panel-display-buttons",
+                    "select": "config-tickets-panel-display-select"
+                },
                 "default": "buttons",
                 "description": "config-tickets-panel-display",
                 "x-ui": { "level": "basic" }
