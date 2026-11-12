@@ -424,7 +424,7 @@ fn transcript_rich_message(
     quoted_attachments: Option<&[message_ticket::MessageQuoteAttachment]>,
 ) -> Option<TranscriptRichMessage> {
     let raw = serde_json::to_value(message).ok()?;
-    let attachments = if let Some(quoted_attachments) = quoted_attachments {
+    let attachments: Vec<_> = if let Some(quoted_attachments) = quoted_attachments {
         quoted_attachments
             .iter()
             .map(|attachment| TranscriptRichAttachment {
