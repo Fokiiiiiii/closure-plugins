@@ -4815,7 +4815,34 @@ async fn open_panel(
         }
     };
     if resolved_questions.is_empty() {
-        cx.defer(true).await?;
+        if let Err(error) = cx.defer(true).await {
+            match release_unstarted_open_reservation(
+                ctx,
+                user.get(),
+                reservation.number,
+                reservation.generation,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    guild = %ctx.guild_id,
+                    opener = user.get(),
+                    number = reservation.number,
+                    generation = reservation.generation,
+                    "ticket reservation could not be released after the interaction acknowledgement failed"
+                ),
+                Err(release_error) => tracing::warn!(
+                    ?release_error,
+                    guild = %ctx.guild_id,
+                    opener = user.get(),
+                    number = reservation.number,
+                    generation = reservation.generation,
+                    "ticket reservation could not be released after the interaction acknowledgement failed"
+                ),
+            }
+            return Err(error);
+        }
         return create_ticket(cx, reservation, revision, resolved_questions).await;
     }
     let inputs = resolved_questions
@@ -4873,8 +4900,28 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
         return Err(UserError::message("tickets-form-invalid"));
     }
     let ctx = cx.ctx();
-    cx.defer(true).await?;
     let user = cx.user().id.get();
+    if let Err(error) = cx.defer(true).await {
+        match release_unstarted_open_reservation(ctx, user, number, generation).await {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                guild = %ctx.guild_id,
+                opener = user,
+                number,
+                generation,
+                "ticket reservation could not be released after the form acknowledgement failed"
+            ),
+            Err(release_error) => tracing::warn!(
+                ?release_error,
+                guild = %ctx.guild_id,
+                opener = user,
+                number,
+                generation,
+                "ticket reservation could not be released after the form acknowledgement failed"
+            ),
+        }
+        return Err(error);
+    }
     let (Some(_entry), Some(mut reservation)) = read_open_reservation(ctx, user, number)
         .await
         .map_err(|error| failed(&error))?
