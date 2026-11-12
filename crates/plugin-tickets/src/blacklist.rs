@@ -172,7 +172,6 @@ pub(super) async fn dashboard_state(
 }
 
 #[allow(clippy::too_many_arguments)]
-
 pub(super) async fn dashboard_change(
     ctx: &EventContext,
     config: &Config,

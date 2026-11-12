@@ -1,10 +1,9 @@
 //! Per-ticket waiting and automatic-close timers.
 
 use super::{
-    Args, CLOSING_WAIT, ChannelId, Closed, Config, Event, EventContext, Flow, Hasher,
-    InteractionRef, ModuleError, RoleId, StorageError, Ticket, UserId,
-    finish_if_automation_generation, id_of, made_at, refresh_ticket_form_answer_ttl, stored,
-    ticket_key, ticket_ttl,
+    Args, CLOSING_WAIT, ChannelId, Closed, Config, Event, EventContext, Flow, ModuleError, RoleId,
+    StorageError, Ticket, UserId, finish_if_automation_generation, id_of, made_at,
+    refresh_ticket_form_answer_ttl, stored, ticket_key, ticket_ttl,
 };
 use closure_core::action::{Action, ChannelPatch, Outcome, Reason};
 use closure_core::error::DiscordError;
