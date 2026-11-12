@@ -794,25 +794,39 @@ async fn a_category_setting_that_is_not_a_category_is_refused_before_any_place_i
 async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_place_back() {
     let harness = harness();
     harness.click(press("open", MEMBER)).await.unwrap();
-    seed_ticket(&harness, HERE, MEMBER).await;
-    let refused = harness.click(press("close", OTHER)).await.unwrap();
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    assert_eq!(tickets.len(), 1);
+    let channel_id = tickets[0]
+        .0
+        .strip_prefix("ticket:")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let close = |user| {
+        Invocation::new("ticket")
+            .subcommand("close")
+            .user(user)
+            .channel(ChannelId::new(channel_id))
+    };
+
+    let refused = harness.invoke(close(OTHER)).await.unwrap();
     assert!(
         refused.last().unwrap().content.contains("Only the member"),
         "{refused:?}"
     );
     assert!(deleted(&harness).is_empty());
-    harness.click(press("close", MEMBER)).await.unwrap();
-    assert_eq!(deleted(&harness), [HERE]);
+    harness.invoke(close(MEMBER)).await.unwrap();
+    assert_eq!(deleted(&harness), [channel_id]);
     let saved = transcripts(&harness);
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].0, "ticket-0003.txt");
     assert!(saved[0].1.contains("Ticket #3"), "{}", saved[0].1);
-    let late = harness.click(press("close", MEMBER)).await.unwrap();
+    let late = harness.invoke(close(MEMBER)).await.unwrap();
     assert!(
         late.last().unwrap().content.contains("not an open ticket"),
         "{late:?}"
     );
-    assert_eq!(deleted(&harness), [HERE]);
+    assert_eq!(deleted(&harness), [channel_id]);
     harness.click(press("open", MEMBER)).await.unwrap();
     assert_eq!(created(&harness).len(), 2);
 }
