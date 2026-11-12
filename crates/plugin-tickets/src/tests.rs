@@ -4675,43 +4675,20 @@ async fn form_submission_after_hours_close_does_not_create_a_ticket() {
             .contains("Tickets are not available at this time.")
     );
     assert!(created(&harness).is_empty());
-    let reservation_prefix = format!("open-reservation:{MEMBER}:");
-    let reservation_keys: Vec<String> = harness
-        .store()
-        .list(&reservation_prefix, 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
-    let reservations = open_reservations(&harness, MEMBER).await;
-    let reservation_state: Vec<_> = reservations
-        .iter()
-        .map(|reservation| {
-            (
-                reservation.number,
-                reservation.generation,
-                reservation.api_started,
-                reservation.channel.is_some(),
-                reservation.attempts,
-                reservation.released_at.is_some(),
-            )
-        })
-        .collect();
-    let open_state: Option<crate::OpenState> = harness
-        .store()
-        .get(&crate::open_state_key(MEMBER))
-        .await
-        .unwrap();
-    let open_lease_until = open_state.and_then(|state| state.lease.map(|lease| lease.until));
-    let open_score = harness.store().score(crate::OPEN, MEMBER).await.unwrap();
-    assert_eq!(
-        open_score, 0,
-        "after-hours reservation cleanup: keys={reservation_keys:?}, reservations={reservation_state:?}, score={open_score}, lease_until={open_lease_until:?}"
+    assert!(
+        harness
+            .store()
+            .list("ticket:", 10)
+            .await
+            .unwrap()
+            .is_empty()
     );
+    assert!(open_reservations(&harness, MEMBER).await.is_empty());
+    assert_eq!(harness.store().score(crate::OPEN, MEMBER).await.unwrap(), 0);
+    // Opening the form consumes its number even when the later submission is denied.
     assert_eq!(
         harness.store().score(crate::NUMBER, 0_u64).await.unwrap(),
-        0
+        1
     );
 }
 
