@@ -407,6 +407,38 @@ fn rating_dm_count(harness: &Harness) -> usize {
         .count()
 }
 
+fn rating_dm_message(harness: &Harness) -> (closure_core::event::MessageId, ChannelId) {
+    let mut next_id = 0;
+    for action in harness.actions() {
+        match &action {
+            Action::CreateChannel { .. }
+            | Action::CreateRole { .. }
+            | Action::SendViaWebhook { .. }
+            | Action::SendFile { .. }
+            | Action::SendMessage { .. }
+            | Action::SuppressEmbeds { .. }
+            | Action::SendDirectMessage { .. }
+            | Action::PostMessage {
+                message_id: None, ..
+            } => next_id += 1,
+            _ => {}
+        }
+
+        if matches!(action, Action::SendDirectMessage { .. })
+            && action
+                .custom_ids()
+                .into_iter()
+                .any(|custom_id| custom_id.starts_with("tickets:rate:"))
+        {
+            return (
+                closure_core::event::MessageId::new(next_id),
+                ChannelId::new(1),
+            );
+        }
+    }
+    panic!("no rating direct message was sent");
+}
+
 fn press(route: &str, user: u64) -> Click {
     Click::new(format!("tickets:{route}:*")).user(user)
 }
@@ -1764,7 +1796,7 @@ async fn staff_let_a_member_in_and_take_them_out_and_others_cannot() {
     seed_ticket(&harness, HERE, MEMBER).await;
     let change = |sub: &str, roles: &[u64]| {
         Invocation::new("ticket")
-            .subcommand(&format!("settings {sub}-role"))
+            .subcommand(sub)
             .option("user", CommandOptionValue::User(Id::new(OTHER)))
             .roles(roles.iter().copied())
             .user(MODERATOR)
@@ -1871,7 +1903,7 @@ async fn tickets_stay_open_on_member_leave_by_default() {
 }
 
 #[tokio::test]
-async fn a_member_without_tickets_does_not_schedule_a_scan() {
+async fn a_member_without_tickets_completes_an_empty_scan_without_changes() {
     let harness = harness();
     harness.set_config(json!({
         "staff_roles": [STAFF_ROLE.to_string()],
@@ -1880,7 +1912,32 @@ async fn a_member_without_tickets_does_not_schedule_a_scan() {
 
     harness.emit(member_left(MEMBER)).await.unwrap();
 
+    assert_eq!(harness.jobs(), 1);
+    harness.run_due_jobs().await;
     assert_eq!(harness.jobs(), 0);
+    assert!(
+        harness
+            .store()
+            .list("ticket:", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an empty scan leaves ticket records unchanged"
+    );
+    assert!(
+        created(&harness).is_empty(),
+        "an empty scan creates no channels"
+    );
+    assert!(
+        deleted(&harness).is_empty(),
+        "an empty scan deletes no channels"
+    );
+    assert!(!harness.actions().iter().any(|action| matches!(
+        action,
+        Action::EditChannel { .. }
+            | Action::SetPermissionOverwrite { .. }
+            | Action::DeletePermissionOverwrite { .. }
+    )));
 }
 
 #[tokio::test]
@@ -2856,7 +2913,7 @@ async fn a_named_panel_ticket_uses_its_staff_roles_for_member_changes() {
 
     let change = |sub: &str, role: u64| {
         Invocation::new("ticket")
-            .subcommand(&format!("settings {sub}-role"))
+            .subcommand(sub)
             .option("user", CommandOptionValue::User(Id::new(MODERATOR)))
             .roles([role])
             .user(OTHER)
@@ -3027,6 +3084,7 @@ async fn a_selected_panel_button_uses_its_name_and_configured_color() {
 async fn a_panel_select_shows_names_descriptions_and_localized_fallbacks() {
     for (locale, fallback) in [(Locale::En, "Panel 2"), (Locale::Ja, "パネル 2")] {
         let harness = harness();
+        harness.set_guild_locale(locale);
         harness.set_config(json!({
             "staff_roles": [STAFF_ROLE.to_string()],
             "panel_display": "select",
@@ -5531,16 +5589,20 @@ async fn concurrent_label_changes_are_preserved_and_closing_blocks_changes() {
 
     ticket.closing = Some(1);
     harness.store().set(&key, &ticket).await.unwrap();
+    let blocked = harness
+        .invoke(label_invocation(
+            "label-add",
+            Some("after-close"),
+            MODERATOR,
+            &[MODERATOR],
+        ))
+        .await
+        .unwrap();
     assert!(
-        harness
-            .invoke(label_invocation(
-                "label-add",
-                Some("after-close"),
-                MODERATOR,
-                &[MODERATOR],
-            ))
-            .await
-            .is_err()
+        blocked.last().is_some_and(|reply| {
+            reply.ephemeral && reply.content.to_lowercase().contains("closing")
+        }),
+        "{blocked:?}"
     );
     let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
     assert_eq!(ticket.labels, vec!["Needs Review".to_owned()]);
@@ -6677,11 +6739,12 @@ async fn only_the_opener_can_rate_and_old_buttons_are_fenced() {
     harness.click(press("close", MEMBER)).await.unwrap();
     let history = closed_history(&harness, HERE).await;
     let old_button = closed_rating_id(&history, HERE, 5);
+    let (rating_message_id, rating_channel_id) = rating_dm_message(&harness);
 
     let _ = harness
         .click_direct_message(
-            closure_core::event::MessageId::new(1),
-            ChannelId::new(1),
+            rating_message_id.clone(),
+            rating_channel_id.clone(),
             Click::new(old_button.clone()).user(OTHER),
         )
         .await;
@@ -6698,8 +6761,8 @@ async fn only_the_opener_can_rate_and_old_buttons_are_fenced() {
     harness.store().set(&pointer, &newer).await.unwrap();
     let stale = harness
         .click_direct_message(
-            closure_core::event::MessageId::new(1),
-            ChannelId::new(1),
+            rating_message_id.clone(),
+            rating_channel_id.clone(),
             Click::new(old_button).user(MEMBER),
         )
         .await
@@ -6758,16 +6821,17 @@ async fn concurrent_rating_buttons_save_only_one_score() {
     let history = closed_history(&harness, HERE).await;
     let lower = closed_rating_id(&history, HERE, 2);
     let higher = closed_rating_id(&history, HERE, 5);
+    let (rating_message_id, rating_channel_id) = rating_dm_message(&harness);
 
     let (left, right) = tokio::join!(
         harness.click_direct_message(
-            closure_core::event::MessageId::new(1),
-            ChannelId::new(1),
+            rating_message_id.clone(),
+            rating_channel_id.clone(),
             Click::new(lower).user(MEMBER),
         ),
         harness.click_direct_message(
-            closure_core::event::MessageId::new(1),
-            ChannelId::new(1),
+            rating_message_id,
+            rating_channel_id,
             Click::new(higher).user(MEMBER),
         ),
     );
