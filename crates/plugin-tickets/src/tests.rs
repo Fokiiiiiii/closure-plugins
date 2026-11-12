@@ -1764,7 +1764,7 @@ async fn staff_let_a_member_in_and_take_them_out_and_others_cannot() {
     seed_ticket(&harness, HERE, MEMBER).await;
     let change = |sub: &str, roles: &[u64]| {
         Invocation::new("ticket")
-            .subcommand(sub)
+            .subcommand(&format!("settings {sub}-role"))
             .option("user", CommandOptionValue::User(Id::new(OTHER)))
             .roles(roles.iter().copied())
             .user(MODERATOR)
@@ -2856,7 +2856,7 @@ async fn a_named_panel_ticket_uses_its_staff_roles_for_member_changes() {
 
     let change = |sub: &str, role: u64| {
         Invocation::new("ticket")
-            .subcommand(sub)
+            .subcommand(&format!("settings {sub}-role"))
             .option("user", CommandOptionValue::User(Id::new(MODERATOR)))
             .roles([role])
             .user(OTHER)

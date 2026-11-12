@@ -3839,13 +3839,25 @@ async fn post_close_request_message(
         .reason
         .clone()
         .unwrap_or_else(|| ctx.t_in(ctx.locale, "tickets-close-request-no-reason", &Args::new()));
-    let content = ctx.t_in(
+    let mut content = ctx.t_in(
         ctx.locale,
         "tickets-close-request-message",
         &Args::new()
             .with("staff", format!("<@{}>", request.requested_by))
             .with("reason", reason),
     );
+    if let Some(expires_at) = request.expires_at {
+        let remaining_seconds = expires_at.saturating_sub(ctx.now());
+        if remaining_seconds > 0 {
+            let minutes = remaining_seconds.saturating_add(59) / 60;
+            content.push('\n');
+            content.push_str(&ctx.t_in(
+                ctx.locale,
+                "tickets-close-request-deadline",
+                &Args::new().with("minutes", minutes),
+            ));
+        }
+    }
     ctx.api
         .execute(Action::PostMessage {
             channel_id: channel,
