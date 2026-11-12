@@ -2502,7 +2502,7 @@ async fn open_limits_count_tickets_beyond_the_store_page_limit_and_repair_open_s
 async fn an_unconfirmed_transient_open_keeps_its_slot_when_no_channel_is_verified() {
     let harness = harness();
     harness.api().fail_nth(
-        1,
+        2,
         closure_core::error::DiscordError::Transient("connection lost".into()),
     );
 
@@ -2538,7 +2538,7 @@ async fn an_unconfirmed_transient_open_keeps_its_slot_when_no_channel_is_verifie
 async fn a_lost_create_response_is_recovered_from_the_channel_id_and_reservation_token() {
     let harness = harness();
     harness.api().fail_nth(
-        1,
+        2,
         closure_core::error::DiscordError::Transient("connection lost".into()),
     );
     harness.click(press("open", MEMBER)).await.unwrap();
@@ -2574,7 +2574,7 @@ async fn a_lost_create_response_is_recovered_from_the_channel_id_and_reservation
 async fn a_terminal_channel_rejection_releases_a_reservation_after_a_confirmed_empty_lookup() {
     let harness = harness();
     harness.api().fail_nth(
-        1,
+        2,
         closure_core::error::DiscordError::Fatal("permission denied".into()),
     );
 
