@@ -3470,12 +3470,14 @@ async fn a_partial_button_publish_can_be_retried_by_page() {
         "{retry:?}"
     );
     let posts = posted_panels(&harness);
-    assert_eq!(posts.len(), 3);
+    assert_eq!(posts.len(), 2);
     assert_eq!(
-        posts[2].2.as_deref().unwrap(),
-        "Need help? Use the panel below to open a ticket. Only you and the staff will see it.\n\nPanel page 2 of 2"
+        posts[1].2.as_deref().unwrap(),
+        "Need help? Use the panel below to open a ticket. Only you and the staff will see it.
+
+Panel page 2 of 2"
     );
-    let Component::ActionRow(row) = &posts[2].3[0] else {
+    let Component::ActionRow(row) = &posts[1].3[0] else {
         panic!("the retried page is not in an action row");
     };
     let Component::Button(button) = &row.components[0] else {
@@ -6520,8 +6522,9 @@ async fn retrying_a_partial_reply_skips_confirmed_parts_and_flags_the_uncertain_
         .await
         .unwrap();
 
+    // defer, progress edit, and part 1 precede the intended part 2 failure.
     harness.api().fail_nth(
-        3,
+        4,
         closure_core::error::DiscordError::Fatal("connection lost".into()),
     );
     let stopped = harness
@@ -6743,8 +6746,8 @@ async fn only_the_opener_can_rate_and_old_buttons_are_fenced() {
 
     let _ = harness
         .click_direct_message(
-            rating_message_id.clone(),
-            rating_channel_id.clone(),
+            rating_message_id,
+            rating_channel_id,
             Click::new(old_button.clone()).user(OTHER),
         )
         .await;
@@ -6761,8 +6764,8 @@ async fn only_the_opener_can_rate_and_old_buttons_are_fenced() {
     harness.store().set(&pointer, &newer).await.unwrap();
     let stale = harness
         .click_direct_message(
-            rating_message_id.clone(),
-            rating_channel_id.clone(),
+            rating_message_id,
+            rating_channel_id,
             Click::new(old_button).user(MEMBER),
         )
         .await
@@ -6825,8 +6828,8 @@ async fn concurrent_rating_buttons_save_only_one_score() {
 
     let (left, right) = tokio::join!(
         harness.click_direct_message(
-            rating_message_id.clone(),
-            rating_channel_id.clone(),
+            rating_message_id,
+            rating_channel_id,
             Click::new(lower).user(MEMBER),
         ),
         harness.click_direct_message(
