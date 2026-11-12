@@ -13,7 +13,7 @@ use serde_json::json;
 
 const EVENT_PREFIX: &str = "tickets:audit:v1:e:";
 const DEDUPE_PREFIX: &str = "tickets:audit:v1:d:";
-const RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+const RETENTION: Duration = Duration::from_hours(2_160);
 const PAGE_SIZE: usize = 25;
 const MAX_PAGE_SIZE: usize = 2_500;
 const MAX_PAGE: usize = 10_000;
@@ -425,7 +425,7 @@ pub(crate) async fn record_event(
     if timestamp < 0 {
         return Err(DashboardActionError::Unavailable);
     }
-    let reverse_timestamp = u64::MAX - timestamp as u64;
+    let reverse_timestamp = u64::MAX - timestamp.cast_unsigned();
     let event_key = format!(
         "{EVENT_PREFIX}{reverse_timestamp:020}:{actor_id:016x}:{:02}:{dedupe_key}",
         action.code()
@@ -582,6 +582,10 @@ pub(crate) async fn record_dashboard_action(
     .await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded audit search keeps validation, ACL checks, and pagination together"
+)]
 pub(crate) async fn query(
     ctx: &EventContext,
     request: &DashboardActionRequest,
@@ -672,7 +676,7 @@ pub(crate) async fn query(
 
     let mut after = query
         .date_to
-        .map(|date| format!("{EVENT_PREFIX}{:020}", u64::MAX - date as u64));
+        .map(|date| format!("{EVENT_PREFIX}{:020}", u64::MAX - date.cast_unsigned()));
     let mut scanned = 0;
     let mut total = 0;
     let mut entries = Vec::with_capacity(page_size);

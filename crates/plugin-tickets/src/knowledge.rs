@@ -16,7 +16,7 @@ use serde_json::Value;
 use twilight_model::channel::message::Embed;
 
 const PREFIX: &str = "ticket-knowledge:";
-const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
+const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_hours(720);
 const PAGE_SIZE: usize = 8;
 const ARTICLE_SCAN_BATCH: usize = 1000;
 const DASHBOARD_PAGE_SIZE: usize = 25;
@@ -24,15 +24,15 @@ pub(crate) const KNOWLEDGE_SEARCH_JOB: &str = "knowledge-search";
 pub(crate) const KNOWLEDGE_SUGGESTION_JOB: &str = "knowledge-suggestion";
 const SUGGESTION_PREFIX: &str = "ticket-knowledge-suggestion:";
 const SUGGESTION_JOB_DELAY: Duration = Duration::from_millis(250);
-const SUGGESTION_STATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const SUGGESTION_STATE_TTL: Duration = Duration::from_hours(24);
 const SUGGESTION_BATCHES_PER_JOB: usize = 10;
 const SEARCH_PREFIX: &str = "ticket-knowledge-search:";
 const SEARCH_REQUEST_PREFIX: &str = "ticket-knowledge-search-request:";
-const SEARCH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const SEARCH_TTL: Duration = Duration::from_hours(24);
 const SEARCH_EMPTY_RESULT_TTL: Duration = Duration::from_secs(60);
 const SEARCH_JOB_DELAY: Duration = Duration::from_millis(250);
 const PUBLIC_CURSOR_PREFIX: &str = "ticket-knowledge-public-cursor:";
-const PUBLIC_CURSOR_TTL: Duration = Duration::from_secs(15 * 60);
+const PUBLIC_CURSOR_TTL: Duration = Duration::from_mins(15);
 static PUBLIC_CURSOR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_ID_CHARS: usize = 32;
 const MAX_TITLE_CHARS: usize = 100;
@@ -83,6 +83,8 @@ struct KnowledgeSearchResult {
     title: String,
 }
 
+// shortcut: preserve the serialized flag shape; group flags only with a storage migration.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct KnowledgeSearchState {
@@ -301,7 +303,7 @@ pub(crate) async fn search(cx: CommandCx, args: SearchArgs) -> Result<(), UserEr
         };
         match refresh_search_request(ctx, &request_key, &request, request_revision, &state).await {
             Ok(_) | Err(StorageError::Conflict) => {}
-            Err(error) => return Err(storage_error(error)),
+            Err(error) => return Err(storage_error(&error)),
         }
         return reply_search_queued(&cx, &query, page + 1).await;
     }
@@ -309,6 +311,8 @@ pub(crate) async fn search(cx: CommandCx, args: SearchArgs) -> Result<(), UserEr
     start_search(&cx, ctx, owner, &query, page, lookup.request_revision, now).await
 }
 
+// shortcut: keep the persisted search worker flow together; split a phase if it grows further.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn search_job(cx: JobCx) -> Result<(), ModuleError> {
     let job: KnowledgeSearchJob = cx.payload()?;
     let ctx = cx.ctx();
@@ -317,7 +321,7 @@ pub(crate) async fn search_job(cx: JobCx) -> Result<(), ModuleError> {
         .store()
         .entry(&state_key)
         .await
-        .map_err(storage_module_error)?
+        .map_err(|error| storage_module_error(&error))?
     else {
         return Ok(());
     };
@@ -333,7 +337,7 @@ pub(crate) async fn search_job(cx: JobCx) -> Result<(), ModuleError> {
         .store()
         .entry(&request_key)
         .await
-        .map_err(storage_module_error)?
+        .map_err(|error| storage_module_error(&error))?
     else {
         return Ok(());
     };
@@ -367,7 +371,7 @@ pub(crate) async fn search_job(cx: JobCx) -> Result<(), ModuleError> {
             match persist_search_state(ctx, &state_key, &state, Expect::Revision(revision)).await {
                 Ok(revision) => revision,
                 Err(StorageError::Conflict) => return Ok(()),
-                Err(error) => return Err(storage_module_error(error)),
+                Err(error) => return Err(storage_module_error(&error)),
             };
         let updated_request = KnowledgeSearchRequest {
             expires_at: state.expires_at,
@@ -391,7 +395,7 @@ pub(crate) async fn search_job(cx: JobCx) -> Result<(), ModuleError> {
                     })?;
                 return Ok(());
             }
-            Err(error) => return Err(storage_module_error(error)),
+            Err(error) => return Err(storage_module_error(&error)),
         };
     }
 
@@ -496,7 +500,7 @@ pub(crate) async fn schedule_ticket_suggestions(
         terms,
         after_key: PREFIX.to_owned(),
         candidates: Vec::new(),
-        expires_at: now.saturating_add(SUGGESTION_STATE_TTL.as_secs() as i64),
+        expires_at: now.saturating_add(SUGGESTION_STATE_TTL.as_secs().cast_signed()),
         complete: false,
         notified: false,
         cancelled: false,
@@ -505,7 +509,7 @@ pub(crate) async fn schedule_ticket_suggestions(
         .store()
         .entry(&key)
         .await
-        .map_err(storage_module_error)?
+        .map_err(|error| storage_module_error(&error))?
     {
         None => Expect::Missing,
         Some(entry) => {
@@ -536,7 +540,7 @@ pub(crate) async fn schedule_ticket_suggestions(
     {
         Ok(_) => {}
         Err(StorageError::Conflict) => return Ok(()),
-        Err(error) => return Err(storage_module_error(error)),
+        Err(error) => return Err(storage_module_error(&error)),
     }
     schedule_suggestion_job(ctx, &state, Duration::ZERO).await
 }
@@ -551,7 +555,7 @@ pub(crate) async fn cancel_ticket_suggestions(
         .store()
         .entry(&key)
         .await
-        .map_err(storage_module_error)?
+        .map_err(|error| storage_module_error(&error))?
     else {
         return Ok(());
     };
@@ -568,10 +572,10 @@ pub(crate) async fn cancel_ticket_suggestions(
     state.cancelled = true;
     state.terms.clear();
     state.candidates.clear();
-    state.after_key = PREFIX.to_owned();
+    PREFIX.clone_into(&mut state.after_key);
     state.expires_at = ctx
         .now()
-        .saturating_add(SUGGESTION_STATE_TTL.as_secs() as i64);
+        .saturating_add(SUGGESTION_STATE_TTL.as_secs().cast_signed());
     match ctx
         .store()
         .replace(
@@ -583,7 +587,7 @@ pub(crate) async fn cancel_ticket_suggestions(
         .await
     {
         Ok(_) | Err(StorageError::Conflict) => Ok(()),
-        Err(error) => Err(storage_module_error(error)),
+        Err(error) => Err(storage_module_error(&error)),
     }
 }
 
@@ -598,7 +602,7 @@ pub(crate) async fn suggestion_job(cx: JobCx) -> Result<(), ModuleError> {
         .store()
         .entry(&state_key)
         .await
-        .map_err(storage_module_error)?
+        .map_err(|error| storage_module_error(&error))?
     else {
         return Ok(());
     };
@@ -618,10 +622,10 @@ pub(crate) async fn suggestion_job(cx: JobCx) -> Result<(), ModuleError> {
         if complete {
             break;
         }
-        complete = scan_suggestion_batch(&ctx, &mut state).await?;
+        complete = scan_suggestion_batch(ctx, &mut state).await?;
     }
     state.complete = complete;
-    state.expires_at = now.saturating_add(SUGGESTION_STATE_TTL.as_secs() as i64);
+    state.expires_at = now.saturating_add(SUGGESTION_STATE_TTL.as_secs().cast_signed());
     let revision = match ctx
         .store()
         .replace(
@@ -634,12 +638,12 @@ pub(crate) async fn suggestion_job(cx: JobCx) -> Result<(), ModuleError> {
     {
         Ok(revision) => revision,
         Err(StorageError::Conflict) => return Ok(()),
-        Err(error) => return Err(storage_module_error(error)),
+        Err(error) => return Err(storage_module_error(&error)),
     };
     if state.complete {
-        finish_suggestion_job(&cx, &ctx, &state_key, state, revision).await
+        finish_suggestion_job(&cx, ctx, &state_key, state, revision).await
     } else {
-        schedule_suggestion_job(&ctx, &state, SUGGESTION_JOB_DELAY).await
+        schedule_suggestion_job(ctx, &state, SUGGESTION_JOB_DELAY).await
     }
 }
 
@@ -651,10 +655,10 @@ async fn scan_suggestion_batch(
         .store()
         .list_after(PREFIX, &state.after_key, ARTICLE_SCAN_BATCH)
         .await
-        .map_err(storage_module_error)?;
+        .map_err(|error| storage_module_error(&error))?;
     let count = entries.len();
     for (key, entry) in entries {
-        state.after_key = key.clone();
+        state.after_key.clone_from(&key);
         let article = article_from_entry(&key, entry)
             .map_err(|_| ModuleError::other("knowledge suggestions could not be loaded"))?;
         if article.deleted || !article.published {
@@ -757,7 +761,7 @@ async fn ticket_is_open_for_suggestions(
         .store()
         .entry(&key)
         .await
-        .map_err(storage_module_error)?
+        .map_err(|error| storage_module_error(&error))?
     else {
         return Ok(false);
     };
@@ -783,10 +787,10 @@ async fn mark_suggestion_notified(
     state.cancelled = true;
     state.terms.clear();
     state.candidates.clear();
-    state.after_key = PREFIX.to_owned();
+    PREFIX.clone_into(&mut state.after_key);
     state.expires_at = ctx
         .now()
-        .saturating_add(SUGGESTION_STATE_TTL.as_secs() as i64);
+        .saturating_add(SUGGESTION_STATE_TTL.as_secs().cast_signed());
     match ctx
         .store()
         .replace(
@@ -799,7 +803,7 @@ async fn mark_suggestion_notified(
     {
         Ok(_) => Ok(true),
         Err(StorageError::Conflict) => Ok(false),
-        Err(error) => Err(storage_module_error(error)),
+        Err(error) => Err(storage_module_error(&error)),
     }
 }
 
@@ -1010,7 +1014,12 @@ pub(crate) async fn add(cx: CommandCx, args: AddArgs) -> Result<(), UserError> {
     cx.defer(true).await?;
     let ctx = cx.ctx();
     let key = article_key(&article.id);
-    let expect = match ctx.store().entry(&key).await.map_err(storage_error)? {
+    let expect = match ctx
+        .store()
+        .entry(&key)
+        .await
+        .map_err(|error| storage_error(&error))?
+    {
         None => Expect::Missing,
         Some(entry) => {
             let revision = entry.revision;
@@ -1024,7 +1033,7 @@ pub(crate) async fn add(cx: CommandCx, args: AddArgs) -> Result<(), UserError> {
         Ok(_) => {
             record_knowledge_success(
                 &cx,
-                &ctx,
+                ctx,
                 crate::audit::AuditAction::KnowledgeCreate,
                 "knowledge-create",
             )
@@ -1036,7 +1045,7 @@ pub(crate) async fn add(cx: CommandCx, args: AddArgs) -> Result<(), UserError> {
             .await
         }
         Err(StorageError::Conflict) => Err(UserError::message("tickets-knowledge-id-exists")),
-        Err(error) => Err(storage_error(error)),
+        Err(error) => Err(storage_error(&error)),
     }
 }
 
@@ -1080,7 +1089,7 @@ pub(crate) async fn edit(cx: CommandCx, args: EditArgs) -> Result<(), UserError>
         Ok(_) => {
             record_knowledge_success(
                 &cx,
-                &ctx,
+                ctx,
                 crate::audit::AuditAction::KnowledgeUpdate,
                 "knowledge-update",
             )
@@ -1092,7 +1101,7 @@ pub(crate) async fn edit(cx: CommandCx, args: EditArgs) -> Result<(), UserError>
             .await
         }
         Err(StorageError::Conflict) => Err(UserError::message("tickets-knowledge-changed")),
-        Err(error) => Err(storage_error(error)),
+        Err(error) => Err(storage_error(&error)),
     }
 }
 
@@ -1136,7 +1145,7 @@ pub(crate) async fn delete(cx: CommandCx, args: DeleteArgs) -> Result<(), UserEr
         Ok(_) => {
             record_knowledge_success(
                 &cx,
-                &ctx,
+                ctx,
                 crate::audit::AuditAction::KnowledgeDelete,
                 "knowledge-delete",
             )
@@ -1148,7 +1157,7 @@ pub(crate) async fn delete(cx: CommandCx, args: DeleteArgs) -> Result<(), UserEr
             .await
         }
         Err(StorageError::Conflict) => Err(UserError::message("tickets-knowledge-changed")),
-        Err(error) => Err(storage_error(error)),
+        Err(error) => Err(storage_error(&error)),
     }
 }
 
@@ -1164,7 +1173,7 @@ async fn scan_search_batch(
         .store()
         .list_after(PREFIX, &state.after_key, ARTICLE_SCAN_BATCH)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| storage_error(&error))?;
     let entry_count = entries.len();
     for (index, (key, entry)) in entries.into_iter().enumerate() {
         let article = article_from_entry(&key, entry)?;
@@ -1294,7 +1303,7 @@ async fn load_search_lookup(
         .store()
         .entry(&request_key)
         .await
-        .map_err(storage_error)?
+        .map_err(|error| storage_error(&error))?
     else {
         return Ok(SearchLookup {
             request_revision: None,
@@ -1318,7 +1327,12 @@ async fn load_search_lookup(
         });
     }
     let state_key = knowledge_search_state_key(owner, &request.token);
-    let Some(state_entry) = ctx.store().entry(&state_key).await.map_err(storage_error)? else {
+    let Some(state_entry) = ctx
+        .store()
+        .entry(&state_key)
+        .await
+        .map_err(|error| storage_error(&error))?
+    else {
         return Ok(SearchLookup {
             request_revision: Some(request_entry.revision),
             state_revision: None,
@@ -1378,7 +1392,7 @@ async fn start_search(
     let state_key = knowledge_search_state_key(owner, &token);
     persist_search_state(ctx, &state_key, &state, Expect::Missing)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| storage_error(&error))?;
     let request_key = knowledge_search_request_key(owner, query, page);
     let request = KnowledgeSearchRequest {
         owner,
@@ -1403,12 +1417,14 @@ async fn start_search(
             }
             return reply_search_queued(cx, query, page + 1).await;
         }
-        Err(error) => return Err(storage_error(error)),
+        Err(error) => return Err(storage_error(&error)),
     }
     schedule_search_job(ctx, &state, SEARCH_JOB_DELAY).await?;
     reply_search_queued(cx, query, page + 1).await
 }
 
+// shortcut: keep revisioned restart inputs explicit; bundle them only if this helper grows.
+#[allow(clippy::too_many_arguments)]
 async fn restart_search(
     cx: &CommandCx,
     ctx: &EventContext,
@@ -1428,7 +1444,7 @@ async fn restart_search(
         if matches!(error, StorageError::Conflict) {
             return reply_search_queued(cx, query, page + 1).await;
         }
-        return Err(storage_error(error));
+        return Err(storage_error(&error));
     }
     let request_key = knowledge_search_request_key(owner, query, page);
     let request = KnowledgeSearchRequest {
@@ -1451,7 +1467,7 @@ async fn restart_search(
         if matches!(error, StorageError::Conflict) {
             return reply_search_queued(cx, query, page + 1).await;
         }
-        return Err(storage_error(error));
+        return Err(storage_error(&error));
     }
     schedule_search_job(ctx, &state, SEARCH_JOB_DELAY).await?;
     reply_search_queued(cx, query, page + 1).await
@@ -1463,7 +1479,7 @@ fn reset_search_state(
     now: i64,
 ) -> Result<(), UserError> {
     state.locale = locale;
-    state.after_key = PREFIX.to_owned();
+    PREFIX.clone_into(&mut state.after_key);
     state.matched = 0;
     state.results.clear();
     state.expires_at = search_expiry(now, false)?;
@@ -1600,6 +1616,8 @@ async fn refresh_search_results(
     Ok(true)
 }
 
+// shortcut: keep delivery and revision handling together; bundle inputs if another is added.
+#[allow(clippy::too_many_arguments)]
 async fn finish_search_job(
     cx: &JobCx,
     ctx: &EventContext,
@@ -1631,10 +1649,10 @@ async fn finish_search_job(
                     Some(search_state_ttl(&state, ctx.now())),
                 )
                 .await
-                .map_err(storage_module_error)?;
+                .map_err(|error| storage_module_error(&error))?;
             let _ = refresh_search_request(ctx, request_key, request, request_revision, &state)
                 .await
-                .map_err(storage_module_error)?;
+                .map_err(|error| storage_module_error(&error))?;
             let _ = revision;
             return Ok(());
         }
@@ -1660,11 +1678,11 @@ async fn finish_search_job(
         {
             Ok(revision) => revision,
             Err(StorageError::Conflict) => return Ok(()),
-            Err(error) => return Err(storage_module_error(error)),
+            Err(error) => return Err(storage_module_error(&error)),
         };
         match refresh_search_request(ctx, request_key, request, request_revision, &state).await {
             Ok(_) | Err(StorageError::Conflict) => {}
-            Err(error) => return Err(storage_module_error(error)),
+            Err(error) => return Err(storage_module_error(&error)),
         }
         let _ = revision;
         return schedule_search_job(ctx, &state, SEARCH_JOB_DELAY)
@@ -1698,7 +1716,7 @@ async fn finish_search_job(
         .await
     {
         Ok(_) | Err(StorageError::Conflict) => {}
-        Err(error) => return Err(storage_module_error(error)),
+        Err(error) => return Err(storage_module_error(&error)),
     }
     Ok(())
 }
@@ -1753,7 +1771,12 @@ async fn read_article_record(
     id: &str,
 ) -> Result<Option<(Article, i64)>, UserError> {
     let key = article_key(id);
-    let Some(entry) = ctx.store().entry(&key).await.map_err(storage_error)? else {
+    let Some(entry) = ctx
+        .store()
+        .entry(&key)
+        .await
+        .map_err(|error| storage_error(&error))?
+    else {
         return Ok(None);
     };
     let revision = entry.revision;
@@ -1804,7 +1827,7 @@ fn valid_article(article: &Article) -> bool {
                 })
                 && valid_labels(&article.categories, MAX_CATEGORY_CHARS)
                 && valid_labels(&article.keywords, MAX_KEYWORD_CHARS)
-                && valid_custom_embed(&article.custom_embed)
+                && valid_custom_embed(article.custom_embed.as_ref())
                 && serde_json::to_vec(article).is_ok_and(|value| value.len() <= MAX_VALUE_BYTES)
         }
 }
@@ -1823,7 +1846,7 @@ fn valid_labels(values: &[String], max_chars: usize) -> bool {
         == values.len()
 }
 
-fn valid_custom_embed(embed: &Option<Value>) -> bool {
+fn valid_custom_embed(embed: Option<&Value>) -> bool {
     let Some(embed) = embed else {
         return true;
     };
@@ -1875,12 +1898,12 @@ fn matches_query(article: &Article, query: &str) -> bool {
             .any(|keyword| keyword.to_lowercase().contains(query))
 }
 
-fn storage_error(error: StorageError) -> UserError {
+fn storage_error(error: &StorageError) -> UserError {
     tracing::warn!(?error, "knowledge article storage operation failed");
     UserError::message("tickets-knowledge-storage-failed")
 }
 
-fn storage_module_error(error: StorageError) -> ModuleError {
+fn storage_module_error(error: &StorageError) -> ModuleError {
     ModuleError::other(error.to_string())
 }
 
@@ -2011,6 +2034,8 @@ pub(crate) async fn public_article(
     Ok(Some(public_projection(article)))
 }
 
+// shortcut: keep the bounded scan and projection together; split if another phase is added.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn public_state(
     ctx: &EventContext,
     query: Option<&str>,
@@ -2169,7 +2194,7 @@ async fn create_public_cursor(
             query: query.clone(),
             category: category.clone(),
             after_key: after_key.clone(),
-            expires_at: now.saturating_add(PUBLIC_CURSOR_TTL.as_secs() as i64),
+            expires_at: now.saturating_add(PUBLIC_CURSOR_TTL.as_secs().cast_signed()),
         };
         match ctx
             .store()
@@ -2182,7 +2207,7 @@ async fn create_public_cursor(
             .await
         {
             Ok(_) => return Ok(token),
-            Err(StorageError::Conflict) => continue,
+            Err(StorageError::Conflict) => (),
             Err(_) => {
                 return Err(DashboardActionError::Internal(
                     "public knowledge could not be paged".to_owned(),
@@ -2195,6 +2220,8 @@ async fn create_public_cursor(
     ))
 }
 
+// shortcut: keep the authorized CRUD action flow together; split when another action is added.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn dashboard_action(
     ctx: &EventContext,
     _actor: &closure_core::permission::Actor,
@@ -2254,7 +2281,7 @@ pub(crate) async fn dashboard_action(
                             == Some(request.idempotency_key.as_str())
                             && same_article_content(&current, &article)
                         {
-                            return Ok(dashboard_article_result(current, revision));
+                            return Ok(dashboard_article_result(&current, revision));
                         }
                         return Err(DashboardActionError::Conflict);
                     }
@@ -2271,7 +2298,7 @@ pub(crate) async fn dashboard_action(
                 .replace(&key, &article, expect, None)
                 .await
                 .map_err(dashboard_storage_error)?;
-            Ok(dashboard_article_result(article, revision))
+            Ok(dashboard_article_result(&article, revision))
         }
         "knowledge.update" => {
             let input: DashboardArticleInput = serde_json::from_value(request.data.clone())
@@ -2298,7 +2325,7 @@ pub(crate) async fn dashboard_action(
                     == Some(request.idempotency_key.as_str())
                     && same_article_content(&current, &article)
                 {
-                    return Ok(dashboard_article_result(current, current_revision));
+                    return Ok(dashboard_article_result(&current, current_revision));
                 }
                 return Err(DashboardActionError::PreconditionFailed {
                     current: current_revision,
@@ -2309,7 +2336,7 @@ pub(crate) async fn dashboard_action(
                 .replace(&key, &article, Expect::Revision(current_revision), None)
                 .await
                 .map_err(dashboard_conflict_error)?;
-            Ok(dashboard_article_result(article, revision))
+            Ok(dashboard_article_result(&article, revision))
         }
         "knowledge.delete" => {
             let input: DashboardArticleId = serde_json::from_value(request.data.clone())
@@ -2470,7 +2497,7 @@ fn dashboard_article_from_entry(
 }
 
 fn dashboard_article_result(
-    article: Article,
+    article: &Article,
     revision: i64,
 ) -> closure_core::module::DashboardActionResult {
     closure_core::module::DashboardActionResult {

@@ -16,7 +16,7 @@ const TICKET_PREFIX: &str = "ticket:";
 const JOB_PREFIX: &str = "ticket-dashboard-analytics:";
 const JOB_COUNTER: &str = "ticket-dashboard-analytics-job";
 const BATCH_SIZE: usize = 250;
-const JOB_TTL: Duration = Duration::from_secs(15 * 60);
+const JOB_TTL: Duration = Duration::from_mins(15);
 const SECONDS_PER_DAY: i64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,12 +242,9 @@ async fn scan_histories(
     let exhausted = entries.len() < BATCH_SIZE;
     for (key, entry) in entries {
         job.after_key = Some(key);
-        let history: TicketHistory = match serde_json::from_value(entry.value) {
-            Ok(history) => history,
-            Err(_) => {
-                job.totals.has_unreadable_records = true;
-                continue;
-            }
+        let Ok(history) = serde_json::from_value(entry.value) else {
+            job.totals.has_unreadable_records = true;
+            continue;
         };
         if !history_visible(&history, actor, config, job.access.can_manage) {
             continue;
@@ -285,20 +282,17 @@ async fn scan_open_tickets(
     let exhausted = entries.len() < BATCH_SIZE;
     for (key, entry) in entries {
         job.after_key = Some(key.clone());
-        if !key
+        if key
             .strip_prefix(TICKET_PREFIX)
             .and_then(|id| id.parse::<u64>().ok())
-            .is_some_and(|id| id > 0)
+            .is_none_or(|id| id == 0)
         {
             job.totals.has_unreadable_records = true;
             continue;
         }
-        let ticket: Ticket = match serde_json::from_value(entry.value) {
-            Ok(ticket) => ticket,
-            Err(_) => {
-                job.totals.has_unreadable_records = true;
-                continue;
-            }
+        let Ok(ticket) = serde_json::from_value(entry.value) else {
+            job.totals.has_unreadable_records = true;
+            continue;
         };
         let access = config.for_ticket(&ticket);
         let roles = history_staff_roles(&ticket, &access);
@@ -363,7 +357,7 @@ fn accumulate_history(
             totals.duration_samples = totals.duration_samples.saturating_add(1);
             totals.duration_total_seconds = totals
                 .duration_total_seconds
-                .saturating_add((history.closed - history.created) as u64);
+                .saturating_add((history.closed - history.created).cast_unsigned());
         } else {
             totals.duration_missing = totals.duration_missing.saturating_add(1);
         }
@@ -448,6 +442,7 @@ fn job_key(ctx: &EventContext, actor: &Actor, period_days: u16, cursor: &str) ->
     )
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn job_result(job: &AnalyticsJob, cursor: &str, revision: i64) -> DashboardActionResult {
     let complete = job.phase == Phase::Complete;
     let duration_average = (job.totals.duration_samples > 0)

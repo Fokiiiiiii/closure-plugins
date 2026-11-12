@@ -1,5 +1,5 @@
 //! Ticket panel, participant-role, and reply-waiting operations.
-//! Ticket state changes are CAS-written and use ticket_ttl so close/history fences survive.
+//! Ticket state changes are CAS-written and use `ticket_ttl` so close/history fences survive.
 
 use closure_core::action::{
     Action, ChannelPatch, MentionPolicy, Outcome, OverwriteSpec, OverwriteTarget, Reason,
@@ -49,8 +49,8 @@ pub(super) enum PendingOperation {
         token: i64,
         lease_until: i64,
         phase: PanelPhase,
-        panel: Option<NamedPanel>,
-        settings: Config,
+        panel: Option<Box<NamedPanel>>,
+        settings: Box<Config>,
         staff_roles: Vec<u64>,
         old_staff_roles: Vec<u64>,
         old_parent: Option<u64>,
@@ -302,9 +302,10 @@ async fn current_text_parent(
     if found.kind != ChannelType::GuildText {
         return Err(UserError::message("tickets-not-a-ticket"));
     }
-    Ok(found.parent_id.map(|parent| parent.get()))
+    Ok(found.parent_id.map(twilight_model::id::Id::get))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn validate_panel(
     ctx: &EventContext,
     ticket: &Ticket,
@@ -325,7 +326,7 @@ async fn validate_panel(
         ctx.guild_id.get(),
     )?;
     let mut staff_roles = staff_access.as_ref().map_or_else(
-        || base_roles.iter().map(|role| role.get()).collect(),
+        || base_roles.iter().map(twilight_model::id::Id::get).collect(),
         super::teams_survey::staff_roles,
     );
     staff_roles.sort_unstable();
@@ -671,7 +672,7 @@ pub(super) async fn retry_pending_job(cx: JobCx) -> Result<(), ModuleError> {
     }
     if operation_lease(operation) > ctx.now() {
         return schedule_operation_recovery(
-            &ctx,
+            ctx,
             channel,
             recovery.token,
             operation_lease(operation),
@@ -679,7 +680,7 @@ pub(super) async fn retry_pending_job(cx: JobCx) -> Result<(), ModuleError> {
         .await;
     }
 
-    match resume_pending(&ctx, channel).await {
+    match Box::pin(resume_pending(ctx, channel)).await {
         Ok(Some(until)) => {
             if let Some(ticket) = ctx
                 .store()
@@ -689,7 +690,7 @@ pub(super) async fn retry_pending_job(cx: JobCx) -> Result<(), ModuleError> {
                 && let Some(operation) = ticket.pending_operation.as_ref()
             {
                 return schedule_operation_recovery(
-                    &ctx,
+                    ctx,
                     channel,
                     operation_token(operation),
                     until.max(operation_lease(operation)),
@@ -709,7 +710,7 @@ pub(super) async fn retry_pending_job(cx: JobCx) -> Result<(), ModuleError> {
                 && let Some(operation) = ticket.pending_operation.as_ref()
             {
                 schedule_operation_recovery(
-                    &ctx,
+                    ctx,
                     channel,
                     operation_token(operation),
                     (ctx.now() + OPERATION_RETRY_SECONDS).max(operation_lease(operation)),
@@ -1017,6 +1018,7 @@ async fn apply_team_role_policy(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn restore_team_role_policy(
     ctx: &EventContext,
     channel: ChannelId,
@@ -1084,6 +1086,7 @@ async fn apply_team_user_policy(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn restore_team_user_policy(
     ctx: &EventContext,
     channel: ChannelId,
@@ -1313,6 +1316,7 @@ async fn move_text_ticket(
         .map_err(|error| stored(&error))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_panel(
     ctx: &EventContext,
     channel: ChannelId,
@@ -1373,16 +1377,15 @@ async fn finish_panel(
             .await
         {
             Ok(_) => {
-                if settings.close_after_days > 0 {
-                    if let Err(error) = super::watch(
+                if settings.close_after_days > 0
+                    && let Err(error) = super::watch(
                         ctx,
                         channel,
                         ctx.now() + i64::from(settings.close_after_days) * super::DAY,
                     )
                     .await
-                    {
-                        tracing::warn!(?error, %channel, "could not reschedule ticket idle close");
-                    }
+                {
+                    tracing::warn!(?error, %channel, "could not reschedule ticket idle close");
                 }
                 return Ok(());
             }
@@ -1519,6 +1522,7 @@ async fn commit_user(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn apply_panel_forward(
     ctx: &EventContext,
     channel: ChannelId,
@@ -1547,8 +1551,8 @@ async fn apply_panel_forward(
             user_baselines,
             ..
         }) => (
-            panel.clone(),
-            settings.clone(),
+            panel.as_deref().cloned(),
+            settings.as_ref().clone(),
             staff_roles.clone(),
             old_staff_roles.clone(),
             target_staff_access.clone(),
@@ -1642,7 +1646,7 @@ async fn apply_panel_forward(
     let role_baselines = if let Some(baselines) = saved_role_baselines.clone() {
         baselines
     } else {
-        let baselines = target_roles
+        target_roles
             .iter()
             .map(|role| {
                 if ticket
@@ -1660,8 +1664,7 @@ async fn apply_panel_forward(
                     role_access(overwrites, *role).unwrap_or_else(|| empty_access(*role))
                 }
             })
-            .collect::<Vec<_>>();
-        baselines
+            .collect::<Vec<_>>()
     };
     let opener = UserId::new(ticket.opener);
     let bot = ctx.bot();
@@ -1945,6 +1948,7 @@ async fn clear_panel_operation(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn apply_panel_rollback(
     ctx: &EventContext,
     channel: ChannelId,
@@ -1971,7 +1975,7 @@ async fn apply_panel_rollback(
             phase: PanelPhase::Rollback,
             ..
         }) => (
-            settings.clone(),
+            settings.as_ref().clone(),
             old_staff_roles.clone(),
             *old_parent,
             target_staff_access.clone(),
@@ -2261,6 +2265,7 @@ async fn apply_pending(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let channel = cx.invocation().channel_id;
@@ -2288,7 +2293,7 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
             .reply_private_t("tickets-team-thread-conflict", &Args::new())
             .await;
     }
-    if resume_pending(ctx, channel)
+    if Box::pin(resume_pending(ctx, channel))
         .await
         .map_err(|error| failed(&error))?
         .is_some()
@@ -2335,8 +2340,8 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
             token: 0,
             lease_until: 0,
             phase: PanelPhase::Forward,
-            panel: panel.clone(),
-            settings: settings.clone(),
+            panel: panel.clone().map(Box::new),
+            settings: Box::new(settings.clone()),
             staff_roles,
             old_staff_roles,
             old_parent,
@@ -2389,6 +2394,7 @@ pub(super) async fn set_panel(cx: CommandCx, args: SetPanelArgs) -> Result<(), U
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn change_role(cx: CommandCx, args: RoleArgs, add: bool) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let channel = cx.invocation().channel_id;
@@ -2409,7 +2415,7 @@ async fn change_role(cx: CommandCx, args: RoleArgs, add: bool) -> Result<(), Use
         return Err(UserError::message("tickets-thread-role-unavailable"));
     }
     cx.defer(true).await?;
-    if resume_pending(ctx, channel)
+    if Box::pin(resume_pending(ctx, channel))
         .await
         .map_err(|error| failed(&error))?
         .is_some()
@@ -2511,11 +2517,11 @@ async fn change_role(cx: CommandCx, args: RoleArgs, add: bool) -> Result<(), Use
 }
 
 pub(super) async fn add_role(cx: CommandCx, args: RoleArgs) -> Result<(), UserError> {
-    change_role(cx, args, true).await
+    Box::pin(change_role(cx, args, true)).await
 }
 
 pub(super) async fn remove_role(cx: CommandCx, args: RoleArgs) -> Result<(), UserError> {
-    change_role(cx, args, false).await
+    Box::pin(change_role(cx, args, false)).await
 }
 
 pub(super) async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Result<(), UserError> {
@@ -2535,7 +2541,7 @@ pub(super) async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Res
         return Err(UserError::message("tickets-staff-only"));
     }
     cx.defer(true).await?;
-    if resume_pending(ctx, channel)
+    if Box::pin(resume_pending(ctx, channel))
         .await
         .map_err(|error| failed(&error))?
         .is_some()
@@ -2623,7 +2629,7 @@ pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), User
     let channel = cx.invocation().channel_id;
     let config: Config = cx.config()?;
     cx.defer(true).await?;
-    if resume_pending(ctx, channel)
+    if Box::pin(resume_pending(ctx, channel))
         .await
         .map_err(|error| failed(&error))?
         .is_some()
@@ -2693,8 +2699,8 @@ pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), User
                 } else {
                     "tickets-waiting-cleared"
                 };
-                if changed {
-                    if let Err(error) = ctx
+                if changed
+                    && let Err(error) = ctx
                         .api
                         .execute(Action::SendMessage {
                             channel_id: channel,
@@ -2704,9 +2710,8 @@ pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), User
                             mentions: MentionPolicy::None,
                         })
                         .await
-                    {
-                        tracing::warn!(?error, %channel, "could not announce ticket reply status");
-                    }
+                {
+                    tracing::warn!(?error, %channel, "could not announce ticket reply status");
                 }
                 return cx.reply_private_t(message, &Args::new()).await;
             }

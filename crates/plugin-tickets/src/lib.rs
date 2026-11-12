@@ -8,11 +8,9 @@
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
-use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-use closure_core::action::MessageCursor;
 use closure_core::action::{
     Action, ChannelKind, ChannelPatch, FileUpload, MentionPolicy, NewChannel, Outcome,
     OverwriteSpec, OverwriteTarget, Reason, ThreadKind, ThreadPatch,
@@ -56,16 +54,15 @@ const CLOSE_REQUESTS: &str = "close-requests";
 const CLOSING: &str = "closing";
 const FORM: &str = "form";
 const MAX_TICKET_CUSTOM_ID_BYTES: usize = 100;
-const MAX_FORM_QUESTION_CHARS: usize = advanced_forms::MAX_FORM_QUESTION_CHARS;
 const MAX_TICKET_BYTES: usize = 32 * 1024;
 const HISTORY_PREFIX: &str = "ticket-history:";
 const HISTORY_LINK_PREFIX: &str = "ticket-history-link:";
 const HISTORY_CONTENT_PREFIX: &str = "ticket-history-content:";
 const HISTORY_INDEX_PREFIX: &str = "ticket-history-index:";
 const HISTORY_ID_PREFIX: &str = "ticket-history-id:";
-const HISTORY_TTL: Duration = Duration::from_secs(31_536_000);
+const HISTORY_TTL: Duration = Duration::from_days(365);
 const HISTORY_SEARCH_SESSION_PREFIX: &str = "ticket-history-search-session:";
-const HISTORY_SEARCH_TTL: Duration = Duration::from_secs(15 * 60);
+const HISTORY_SEARCH_TTL: Duration = Duration::from_minutes(15);
 const HISTORY_SEARCH_BATCH: usize = 25;
 const HISTORY_SEARCH_PAGE_BUDGET: usize = 32;
 const HISTORY_SEARCH_NORMALIZED_CHARS: usize = 300;
@@ -94,10 +91,9 @@ const REPLY_CHUNK_MAX_UTF16: usize = 2_000;
 const REPLY_SEND_COUNTER: &str = "ticket-reply-send";
 const REPLY_SEND_RETENTION: Duration = Duration::from_hours(24 * 30);
 /// How many messages a transcript holds at most: 100 for each of 50 pages.
-const TRANSCRIPT_PAGES: usize = 50;
 /// A ticket nobody writes in is looked at again after at most this long.
 const DAY: i64 = 86_400;
-/// Store::list caps results; ticket keys can be partitioned by channel ID digits.
+/// `Store::list` caps results; ticket keys can be partitioned by channel ID digits.
 const TICKET_LIST_LIMIT: usize = 1000;
 const CHANNEL_ID_DIGITS: usize = 20;
 /// What the member and the staff may do in a ticket.
@@ -255,8 +251,7 @@ impl Config {
             .form_id
             .as_deref()
             .and_then(|id| form_library::resolve_form(&self.forms, id))
-            .map(|form| form.questions.clone())
-            .unwrap_or_else(|| panel.questions.clone());
+            .map_or_else(|| panel.questions.clone(), |form| form.questions.clone());
         Self {
             category: panel.category.clone(),
             thread_channel: panel.thread_channel.clone(),
@@ -387,7 +382,7 @@ struct TicketRating {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-
+#[allow(clippy::struct_excessive_bools)]
 struct TicketHistory {
     version: u8,
     #[serde(default)]
@@ -628,6 +623,7 @@ struct CloseAttempt<'a> {
     attempt: i64,
 }
 
+#[derive(Clone, Copy)]
 struct TranscriptInfo {
     pages: u32,
     index_pages: u32,
@@ -737,6 +733,7 @@ struct OpenRecovery {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum OpenReservationResult {
     Reserved(OpenReservation),
     GlobalLimit(u32),
@@ -1828,6 +1825,7 @@ async fn save_open_ticket(
     result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn save_open_ticket_locked(
     ctx: &EventContext,
     user: u64,
@@ -1910,12 +1908,11 @@ async fn save_open_ticket_locked(
                 .set_for(&key, &ticket, ticket_ttl(&ticket, ctx.now()))
                 .await
             {
-                if externalized {
-                    if let Err(cleanup_error) =
+                if externalized
+                    && let Err(cleanup_error) =
                         advanced_forms::delete_ticket_form_answers(ctx, &ticket).await
-                    {
-                        tracing::warn!(?cleanup_error, channel = %channel, number = ticket.number, "could not clean up external ticket form answers");
-                    }
+                {
+                    tracing::warn!(?cleanup_error, channel = %channel, number = ticket.number, "could not clean up external ticket form answers");
                 }
                 return Err(stored(&error));
             }
@@ -1973,6 +1970,7 @@ async fn save_open_ticket_locked(
     Ok(true)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket) {
     if let Err(error) = add_team_users_to_thread(ctx, channel, ticket).await {
         tracing::warn!(?error, %channel, "ticket team members could not be added to the thread");
@@ -2006,7 +2004,7 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
         Ok(Some(embed)) => welcome_embeds.insert(0, embed),
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(?error, channel = %channel, "custom ticket welcome embed could not be built")
+            tracing::warn!(?error, channel = %channel, "custom ticket welcome embed could not be built");
         }
     }
     let welcome = ctx
@@ -2155,6 +2153,7 @@ async fn add_team_users_to_thread(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn post_ticket_message_quote(
     ctx: &EventContext,
     channel: ChannelId,
@@ -2509,6 +2508,7 @@ async fn claim_open_recovery(
     result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn open_recovery_job(cx: JobCx) -> Result<(), ModuleError> {
     let job: OpenRecovery = cx.payload()?;
     let ctx = cx.ctx();
@@ -2613,11 +2613,11 @@ async fn open_recovery_job(cx: JobCx) -> Result<(), ModuleError> {
             }
         }
     }
-    if let OpenChannelLookup::Found(channel) = recover_open_channel(ctx, &reservation).await? {
-        if save_open_ticket(ctx, job.opener, &reservation, channel).await? {
-            let ticket = ticket_from_reservation(&reservation, job.opener);
-            announce_ticket(ctx, channel, &ticket).await;
-        }
+    if let OpenChannelLookup::Found(channel) = recover_open_channel(ctx, &reservation).await?
+        && save_open_ticket(ctx, job.opener, &reservation, channel).await?
+    {
+        let ticket = ticket_from_reservation(&reservation, job.opener);
+        announce_ticket(ctx, channel, &ticket).await;
     }
     Ok(())
 }
@@ -2887,6 +2887,7 @@ async fn release_open_command(cx: CommandCx, args: OpenReservationArgs) -> Resul
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reserve_open(
     ctx: &EventContext,
     user: u64,
@@ -2932,6 +2933,7 @@ async fn reserve_open(
     clippy::too_many_lines,
     reason = "keeps counting, fencing and sharded reservation persistence in one critical flow"
 )]
+#[allow(clippy::too_many_arguments)]
 async fn reserve_open_locked(
     ctx: &EventContext,
     user: u64,
@@ -3403,20 +3405,6 @@ fn left_close_key(channel: ChannelId) -> String {
     format!("left-close-{}", channel.get())
 }
 
-async fn ticket_config(
-    ctx: &EventContext,
-    config: &Config,
-    channel: ChannelId,
-) -> Result<Config, UserError> {
-    let ticket = ctx
-        .store()
-        .get::<Ticket>(&ticket_key(channel))
-        .await
-        .map_err(|error| failed(&error))?
-        .ok_or_else(|| UserError::message("tickets-not-a-ticket"))?;
-    Ok(config.for_ticket(&ticket))
-}
-
 fn failed(error: &impl ToString) -> UserError {
     UserError::from(ModuleError::other(error.to_string()))
 }
@@ -3574,6 +3562,7 @@ async fn send_rating_prompt(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn send_history_link_dm(ctx: &EventContext, history: &TicketHistory) -> bool {
     if history.status != HistoryStatus::Closed || history.opener_erased {
         return false;
@@ -3935,10 +3924,10 @@ async fn stats_command(cx: CommandCx, _: StatsArgs) -> Result<(), UserError> {
         if ticket.closed {
             continue;
         }
-        if !ticket.is_open() {
-            closing += 1;
-        } else {
+        if ticket.is_open() {
             open += 1;
+        } else {
+            closing += 1;
         }
         if ticket.claimed_by.is_some() {
             assigned += 1;
@@ -4293,7 +4282,7 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
             .api
             .execute(Action::GetMessage {
                 channel_id: channel,
-                message_id: (*message_id).clone(),
+                message_id: *message_id,
             })
             .await
             .map_err(|_| UserError::message("tickets-panel-update-unavailable"))?
@@ -4324,14 +4313,13 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
         })
         .unwrap_or_else(|| cx.t("tickets-panel-text", &Args::new()));
     let total_to_publish = page_indexes.len();
-    let mut sent = 0;
-    for page_index in &page_indexes {
+    for (sent, page_index) in page_indexes.iter().enumerate() {
         let content = page_message_content(ctx, &base_content, *page_index + 1, page_count);
         let result = ctx
             .api
             .execute(Action::PostMessage {
                 channel_id: channel,
-                message_id: message_id.clone(),
+                message_id,
                 reply_to: None,
                 content: Some(content),
                 embeds: panel_embeds.clone(),
@@ -4353,7 +4341,6 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
                 )
                 .await;
         }
-        sent += 1;
     }
 
     let audit_key = format!("panel-resend-{}", cx.invocation().interaction_id.get());
@@ -4605,6 +4592,7 @@ fn panel_name_needs_nickname(panel: &NamedPanel) -> bool {
     }
 }
 
+#[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn open_panel(
     cx: ComponentCx,
     panel_id: Option<String>,
@@ -4848,6 +4836,7 @@ async fn open_panel(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
     cx.require("tickets.use").await?;
     let Some((module, form)) = CustomId::parse(&cx.submission().custom_id) else {
@@ -4925,17 +4914,17 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
             .reply_private_t("tickets-team-thread-conflict", &Args::new())
             .await;
     }
-    let panel = match reservation.panel.as_ref() {
-        Some(saved) => match original.named(&saved.id) {
-            Ok(panel) => Some(panel.clone()),
-            Err(_) => {
-                let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
-                return cx
-                    .reply_private_t("tickets-form-changed", &Args::new())
-                    .await;
-            }
-        },
-        None => None,
+    let panel = if let Some(saved) = reservation.panel.as_ref() {
+        if let Ok(panel) = original.named(&saved.id) {
+            Some(panel.clone())
+        } else {
+            let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+            return cx
+                .reply_private_t("tickets-form-changed", &Args::new())
+                .await;
+        }
+    } else {
+        None
     };
     if panel
         .as_ref()
@@ -5163,23 +5152,23 @@ async fn create_ticket<I: InteractionRef + 'static>(
             .reply_private_t("tickets-team-thread-conflict", &Args::new())
             .await;
     }
-    let current_panel = match panel.as_ref() {
-        Some(saved) => match current_original.named(&saved.id) {
-            Ok(panel) => Some(panel.clone()),
-            Err(_) => {
-                let _ = release_unstarted_open_reservation(
-                    ctx,
-                    user,
-                    reservation.number,
-                    reservation.generation,
-                )
+    let current_panel = if let Some(saved) = panel.as_ref() {
+        if let Ok(panel) = current_original.named(&saved.id) {
+            Some(panel.clone())
+        } else {
+            let _ = release_unstarted_open_reservation(
+                ctx,
+                user,
+                reservation.number,
+                reservation.generation,
+            )
+            .await;
+            return cx
+                .reply_private_t("tickets-form-changed", &Args::new())
                 .await;
-                return cx
-                    .reply_private_t("tickets-form-changed", &Args::new())
-                    .await;
-            }
-        },
-        None => None,
+        }
+    } else {
+        None
     };
     if current_panel
         .as_ref()
@@ -5362,17 +5351,17 @@ async fn create_ticket<I: InteractionRef + 'static>(
             .await;
             return Err(error);
         }
-    } else if let Some(parent) = config.category() {
-        if let Err(error) = ensure_category(ctx, parent).await {
-            let _ = release_unstarted_open_reservation(
-                ctx,
-                user,
-                reservation.number,
-                reservation.generation,
-            )
-            .await;
-            return Err(error);
-        }
+    } else if let Some(parent) = config.category()
+        && let Err(error) = ensure_category(ctx, parent).await
+    {
+        let _ = release_unstarted_open_reservation(
+            ctx,
+            user,
+            reservation.number,
+            reservation.generation,
+        )
+        .await;
+        return Err(error);
     }
     match mark_open_request_started(ctx, user, &reservation).await {
         Ok(true) => {}
@@ -5507,10 +5496,10 @@ async fn create_ticket<I: InteractionRef + 'static>(
         match remember_open_channel(ctx, user, &reservation, channel).await {
             Ok(true) => {}
             Ok(false) => {
-                tracing::warn!(guild = %ctx.guild_id, %channel, "ticket thread ID could not be persisted before setup")
+                tracing::warn!(guild = %ctx.guild_id, %channel, "ticket thread ID could not be persisted before setup");
             }
             Err(error) => {
-                tracing::warn!(?error, guild = %ctx.guild_id, %channel, "ticket thread ID could not be persisted before setup")
+                tracing::warn!(?error, guild = %ctx.guild_id, %channel, "ticket thread ID could not be persisted before setup");
             }
         }
     }
@@ -5541,7 +5530,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
             Ok(Some(embed)) => welcome_embeds.insert(0, embed),
             Ok(None) => {}
             Err(error) => {
-                tracing::warn!(?error, %channel, "custom ticket welcome embed could not be built")
+                tracing::warn!(?error, %channel, "custom ticket welcome embed could not be built");
             }
         }
         let welcome = ctx
@@ -5752,6 +5741,7 @@ fn made_at(id: u64) -> i64 {
 
 /// A job: the ticket is closed when nobody has written in it for the days of the settings, and
 /// looked at again when the time comes otherwise.
+#[allow(clippy::large_futures)]
 async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
     let job: Idle = cx.payload()?;
     let ctx = cx.ctx();
@@ -5805,6 +5795,7 @@ async fn idle_job(cx: JobCx) -> Result<(), ModuleError> {
 }
 
 /// A request that was not answered by its deadline closes the ticket.
+#[allow(clippy::large_futures)]
 async fn close_request_timeout_job(cx: JobCx) -> Result<(), ModuleError> {
     let job: CloseRequestTimeout = cx.payload()?;
     let ctx = cx.ctx();
@@ -5957,6 +5948,7 @@ async fn left_scan_job(cx: JobCx) -> Result<(), ModuleError> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn left_close_job(cx: JobCx) -> Result<(), ModuleError> {
     let job: LeftClose = cx.payload()?;
     let ctx = cx.ctx();
@@ -6000,74 +5992,6 @@ async fn left_close_job(cx: JobCx) -> Result<(), ModuleError> {
         close_left_later(ctx, channel, until).await?;
     }
     Ok(())
-}
-
-async fn transcript(
-    ctx: &EventContext,
-    channel: ChannelId,
-    ticket: &Ticket,
-) -> Result<(String, bool, usize), DiscordError> {
-    let mut messages = Vec::new();
-    let mut cursor = None;
-    let mut cut = false;
-    for page_number in 0..TRANSCRIPT_PAGES {
-        let page = ctx.api.get_messages(channel, cursor, 100).await?;
-        let Some(oldest) = page.last().map(|message| message.id) else {
-            break;
-        };
-        let full = page.len() == 100;
-        messages.extend(page);
-        if !full {
-            break;
-        }
-        if page_number + 1 == TRANSCRIPT_PAGES {
-            let older = ctx
-                .api
-                .get_messages(channel, Some(MessageCursor::Before(oldest)), 1)
-                .await?;
-            cut = transcript_is_incomplete(messages.len(), !older.is_empty());
-            break;
-        }
-        cursor = Some(MessageCursor::Before(oldest));
-    }
-    messages.reverse();
-    let mut text = ctx.t_in(
-        ctx.locale,
-        "tickets-transcript-head",
-        &Args::new()
-            .with("number", ticket.number)
-            .with("opener", ticket.opener.to_string()),
-    );
-    text.push('\n');
-    if cut {
-        text.push_str(&ctx.t_in(
-            ctx.locale,
-            "tickets-transcript-cut",
-            &Args::new().with("count", messages.len() as u64),
-        ));
-        text.push('\n');
-    }
-    for message in &messages {
-        let attached = message
-            .attachments
-            .iter()
-            .map(|file| file.url.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let _ = writeln!(
-            text,
-            "[{}] {} ({}): {} {attached}",
-            made_at(message.id.get()),
-            message.author.name,
-            message.author.id,
-            message.content.replace('\n', " ")
-        );
-    }
-    Ok((text, cut, messages.len()))
-}
-
-fn transcript_is_incomplete(messages: usize, older_message_exists: bool) -> bool {
-    messages == TRANSCRIPT_PAGES * 100 && older_message_exists
 }
 
 /// How long a close that began is waited for before another may take over.
@@ -6165,31 +6089,6 @@ async fn closing_job(cx: JobCx) -> Result<(), ModuleError> {
     complete_history_close(ctx, &closing, &history, true)
         .await
         .map(drop)
-}
-
-fn history_transcript(
-    ctx: &EventContext,
-    transcript: &str,
-    form_answers: &[(String, String)],
-) -> Option<String> {
-    if form_answers.is_empty() {
-        return None;
-    }
-    let mut text = transcript.to_owned();
-    let _ = writeln!(
-        text,
-        "\n{}",
-        ctx.t_in(ctx.locale, "tickets-transcript-answers-title", &Args::new(),)
-    );
-    for (question, answer) in form_answers {
-        let _ = writeln!(
-            text,
-            "- {}: {}",
-            question.replace(['\n', '\r'], " "),
-            answer.replace(['\n', '\r'], " "),
-        );
-    }
-    Some(text)
 }
 
 fn history_staff_roles(ticket: &Ticket, config: &Config) -> Vec<u64> {
@@ -6302,7 +6201,7 @@ fn history_record(
         anonymizing_user: None,
         operation_token: None,
         operation_until: 0,
-        log_copy_channel: closing.config.log().map(|channel| channel.get()),
+        log_copy_channel: closing.config.log().map(twilight_model::id::Id::get),
         log_copy_message: None,
         transcript_span_pages: transcript.span_pages,
         staff_access: closing.ticket.staff_access.clone(),
@@ -6367,6 +6266,7 @@ async fn write_history_pages(
     Ok(index_pages)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn save_history(
     ctx: &EventContext,
     closing: &CloseAttempt<'_>,
@@ -6600,8 +6500,7 @@ fn history_search_excerpt(text: &str, query: &str) -> Option<String> {
         .skip(start)
         .take(end.min(count).saturating_sub(start))
         .collect::<String>()
-        .replace('\n', " ")
-        .replace('\r', " ");
+        .replace(['\n', '\r'], " ");
     Some(format!(
         "{}{}{}",
         if start > 0 { "…" } else { "" },
@@ -6615,14 +6514,14 @@ fn history_search_metadata_excerpt(history: &TicketHistory, query: &str) -> Stri
     history_search_excerpt(&searchable, query).unwrap_or_else(|| {
         history
             .reason
-            .replace('\n', " ")
-            .replace('\r', " ")
+            .replace(['\n', '\r'], " ")
             .chars()
             .take(80)
             .collect()
     })
 }
 
+#[allow(clippy::large_enum_variant)]
 enum HistoryRecordSearch {
     Inaccessible,
     Match(TicketHistory, String),
@@ -6904,13 +6803,10 @@ async fn search_history_batch(
         }
         records += 1;
         processed += 1;
-        let history = match serde_json::from_value(entry.value) {
-            Ok(history) => history,
-            Err(_) => {
-                state.incomplete = true;
-                state.after_key = key;
-                continue;
-            }
+        let Ok(history) = serde_json::from_value(entry.value) else {
+            state.incomplete = true;
+            state.after_key = key;
+            continue;
         };
         let result = search_history_record(
             ctx,
@@ -7073,7 +6969,7 @@ fn history_search_update(content: String, components: Vec<Component>) -> Interac
 }
 
 fn history_search_display(text: &str, limit: usize) -> String {
-    let normalized = text.replace('\n', " ").replace('\r', " ");
+    let normalized = text.replace(['\n', '\r'], " ");
     let mut chars = normalized.chars();
     let display = chars.by_ref().take(limit).collect::<String>();
     if chars.next().is_some() {
@@ -7414,6 +7310,7 @@ async fn renew_close_lease(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn complete_history_close(
     ctx: &EventContext,
     closing: &CloseAttempt<'_>,
@@ -7460,11 +7357,10 @@ async fn complete_history_close(
     if !lease {
         return Ok(Closed::BusyUntil(ctx.now() + CLOSING_WAIT));
     }
-    if !recovery_job {
-        if let Err(error) = watch_closing(ctx, closing, ctx.now() + CLOSING_WAIT).await {
-            reopen(ctx, closing).await;
-            return Err(error);
-        }
+    if !recovery_job && let Err(error) = watch_closing(ctx, closing, ctx.now() + CLOSING_WAIT).await
+    {
+        reopen(ctx, closing).await;
+        return Err(error);
     }
     let not_found = if closing.ticket.thread {
         match ctx
@@ -7533,6 +7429,7 @@ async fn complete_history_close(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 async fn prepare_history(
     ctx: &EventContext,
     closing: &CloseAttempt<'_>,
@@ -7680,7 +7577,7 @@ async fn update_exit_survey_archive(
         .api
         .execute(Action::GetMessage {
             channel_id: channel,
-            message_id: message_id.clone(),
+            message_id,
         })
         .await
     {
@@ -7834,6 +7731,7 @@ async fn forget(
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn finish(
     ctx: &EventContext,
     channel: ChannelId,
@@ -7844,6 +7742,7 @@ async fn finish(
     finish_with_guard(ctx, channel, closer, reason, request_id, None).await
 }
 
+#[allow(clippy::large_futures)]
 pub(crate) async fn finish_if_automation_generation(
     ctx: &EventContext,
     channel: ChannelId,
@@ -7862,6 +7761,7 @@ pub(crate) async fn finish_if_automation_generation(
     .await
 }
 
+#[allow(clippy::large_futures)]
 async fn finish_with_guard(
     ctx: &EventContext,
     channel: ChannelId,
@@ -7989,6 +7889,7 @@ fn may_close(ticket: &Ticket, user: UserId, staff: bool) -> bool {
     staff || ticket.opener == user.get()
 }
 
+#[allow(clippy::large_futures)]
 async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
     let channel = cx.click().channel_id;
     let ctx = cx.ctx();
@@ -8031,16 +7932,15 @@ async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
             tracing::warn!(?error, channel = %channel, "could not record ticket close audit event");
         }
     }
-    if closed == Closed::RatingDmUnconfirmed {
-        if let Err(error) = cx
+    if closed == Closed::RatingDmUnconfirmed
+        && let Err(error) = cx
             .reply_private_t(
                 "tickets-rating-dm-fallback",
                 &Args::new().with("number", ticket.number),
             )
             .await
-        {
-            tracing::warn!(?error, channel = %channel, "could not tell the ticket closer about the rating fallback");
-        }
+    {
+        tracing::warn!(?error, channel = %channel, "could not tell the ticket closer about the rating fallback");
     }
     Ok(())
 }
@@ -8057,7 +7957,7 @@ async fn rate_button(cx: ComponentCx) -> Result<(), UserError> {
     };
     let ctx = cx.ctx();
     let result = submit_rating(
-        &ctx,
+        ctx,
         ChannelId::new(request.channel),
         request.number,
         request.attempt,
@@ -8066,11 +7966,11 @@ async fn rate_button(cx: ComponentCx) -> Result<(), UserError> {
     )
     .await?;
     if matches!(result, RatingSubmission::Saved) {
-        if let Some(history) = history_by_number(&ctx, request.number)
+        if let Some(history) = history_by_number(ctx, request.number)
             .await
             .map_err(|error| failed(&error))?
         {
-            let prompt_sent = teams_survey::send_exit_survey_prompt(&ctx, &history).await;
+            let prompt_sent = teams_survey::send_exit_survey_prompt(ctx, &history).await;
             if !prompt_sent
                 && teams_survey::maybe_open_exit_survey(
                     &cx,
@@ -8117,7 +8017,7 @@ async fn rate_command(cx: CommandCx, args: RateArgs) -> Result<(), UserError> {
             .await;
     }
     let ctx = cx.ctx();
-    let history = history_by_number(&ctx, args.ticket)
+    let history = history_by_number(ctx, args.ticket)
         .await
         .map_err(|error| failed(&error))?;
     let Some(history) = history else {
@@ -8126,7 +8026,7 @@ async fn rate_command(cx: CommandCx, args: RateArgs) -> Result<(), UserError> {
             .await;
     };
     let result = submit_rating(
-        &ctx,
+        ctx,
         ChannelId::new(history.channel_id),
         history.number,
         history.attempt,
@@ -8137,10 +8037,10 @@ async fn rate_command(cx: CommandCx, args: RateArgs) -> Result<(), UserError> {
     if matches!(
         result,
         RatingSubmission::Saved | RatingSubmission::AlreadyRated
-    ) && teams_survey::survey_open_component(&ctx, &history).is_some()
+    ) && teams_survey::survey_open_component(ctx, &history).is_some()
     {
         let prompt_sent = matches!(result, RatingSubmission::Saved)
-            && teams_survey::send_exit_survey_prompt(&ctx, &history).await;
+            && teams_survey::send_exit_survey_prompt(ctx, &history).await;
         if !prompt_sent {
             return teams_survey::survey_command(cx, history.number).await;
         }
@@ -8162,9 +8062,9 @@ async fn knowledge_send(cx: CommandCx, args: KnowledgeSendArgs) -> Result<(), Us
     cx.defer(true).await?;
     let channel = cx.invocation().channel_id;
     let ctx = cx.ctx();
-    staff_ticket(&cx, &ctx, channel).await?;
+    staff_ticket(&cx, ctx, channel).await?;
     let can_manage = cx.require("tickets.manage").await.is_ok();
-    knowledge::send_article(&ctx, channel, &args.id, can_manage)
+    knowledge::send_article(ctx, channel, &args.id, can_manage)
         .await
         .map_err(|error| failed(&error))?;
     cx.reply_private_t("tickets-knowledge-send-complete", &Args::new())
@@ -8273,6 +8173,7 @@ async fn expire_close_request(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn close_request_decision(cx: ComponentCx, approve: bool) -> Result<(), UserError> {
     let channel = cx.click().channel_id;
     let Some(request_id) = close_request_id(&cx, channel) else {
@@ -8380,14 +8281,17 @@ async fn close_request_decision(cx: ComponentCx, approve: bool) -> Result<(), Us
     say(&cx, "tickets-failed", &Args::new()).await
 }
 
+#[allow(clippy::large_futures)]
 async fn approve_close_request(cx: ComponentCx) -> Result<(), UserError> {
     close_request_decision(cx, true).await
 }
 
+#[allow(clippy::large_futures)]
 async fn reject_close_request(cx: ComponentCx) -> Result<(), UserError> {
     close_request_decision(cx, false).await
 }
 
+#[allow(clippy::large_futures)]
 async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
     let channel = cx.invocation().channel_id;
     let ctx = cx.ctx();
@@ -8442,16 +8346,15 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
             tracing::warn!(?error, channel = %channel, "could not record ticket close audit event");
         }
     }
-    if closed == Closed::RatingDmUnconfirmed {
-        if let Err(error) = cx
+    if closed == Closed::RatingDmUnconfirmed
+        && let Err(error) = cx
             .reply_private_t(
                 "tickets-rating-dm-fallback",
                 &Args::new().with("number", ticket.number),
             )
             .await
-        {
-            tracing::warn!(?error, channel = %channel, "could not tell the ticket closer about the rating fallback");
-        }
+    {
+        tracing::warn!(?error, channel = %channel, "could not tell the ticket closer about the rating fallback");
     }
     Ok(())
 }
@@ -8470,24 +8373,23 @@ async fn resend_close_request(
     }
     match post_close_request_message(cx.ctx(), channel, opener, request).await {
         Ok(()) => {
-            if let Some(deadline) = request.expires_at {
-                if let Err(error) =
+            if let Some(deadline) = request.expires_at
+                && let Err(error) =
                     watch_close_request_timeout(cx.ctx(), channel, request.id, deadline, deadline)
                         .await
-                {
-                    tracing::warn!(
-                        ?error,
-                        channel = %channel,
-                        request_id = request.id,
-                        "could not reschedule a close request timeout"
-                    );
-                    return cx
-                        .reply_private_t(
-                            "tickets-close-request-timeout-schedule-failed",
-                            &Args::new(),
-                        )
-                        .await;
-                }
+            {
+                tracing::warn!(
+                    ?error,
+                    channel = %channel,
+                    request_id = request.id,
+                    "could not reschedule a close request timeout"
+                );
+                return cx
+                    .reply_private_t(
+                        "tickets-close-request-timeout-schedule-failed",
+                        &Args::new(),
+                    )
+                    .await;
             }
             cx.reply_private_t("tickets-close-request-sent", &Args::new())
                 .await
@@ -8552,8 +8454,8 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
     } else {
         create_close_request(cx.clone(), ticket, revision, reason, timeout_hours).await
     };
-    if result.is_ok() {
-        if let Err(error) = audit::record_event(
+    if result.is_ok()
+        && let Err(error) = audit::record_event(
             ctx,
             actor_id,
             audit::AuditAction::TicketCloseRequest,
@@ -8561,13 +8463,13 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
             &audit_key,
         )
         .await
-        {
-            tracing::warn!(?error, channel = %channel, "could not record ticket close request audit event");
-        }
+    {
+        tracing::warn!(?error, channel = %channel, "could not record ticket close request audit event");
     }
     result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn create_close_request(
     cx: CommandCx,
     mut ticket: Ticket,
@@ -8601,24 +8503,23 @@ async fn create_close_request(
         reason: reason.clone(),
         expires_at,
     };
-    if let Some(deadline) = request.expires_at {
-        if let Err(error) =
+    if let Some(deadline) = request.expires_at
+        && let Err(error) =
             watch_close_request_timeout(ctx, channel, request.id, deadline, deadline).await
-        {
-            tracing::warn!(
-                ?error,
-                channel = %channel,
-                request_id = request.id,
-                "could not schedule a close request timeout"
-            );
-            cancel_close_request_timeout(ctx, channel, &request).await;
-            return cx
-                .reply_private_t(
-                    "tickets-close-request-timeout-schedule-failed",
-                    &Args::new(),
-                )
-                .await;
-        }
+    {
+        tracing::warn!(
+            ?error,
+            channel = %channel,
+            request_id = request.id,
+            "could not schedule a close request timeout"
+        );
+        cancel_close_request_timeout(ctx, channel, &request).await;
+        return cx
+            .reply_private_t(
+                "tickets-close-request-timeout-schedule-failed",
+                &Args::new(),
+            )
+            .await;
     }
 
     let mut saved = false;
@@ -8784,6 +8685,7 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
     say(&cx, "tickets-failed", &Args::new()).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let channel = cx.invocation().channel_id;
@@ -8905,6 +8807,7 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
     Err(UserError::message("tickets-failed"))
 }
 
+#[allow(clippy::large_futures)]
 async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let actor_id = cx.user().id.get();
@@ -8931,14 +8834,17 @@ async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Result<(), Use
     result
 }
 
+#[allow(clippy::large_futures)]
 async fn add(cx: CommandCx, args: Member) -> Result<(), UserError> {
     change_member(cx, args.user, true).await
 }
 
+#[allow(clippy::large_futures)]
 async fn remove(cx: CommandCx, args: Member) -> Result<(), UserError> {
     change_member(cx, args.user, false).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn change_label(cx: CommandCx, value: String, add: bool) -> Result<(), UserError> {
     let Some(label) = display_label(&value) else {
         return cx
@@ -9560,7 +9466,7 @@ async fn stale_history_search_message(cx: &ComponentCx) -> Result<(), UserError>
 }
 
 async fn search_history_next(cx: ComponentCx) -> Result<(), UserError> {
-    let token = cx.data().to_owned();
+    let token = cx.data().clone();
     let owner = cx.user().id.get();
     cx.defer_update().await?;
     if !history_search_token_is_valid(&token) {
@@ -9622,9 +9528,8 @@ async fn search_history_next(cx: ComponentCx) -> Result<(), UserError> {
     if !next.complete {
         next.token = history_search_next_token(&next, &old_token);
         let next_key = history_search_session_key(owner, &next.token);
-        let ttl = match history_ttl_until(next.expires_at, ctx.now()) {
-            Ok(ttl) => ttl,
-            Err(_) => return stale_history_search_message(&cx).await,
+        let Ok(ttl) = history_ttl_until(next.expires_at, ctx.now()) else {
+            return stale_history_search_message(&cx).await;
         };
         if let Err(error) = ctx.store().set_for(&next_key, &next, ttl).await {
             tracing::warn!(
@@ -9636,13 +9541,12 @@ async fn search_history_next(cx: ComponentCx) -> Result<(), UserError> {
         }
     }
     let content = history_search_reply_text(&next, &hits, |key, args| cx.t(key, args));
-    let components = match history_search_components(
+    let Ok(components) = history_search_components(
         ctx,
         &next,
         cx.t("tickets-history-search-next", &Args::new()),
-    ) {
-        Ok(components) => components,
-        Err(_) => return stale_history_search_message(&cx).await,
+    ) else {
+        return stale_history_search_message(&cx).await;
     };
     cx.update(history_search_update(content, components))
         .await?;
@@ -9660,6 +9564,7 @@ async fn search_history_next(cx: ComponentCx) -> Result<(), UserError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError> {
     if args.number <= 0 {
         return cx
@@ -9738,7 +9643,7 @@ async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError>
         .transcript_char_count
         .saturating_add(HISTORY_DISPLAY_CHARS as u64 - 1)
         / HISTORY_DISPLAY_CHARS as u64;
-    if requested_page <= 0 || requested_page as u64 > total_pages {
+    if requested_page <= 0 || requested_page.cast_unsigned() > total_pages {
         return cx
             .reply_private_t(
                 "tickets-history-page-invalid",
@@ -9746,7 +9651,7 @@ async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError>
             )
             .await;
     }
-    let page = requested_page as u64;
+    let page = requested_page.cast_unsigned();
     let text = match history_page(ctx, &history, page).await {
         Ok(text) => text,
         Err(error) => {
@@ -10454,6 +10359,7 @@ async fn delete_reply(cx: CommandCx, args: ReplyDeleteArgs) -> Result<(), UserEr
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn search_replies(cx: CommandCx, args: ReplySearchArgs) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let ticket = staff_ticket(&cx, ctx, cx.invocation().channel_id).await?;
@@ -10566,6 +10472,7 @@ async fn search_replies(cx: CommandCx, args: ReplySearchArgs) -> Result<(), User
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 fn schema() -> serde_json::Value {
     let forms_schema = form_library::schema();
     let team_permissions_schema = json!({
@@ -10783,13 +10690,18 @@ fn schema() -> serde_json::Value {
             }
         }
     });
-    config_schema["properties"]
-        .as_object_mut()
-        .expect("ticket config schema has object properties")
-        .insert("forms".to_owned(), forms_schema);
+    if let Some(properties) = config_schema
+        .get_mut("properties")
+        .and_then(|value| value.as_object_mut())
+    {
+        properties.insert("forms".to_owned(), forms_schema);
+    }
     config_schema
 }
 
+/// # Errors
+/// Returns an error when the SDK rejects a configured module route or handler.
+#[allow(clippy::too_many_lines)]
 pub fn builder() -> Result<ModuleBuilder, CoreError> {
     let schema = schema();
     Ok(

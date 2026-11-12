@@ -546,7 +546,7 @@ impl PanelCustomization {
             "open_cooldown_seconds": {
                 "type": "integer",
                 "minimum": 0,
-                "maximum": 4_294_967_295,
+                "maximum": 4_294_967_295u64,
                 "default": 0,
                 "description": "tickets-open-cooldown-seconds",
                 "x-ui": { "level": "basic" }

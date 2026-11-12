@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use closure_core::action::{Action, InteractionReply, Outcome};
 use closure_core::error::ModuleError;
-use closure_core::event::{GuildId, MessageInfo};
+use closure_core::event::GuildId;
 use closure_core::module::EventContext;
 use closure_sdk::ui::{self, CustomId};
 use closure_sdk::{Args, ComponentCx, ContextCx, EmbedBuilder, UserError};
@@ -32,25 +32,6 @@ pub(super) struct MessageQuoteAttachment {
 }
 
 impl MessageQuote {
-    fn from_context(message: &MessageInfo) -> Self {
-        Self {
-            guild_id: message.guild_id.get(),
-            channel_id: message.channel_id.get(),
-            message_id: message.id.get(),
-            author_id: message.author.id.get(),
-            author_name: message.author.name.clone(),
-            content: message.content.clone(),
-            attachments: message
-                .attachments
-                .iter()
-                .map(|attachment| MessageQuoteAttachment {
-                    filename: attachment.filename.clone(),
-                    url: attachment.url.clone(),
-                })
-                .collect(),
-        }
-    }
-
     fn from_discord(message: &Message, guild_id: GuildId) -> Self {
         Self {
             guild_id: message.guild_id.unwrap_or(guild_id).get(),

@@ -23,7 +23,7 @@ const MAX_BODY_CHARS: usize = 2_000;
 const MAX_QUERY_CHARS: usize = 100;
 const MAX_EMBED_CHARS: usize = 6_000;
 const MAX_EMBED_FIELDS: usize = 25;
-const TOMBSTONE_TTL: Duration = Duration::from_secs(30 * 86_400);
+const TOMBSTONE_TTL: Duration = Duration::from_hours(720);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -133,7 +133,7 @@ pub(crate) async fn dynamic_command_aliases(
             break;
         }
         for (key, entry) in entries {
-            after = key.clone();
+            after.clone_from(&key);
             let record = decode_record(&key, entry)
                 .map_err(|_| ModuleError::other("ticket tag storage is invalid"))?;
             if !record.reply.deleted && record.custom_command_alias {
@@ -591,7 +591,7 @@ pub(crate) async fn gallery_import(
     let payload: GalleryTagPayload = parse_data(payload)?;
     if payload.use_embed != payload.embed.is_some()
         || !valid_body(&payload.content)
-        || !valid_embed(&payload.embed)
+        || !valid_embed(payload.embed.as_ref())
     {
         return Err(DashboardActionError::Invalid(
             "invalid tag template".to_owned(),
@@ -614,7 +614,7 @@ pub(crate) async fn gallery_import(
 fn input_record(input: TagInput, idempotency_key: &str) -> Result<TagRecord, DashboardActionError> {
     if !valid_id(&input.id)
         || !valid_body(&input.body)
-        || !valid_embed(&input.embed)
+        || !valid_embed(input.embed.as_ref())
         || !valid_article_id_option(input.article_id.as_deref())
         || input.body.trim().is_empty() && input.embed.is_none() && input.article_id.is_none()
     {
@@ -1022,6 +1022,10 @@ fn gallery_payload(record: &TagRecord) -> Value {
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "this private constructor maps every persisted tag field explicitly"
+)]
 fn new_record(
     id: String,
     body: String,
@@ -1105,7 +1109,7 @@ fn valid_record(record: &TagRecord) -> bool {
             valid_id(&record.reply.id)
                 && record.reply.title == record.reply.id
                 && valid_body(&record.reply.body)
-                && valid_embed(&record.embed)
+                && valid_embed(record.embed.as_ref())
                 && valid_article_id_option(record.article_id.as_deref())
                 && (!record.reply.body.trim().is_empty()
                     || record.embed.is_some()
@@ -1138,7 +1142,7 @@ fn valid_body(body: &str) -> bool {
         })
 }
 
-fn valid_embed(embed: &Option<TagEmbed>) -> bool {
+fn valid_embed(embed: Option<&TagEmbed>) -> bool {
     let Some(embed) = embed else {
         return true;
     };
@@ -1169,7 +1173,7 @@ fn valid_embed(embed: &Option<TagEmbed>) -> bool {
         && strings
             .iter()
             .all(|(value, max)| value.is_none_or(|value| valid_text(value, *max)))
-        && urls.iter().all(|url| url.is_none_or(|url| valid_url(url)))
+        && urls.iter().all(|url| url.is_none_or(valid_url))
         && embed.fields.len() <= MAX_EMBED_FIELDS
         && embed
             .fields
@@ -1254,17 +1258,18 @@ mod tests {
         assert!(!valid_id("12345678901234567"));
 
         let mut embed = Some(TagEmbed::default());
-        assert!(!valid_embed(&embed));
-        let mut valid = TagEmbed::default();
-        valid.title = Some("Policy".to_owned());
-        valid.color = Some("#336699".to_owned());
-        valid.fields.push(TagEmbedField {
-            name: "Eligibility".to_owned(),
-            value: "Within 30 days".to_owned(),
-            inline: false,
+        assert!(!valid_embed(embed.as_ref()));
+        embed = Some(TagEmbed {
+            title: Some("Policy".to_owned()),
+            color: Some("#336699".to_owned()),
+            fields: vec![TagEmbedField {
+                name: "Eligibility".to_owned(),
+                value: "Within 30 days".to_owned(),
+                inline: false,
+            }],
+            ..TagEmbed::default()
         });
-        embed = Some(valid);
-        assert!(valid_embed(&embed));
+        assert!(valid_embed(embed.as_ref()));
 
         let tag = TagRecord {
             reply: super::SavedReply {

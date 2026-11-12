@@ -366,18 +366,13 @@ async fn may_manage_ticket(
     if ctx.permissions().check(&actor, &key).allowed {
         return Ok(true);
     }
-    actor.owner = match ctx
-        .api
-        .guild_owner()
-        .await
-        .map_err(|error| ModuleError::from(error))?
-    {
+    actor.owner = match ctx.api.guild_owner().await.map_err(ModuleError::from)? {
         Some(owner) => owner == user,
         None => {
             ctx.api
                 .get_guild(ctx.guild_id)
                 .await
-                .map_err(|error| ModuleError::from(error))?
+                .map_err(ModuleError::from)?
                 .owner_id
                 == user
         }
@@ -403,6 +398,7 @@ async fn may_manage_ticket(
 }
 
 /// Record human ticket messages and refresh timers. Message content is not needed.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
     let Event::MessageCreated(message) = event else {
         return Ok(Flow::Continue);
@@ -519,7 +515,7 @@ pub(super) async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, 
                 schedule_after_message(&ctx, channel, &ticket, &config, message_at).await?;
                 return Ok(Flow::Continue);
             }
-            Err(StorageError::Conflict) => continue,
+            Err(StorageError::Conflict) => {}
             Err(error) => return Err(stored(&error)),
         }
     }
@@ -594,6 +590,7 @@ async fn schedule_after_message(
 }
 
 /// Run a persisted timer. Its ticket generations fence obsolete jobs after newer messages or closes.
+#[allow(clippy::large_futures, clippy::too_many_lines)]
 pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
     let timer: Timer = cx.payload()?;
     let ctx = cx.ctx();
@@ -605,14 +602,14 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
         .map_err(|error| stored(&error))?
     else {
         if let Some(check) = &timer.staff_check {
-            delete_pending_staff_check(&ctx, channel, timer.close_generation, check.message_id)
+            delete_pending_staff_check(ctx, channel, timer.close_generation, check.message_id)
                 .await?;
         }
         return Ok(());
     };
     if !ticket.is_open() || ticket.close_generation != timer.close_generation {
         if let Some(check) = &timer.staff_check {
-            delete_pending_staff_check(&ctx, channel, timer.close_generation, check.message_id)
+            delete_pending_staff_check(ctx, channel, timer.close_generation, check.message_id)
                 .await?;
         }
         return Ok(());
@@ -632,9 +629,9 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
                 .automation
                 .first_response_since
                 .unwrap_or(timer.since);
-            if schedule_pending_staff_checks(&ctx, channel, &ticket).await? {
+            if schedule_pending_staff_checks(ctx, channel, &ticket).await? {
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::FirstResponse,
@@ -645,7 +642,7 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             }
             if ticket.automation.generation != timer.generation {
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::FirstResponse,
@@ -656,10 +653,10 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             }
             let at = due(since, config.first_response_timeout_hours);
             if ctx.now() < at {
-                return schedule(&ctx, channel, &ticket, Kind::FirstResponse, since, at).await;
+                return schedule(ctx, channel, &ticket, Kind::FirstResponse, since, at).await;
             }
             auto_close(
-                &ctx,
+                ctx,
                 channel,
                 &ticket,
                 Kind::FirstResponse,
@@ -673,9 +670,9 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             if config.last_message_timeout_hours == 0 {
                 return Ok(());
             }
-            if schedule_pending_staff_checks(&ctx, channel, &ticket).await? {
+            if schedule_pending_staff_checks(ctx, channel, &ticket).await? {
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::LastMessage,
@@ -687,7 +684,7 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             if ticket.automation.generation != timer.generation {
                 let since = latest_activity(&ticket, timer.since);
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::LastMessage,
@@ -698,10 +695,10 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             }
             let at = due(timer.since, config.last_message_timeout_hours);
             if ctx.now() < at {
-                return schedule(&ctx, channel, &ticket, Kind::LastMessage, timer.since, at).await;
+                return schedule(ctx, channel, &ticket, Kind::LastMessage, timer.since, at).await;
             }
             auto_close(
-                &ctx,
+                ctx,
                 channel,
                 &ticket,
                 Kind::LastMessage,
@@ -721,7 +718,7 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             }
             if ticket.pending_operation.is_some() {
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::Waiting,
@@ -733,7 +730,7 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             if ticket.automation.generation != timer.generation {
                 let since = latest_activity(&ticket, timer.since);
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::Waiting,
@@ -744,16 +741,16 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             }
             let at = due(timer.since, config.waiting_after_hours);
             if ctx.now() < at {
-                return schedule(&ctx, channel, &ticket, Kind::Waiting, timer.since, at).await;
+                return schedule(ctx, channel, &ticket, Kind::Waiting, timer.since, at).await;
             }
-            move_category(&ctx, channel, &ticket, true).await?;
-            reconcile_category(&ctx, channel, timer.generation).await
+            move_category(ctx, channel, &ticket, true).await?;
+            reconcile_category(ctx, channel, timer.generation).await
         }
         Kind::Restore => {
-            let has_pending = schedule_pending_staff_checks(&ctx, channel, &ticket).await?;
+            let has_pending = schedule_pending_staff_checks(ctx, channel, &ticket).await?;
             if has_pending {
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::Restore,
@@ -773,7 +770,7 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
             }
             if ticket.pending_operation.is_some() {
                 return schedule(
-                    &ctx,
+                    ctx,
                     channel,
                     &ticket,
                     Kind::Restore,
@@ -782,13 +779,14 @@ pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
                 )
                 .await;
             }
-            move_category(&ctx, channel, &ticket, false).await?;
-            reconcile_category(&ctx, channel, timer.generation).await
+            move_category(ctx, channel, &ticket, false).await?;
+            reconcile_category(ctx, channel, timer.generation).await
         }
-        Kind::StaffCheck => resolve_staff_check(&ctx, channel, &ticket, &timer).await,
+        Kind::StaffCheck => resolve_staff_check(ctx, channel, &ticket, &timer).await,
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn resolve_staff_check(
     ctx: &EventContext,
     channel: ChannelId,
@@ -814,20 +812,20 @@ async fn resolve_staff_check(
         .list(&prefix, 1)
         .await
         .map_err(|error| stored(&error))?;
-    if let Some((first_key, first_entry)) = first.into_iter().next() {
-        if first_key != key {
-            let next: PendingStaffCheck = serde_json::from_value(first_entry.value)
-                .map_err(|error| ModuleError::other(error.to_string()))?;
-            schedule_staff_check(ctx, channel, current, &next, ctx.now()).await?;
-            return schedule_staff_check(
-                ctx,
-                channel,
-                current,
-                &check,
-                ctx.now() + STAFF_CHECK_ORDER_WAIT,
-            )
-            .await;
-        }
+    if let Some((first_key, first_entry)) = first.into_iter().next()
+        && first_key != key
+    {
+        let next: PendingStaffCheck = serde_json::from_value(first_entry.value)
+            .map_err(|error| ModuleError::other(error.to_string()))?;
+        schedule_staff_check(ctx, channel, current, &next, ctx.now()).await?;
+        return schedule_staff_check(
+            ctx,
+            channel,
+            current,
+            &check,
+            ctx.now() + STAFF_CHECK_ORDER_WAIT,
+        )
+        .await;
     }
 
     let ticket_key = ticket_key(channel);
@@ -911,7 +909,7 @@ async fn resolve_staff_check(
                     .await?;
                 return Ok(());
             }
-            Err(StorageError::Conflict) => continue,
+            Err(StorageError::Conflict) => {}
             Err(error) => return Err(stored(&error)),
         }
     }
@@ -1013,7 +1011,7 @@ async fn move_category(
         })
         .await
         .map(|_| ())
-        .map_err(|error| ModuleError::from(error))
+        .map_err(ModuleError::from)
 }
 
 async fn reconcile_category(

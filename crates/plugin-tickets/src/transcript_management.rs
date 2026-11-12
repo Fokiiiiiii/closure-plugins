@@ -343,7 +343,7 @@ pub(super) async fn register_label(ctx: &EventContext, value: &str) -> Result<()
 pub(crate) async fn backfill_job(cx: JobCx) -> Result<(), ModuleError> {
     let _: () = cx.payload()?;
     let ctx = cx.ctx();
-    let (catalog, _) = load_catalog(&ctx).await?;
+    let (catalog, _) = load_catalog(ctx).await?;
     if catalog.phase == BackfillPhase::Complete {
         return Ok(());
     }
@@ -368,7 +368,7 @@ pub(crate) async fn backfill_job(cx: JobCx) -> Result<(), ModuleError> {
             BackfillPhase::Tickets => match serde_json::from_value::<Ticket>(entry.value.clone()) {
                 Ok(ticket) => {
                     for label in &ticket.labels {
-                        if import_label(&ctx, label).await.is_err() {
+                        if import_label(ctx, label).await.is_err() {
                             incomplete = true;
                         }
                     }
@@ -379,7 +379,7 @@ pub(crate) async fn backfill_job(cx: JobCx) -> Result<(), ModuleError> {
                 match serde_json::from_value::<TicketHistory>(entry.value.clone()) {
                     Ok(history) if history.status == HistoryStatus::Closed => {
                         for label in &history.labels {
-                            if import_label(&ctx, label).await.is_err() {
+                            if import_label(ctx, label).await.is_err() {
                                 incomplete = true;
                             }
                         }
@@ -392,9 +392,9 @@ pub(crate) async fn backfill_job(cx: JobCx) -> Result<(), ModuleError> {
         }
     }
 
-    let (mut latest, revision) = load_catalog(&ctx).await?;
+    let (mut latest, revision) = load_catalog(ctx).await?;
     if latest.phase != catalog.phase || latest.after_key != catalog.after_key {
-        schedule_backfill(&ctx).await?;
+        schedule_backfill(ctx).await?;
         return Ok(());
     }
     let mut phase = catalog.phase;
@@ -411,22 +411,17 @@ pub(crate) async fn backfill_job(cx: JobCx) -> Result<(), ModuleError> {
     latest.backfill_incomplete |= incomplete;
     match ctx
         .store()
-        .replace(
-            &LABEL_CATALOG_KEY,
-            &latest,
-            Expect::Revision(revision),
-            None,
-        )
+        .replace(LABEL_CATALOG_KEY, &latest, Expect::Revision(revision), None)
         .await
     {
         Ok(_) => {
             if latest.phase != BackfillPhase::Complete {
-                schedule_backfill(&ctx).await?;
+                schedule_backfill(ctx).await?;
             }
             Ok(())
         }
         Err(StorageError::Conflict) => {
-            schedule_backfill(&ctx).await?;
+            schedule_backfill(ctx).await?;
             Ok(())
         }
         Err(error) => Err(super::stored(&error)),

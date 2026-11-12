@@ -25,7 +25,7 @@ use super::{
 };
 
 const RECEIPT_PREFIX: &str = "ticket-dashboard-action:";
-const RECEIPT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const RECEIPT_RETENTION: Duration = Duration::from_hours(24);
 const RECEIPT_LEASE_SECONDS: i64 = 300;
 const GALLERY_SOURCE_LIMIT: usize = 1000;
 
@@ -63,7 +63,7 @@ enum Start {
     Replay(DashboardActionResult),
     Claimed {
         key: String,
-        receipt: Receipt,
+        receipt: Box<Receipt>,
         revision: i64,
         recovering: bool,
     },
@@ -184,6 +184,7 @@ pub async fn public_state(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn state(
     ctx: EventContext,
     actor: Actor,
@@ -315,6 +316,7 @@ pub async fn state(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn action(
     ctx: EventContext,
     actor: Actor,
@@ -368,19 +370,17 @@ pub async fn action(
     let can_manage = tickets_manage(&ctx, &actor)?;
     let outcome = match (&request.scope, request.action.as_str()) {
         (DashboardScope::Guild, "audit.search") => {
-            if !can_manage {
-                Err(DashboardActionError::Forbidden)
-            } else {
+            if can_manage {
                 audit::query(&ctx, &request, can_manage).await
+            } else {
+                Err(DashboardActionError::Forbidden)
             }
         }
         (
             DashboardScope::Knowledge { .. },
             "knowledge.create" | "knowledge.update" | "knowledge.delete",
         ) => {
-            if !can_manage {
-                Err(DashboardActionError::Forbidden)
-            } else {
+            if can_manage {
                 let start = begin_action(&ctx, &actor, &request).await?;
                 match start {
                     Start::Replay(result) => Ok(result),
@@ -402,6 +402,8 @@ pub async fn action(
                         }
                     }
                 }
+            } else {
+                Err(DashboardActionError::Forbidden)
             }
         }
         (
@@ -422,7 +424,17 @@ pub async fn action(
             | "ticket.reply"
             | "ticket.add_label"
             | "ticket.remove_label",
-        ) => ticket_action(&ctx, &actor, &config, can_manage, &request, *channel_id).await,
+        ) => {
+            Box::pin(ticket_action(
+                &ctx,
+                &actor,
+                &config,
+                can_manage,
+                &request,
+                *channel_id,
+            ))
+            .await
+        }
         _ => Err(DashboardActionError::Unsupported),
     };
     audit::record_dashboard_action(&ctx, &actor, &request, &outcome).await?;
@@ -593,6 +605,7 @@ async fn gallery_export_action(
     Ok(result(json!({ "kind": input.kind, "payload": payload }), 0))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn gallery_import_action(
     ctx: &EventContext,
     request: &DashboardActionRequest,
@@ -664,12 +677,14 @@ async fn gallery_import_action(
 
             let config: Config = ctx.parse_config().map_err(internal)?;
             let id = generated_gallery_id("gallery-", &request.idempotency_key, 32);
-            let mut panel = super::NamedPanel::default();
-            panel.id = id.clone();
-            panel.name = Some(panel_name.to_owned());
-            panel.description = payload.description;
-            panel.button_style = payload.button_style;
-            panel.customization = customization;
+            let panel = super::NamedPanel {
+                id: id.clone(),
+                name: Some(panel_name.to_owned()),
+                description: payload.description,
+                button_style: payload.button_style,
+                customization,
+                ..super::NamedPanel::default()
+            };
 
             if let Some(existing) = config.panels.iter().find(|existing| existing.id == id) {
                 if recovering && existing == &panel {
@@ -1040,15 +1055,14 @@ async fn completed_ticket_action(
         &actor.roles,
         can_manage,
     );
-    if (request.action == "ticket.close" && (staff || history.opener == actor.user.get()))
-        || (request.action != "ticket.close" && staff)
-    {
+    if staff || (request.action == "ticket.close" && history.opener == actor.user.get()) {
         Ok(Some(result(value, revision)))
     } else {
         Err(DashboardActionError::Forbidden)
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn ticket_action(
     ctx: &EventContext,
     actor: &Actor,
@@ -1153,7 +1167,7 @@ async fn ticket_action(
                     &Args::new().with("user", format!("<@{}>", actor.user.get())),
                 )
             });
-            match finish(ctx, channel, Some(actor.user), &reason, None).await {
+            match Box::pin(finish(ctx, channel, Some(actor.user), &reason, None)).await {
                 Ok(super::Closed::Done | super::Closed::RatingDmUnconfirmed) => {
                     complete_action(
                         ctx,
@@ -1327,6 +1341,7 @@ async fn fence_ticket_revision(
     Ok(next)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn request_close(
     ctx: &EventContext,
     actor: &Actor,
@@ -1460,6 +1475,7 @@ async fn request_close(
     .await
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn dashboard_reply(
     ctx: &EventContext,
     actor: &Actor,
@@ -1475,50 +1491,50 @@ async fn dashboard_reply(
     if !valid_reply_content("dashboard", content) {
         return Err(DashboardActionError::Invalid("invalid ticket reply".into()));
     }
-    let attempt_id = match &receipt.state {
-        ReceiptState::Pending {
-            step: ReceiptStep::ReplySend { attempt_id },
-            ..
-        } => *attempt_id,
-        _ => {
-            let attempt_id = ctx
-                .store()
-                .counter_add(super::REPLY_SEND_COUNTER, actor.user.get(), 1)
-                .await
-                .map_err(internal)?;
-            let attempt = ReplySendAttempt {
-                channel: channel.get(),
-                owner: actor.user.get(),
-                ticket_number: ticket.number,
-                panel: ticket.panel.clone(),
-                reply_id: "dashboard".to_owned(),
-                chunks: split_reply(content)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-                confirmed: 0,
-                in_flight: None,
-            };
-            let attempt_key = reply_send_attempt_key(channel, actor.user.get(), attempt_id);
-            ctx.store()
-                .replace(
-                    &attempt_key,
-                    &attempt,
-                    Expect::Missing,
-                    Some(super::REPLY_SEND_RETENTION),
-                )
-                .await
-                .map_err(internal)?;
-            set_step(
-                ctx,
-                receipt_key,
-                receipt,
-                receipt_revision,
-                ReceiptStep::ReplySend { attempt_id },
+    let attempt_id = if let ReceiptState::Pending {
+        step: ReceiptStep::ReplySend { attempt_id },
+        ..
+    } = &receipt.state
+    {
+        *attempt_id
+    } else {
+        let attempt_id = ctx
+            .store()
+            .counter_add(super::REPLY_SEND_COUNTER, actor.user.get(), 1)
+            .await
+            .map_err(internal)?;
+        let attempt = ReplySendAttempt {
+            channel: channel.get(),
+            owner: actor.user.get(),
+            ticket_number: ticket.number,
+            panel: ticket.panel.clone(),
+            reply_id: "dashboard".to_owned(),
+            chunks: split_reply(content)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            confirmed: 0,
+            in_flight: None,
+        };
+        let attempt_key = reply_send_attempt_key(channel, actor.user.get(), attempt_id);
+        ctx.store()
+            .replace(
+                &attempt_key,
+                &attempt,
+                Expect::Missing,
+                Some(super::REPLY_SEND_RETENTION),
             )
-            .await?;
-            attempt_id
-        }
+            .await
+            .map_err(internal)?;
+        set_step(
+            ctx,
+            receipt_key,
+            receipt,
+            receipt_revision,
+            ReceiptStep::ReplySend { attempt_id },
+        )
+        .await?;
+        attempt_id
     };
     let attempt_key = reply_send_attempt_key(channel, actor.user.get(), attempt_id);
     let entry = ctx
@@ -1621,6 +1637,7 @@ async fn dashboard_reply(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn change_label(
     ctx: &EventContext,
     channel: ChannelId,
@@ -1841,7 +1858,7 @@ async fn begin_action(
                 update_receipt(ctx, &key, &mut receipt, &mut revision).await?;
                 return Ok(Start::Claimed {
                     key,
-                    receipt,
+                    receipt: Box::new(receipt),
                     revision,
                     recovering: true,
                 });
@@ -1873,7 +1890,7 @@ async fn begin_action(
         })?;
     Ok(Start::Claimed {
         key,
-        receipt,
+        receipt: Box::new(receipt),
         revision,
         recovering: false,
     })
@@ -2294,6 +2311,7 @@ fn invalid_data(error: impl Display) -> DashboardActionError {
     DashboardActionError::Invalid(error.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub(super) fn user_error(error: super::UserError) -> DashboardActionError {
     DashboardActionError::Internal(format!("{error:?}"))
 }

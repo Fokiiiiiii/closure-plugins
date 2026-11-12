@@ -32,13 +32,6 @@ impl Target {
         }
     }
 
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::User { .. } => "user",
-            Self::Role { .. } => "role",
-        }
-    }
-
     fn id(&self) -> &str {
         match self {
             Self::User { id } | Self::Role { id } => id,
@@ -363,26 +356,6 @@ pub(super) async fn is_blocked(
         return Ok(true);
     }
     Ok(false)
-}
-
-pub(super) async fn is_blocked_member(
-    ctx: &EventContext,
-    user: UserId,
-    panel: Option<&str>,
-) -> Result<bool, UserError> {
-    let effective_roles = match ctx
-        .api
-        .execute(Action::GetMember {
-            guild_id: ctx.guild_id,
-            user_id: user,
-        })
-        .await
-    {
-        Ok(closure_core::action::Outcome::Member(member)) => member.roles,
-        Ok(_) | Err(DiscordError::NotFound) => Vec::new(),
-        Err(error) => return Err(failed(&error)),
-    };
-    is_blocked(ctx, user, &effective_roles, panel).await
 }
 
 fn scope_label(cx: &CommandCx, config: &Config, panel: Option<&str>) -> Result<String, UserError> {

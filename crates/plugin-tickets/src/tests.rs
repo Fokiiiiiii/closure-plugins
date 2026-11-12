@@ -327,9 +327,9 @@ fn existing_panel_message(
     .unwrap()
 }
 
-fn posted_panels(
-    harness: &Harness,
-) -> Vec<(ChannelId, Option<MessageId>, Option<String>, Vec<Component>)> {
+type PostedPanel = (ChannelId, Option<MessageId>, Option<String>, Vec<Component>);
+
+fn posted_panels(harness: &Harness) -> Vec<PostedPanel> {
     harness
         .actions()
         .into_iter()
@@ -4251,9 +4251,9 @@ async fn a_changed_question_config_requires_a_new_form() {
 fn a_maximum_ticket_form_custom_id_fits_within_one_hundred_utf8_bytes() {
     let custom_id = form_submission_id(u64::MAX, i64::MAX, i64::MAX);
     assert!(
-        custom_id.as_bytes().len() <= crate::MAX_TICKET_CUSTOM_ID_BYTES,
+        custom_id.len() <= crate::MAX_TICKET_CUSTOM_ID_BYTES,
         "custom ID is {} bytes: {custom_id}",
-        custom_id.as_bytes().len()
+        custom_id.len()
     );
 }
 
@@ -4644,6 +4644,8 @@ fn transcript_cut_requires_an_older_message() {
     assert!(!transcript_is_incomplete(4999, true));
 }
 
+// shortcut: keep this 103-line regression case intact; split if it grows past 110 lines.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn staff_can_search_and_read_closed_ticket_history_privately() {
     let harness = harness();
@@ -5197,6 +5199,8 @@ fn legacy_staff_snapshot_falls_back_but_explicit_empty_does_not() {
     assert!(crate::history_staff_roles(&explicit, &config).is_empty());
 }
 
+// shortcut: keep this 105-line regression case intact; split if it grows past 110 lines.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn panel_staff_manage_labels_with_display_names_only_for_their_panel() {
     let harness = harness();
@@ -5669,7 +5673,7 @@ async fn rejecting_a_request_cancels_its_timeout_and_stale_jobs_cannot_close_a_n
     let first_deadline = first.expires_at.unwrap();
     assert_eq!(harness.jobs(), 1);
 
-    harness.advance(Duration::from_secs(30 * 60));
+    harness.advance(Duration::from_mins(30));
     let rejected = harness
         .click(request_click("close-request-reject", first.id, MEMBER))
         .await
@@ -5708,7 +5712,7 @@ async fn rejecting_a_request_cancels_its_timeout_and_stale_jobs_cannot_close_a_n
         .unwrap();
     assert_eq!(harness.jobs(), 2);
 
-    harness.advance(Duration::from_secs(30 * 60));
+    harness.advance(Duration::from_mins(30));
     let stale_job = harness.run_due_jobs().await;
     assert!(stale_job.iter().all(Result::is_ok), "{stale_job:?}");
     assert!(deleted(&harness).is_empty());
@@ -5716,7 +5720,7 @@ async fn rejecting_a_request_cancels_its_timeout_and_stale_jobs_cannot_close_a_n
     assert_eq!(ticket.close_request.as_ref().unwrap().id, second.id);
     assert_eq!(harness.jobs(), 1);
 
-    harness.advance(Duration::from_secs(30 * 60));
+    harness.advance(Duration::from_mins(30));
     let second_job = harness.run_due_jobs().await;
     assert!(second_job.iter().all(Result::is_ok), "{second_job:?}");
     assert_eq!(deleted(&harness), [HERE]);
@@ -5815,7 +5819,7 @@ async fn zero_disables_close_request_timeouts() {
     assert!(ticket.close_request.as_ref().unwrap().expires_at.is_none());
     assert_eq!(harness.jobs(), 0);
 
-    harness.advance(Duration::from_secs(48 * 60 * 60));
+    harness.advance(Duration::from_hours(48));
     harness.run_due_jobs().await;
     assert!(deleted(&harness).is_empty());
     let rejected = harness
@@ -5982,7 +5986,7 @@ async fn rejection_cancels_its_timeout_and_a_stale_job_cannot_close_a_new_reques
     let first_deadline = first.expires_at.unwrap();
     assert_eq!(harness.jobs(), 1);
 
-    harness.advance(Duration::from_secs(30 * 60));
+    harness.advance(Duration::from_mins(30));
     let rejected = harness
         .click(request_click("close-request-reject", first.id, MEMBER))
         .await
@@ -6023,7 +6027,7 @@ async fn rejection_cancels_its_timeout_and_a_stale_job_cannot_close_a_new_reques
         .unwrap();
     assert_eq!(harness.jobs(), 2);
 
-    harness.advance(Duration::from_secs(30 * 60));
+    harness.advance(Duration::from_mins(30));
     let stale_job = harness.run_due_jobs().await;
     assert!(stale_job.iter().all(Result::is_ok), "{stale_job:?}");
     assert!(deleted(&harness).is_empty());
@@ -6031,13 +6035,15 @@ async fn rejection_cancels_its_timeout_and_a_stale_job_cannot_close_a_new_reques
     assert_eq!(ticket.close_request.as_ref().unwrap().id, second.id);
     assert_eq!(harness.jobs(), 1);
 
-    harness.advance(Duration::from_secs(30 * 60));
+    harness.advance(Duration::from_mins(30));
     let second_job = harness.run_due_jobs().await;
     assert!(second_job.iter().all(Result::is_ok), "{second_job:?}");
     assert_eq!(deleted(&harness), [HERE]);
     assert_eq!(harness.jobs(), 0);
 }
 
+// shortcut: keep this 144-line regression case intact; split if it grows further.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn saved_replies_use_the_ticket_panels_staff_access_and_safe_mentions() {
     let harness = harness();
@@ -6449,7 +6455,7 @@ async fn retrying_a_partial_reply_skips_confirmed_parts_and_flags_the_uncertain_
     let status = &stopped.last().unwrap().content;
     assert!(status.contains("1 of 3 parts are confirmed"), "{stopped:?}");
     assert!(status.contains("may have arrived"), "{stopped:?}");
-    assert_eq!(ticket_messages(&harness), [first.clone()]);
+    assert_eq!(ticket_messages(&harness), std::slice::from_ref(&first));
 
     let attempt_id = harness
         .store()
@@ -6484,7 +6490,7 @@ async fn retrying_a_partial_reply_skips_confirmed_parts_and_flags_the_uncertain_
             .any(|id| id.contains("reply-retry-uncertain")),
         "{uncertain:?}"
     );
-    assert_eq!(ticket_messages(&harness), [first.clone()]);
+    assert_eq!(ticket_messages(&harness), std::slice::from_ref(&first));
 
     let resumed = harness
         .click(

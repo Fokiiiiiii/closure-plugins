@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    Action, Args, ChannelId, ChannelType, CommandCx, Config, DAY, DiscordError, EventContext,
+    Expect, InteractionRef, ModuleError, Outcome, Permissions, Reason, RoleId, StorageError,
+    ThreadPatch, Ticket, UserError, UserId, acquire_open_lock, all_tickets,
+    cancel_close_request_timeout, closing_key, failed, left_close_key, list_user_reservations,
+    open_counts, owns_open_lock, read_open_state, release_open_lock,
+    remove_missing_closing_tickets, set_open_score, stored, teams_survey, ticket_key, ticket_ttl,
+    watch,
+};
 use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
 use twilight_util::permission_calculator::PermissionCalculator;
 
@@ -17,6 +25,16 @@ const THREAD_PRIVATE_VIEW_PERMISSIONS: Permissions =
 const THREAD_PARENT_VIEW_GRANTS: Permissions =
     THREAD_PRIVATE_VIEW_PERMISSIONS.union(Permissions::ADMINISTRATOR);
 const MAX_THREAD_PERMISSION_CHECKS: usize = 65_536;
+
+enum ReopenResult {
+    Reopened,
+    GlobalLimit(u32),
+    PanelLimit(u32),
+    Busy,
+    PrivacyBusy,
+    Erased,
+    Stale,
+}
 
 /// Effective permissions for one member in a guild channel.
 fn effective_permissions(
@@ -128,33 +146,6 @@ fn unstaffed_roles_can_view_private_threads(
         }
     }
     false
-}
-
-pub(super) async fn ensure_thread_parent(
-    ctx: &EventContext,
-    parent_id: ChannelId,
-    staff_roles: &[RoleId],
-    opener: UserId,
-) -> Result<(), UserError> {
-    ensure_thread_parent_for_members(ctx, parent_id, staff_roles, opener, &[]).await
-}
-
-pub(super) async fn ensure_thread_parent_for_members(
-    ctx: &EventContext,
-    parent_id: ChannelId,
-    staff_roles: &[RoleId],
-    opener: UserId,
-    additional_members: &[UserId],
-) -> Result<(), UserError> {
-    ensure_thread_parent_with_access(
-        ctx,
-        parent_id,
-        staff_roles,
-        opener,
-        additional_members,
-        None,
-    )
-    .await
 }
 
 /// Validates named team members as well as the configured role staff in the parent channel.
@@ -735,6 +726,10 @@ async fn rollback_reopened_ticket(
     ))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "ticket reopen coordinates CAS, locks, history leases, and rollback in one operation"
+)]
 pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError> {
     cx.require("tickets.manage").await?;
     cx.defer(true).await?;
@@ -816,8 +811,7 @@ pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError
     };
     let legacy_staff_roles = ticket
         .staff_roles
-        .as_ref()
-        .cloned()
+        .clone()
         .unwrap_or_else(|| staff.iter().map(|role| role.get()).collect());
     let opener_is_staff = member.as_ref().is_some_and(|member| {
         teams_survey::may_access(
@@ -842,15 +836,6 @@ pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError
         return cx.reply_private_t("tickets-opening", &Args::new()).await;
     };
 
-    enum ReopenResult {
-        Reopened,
-        GlobalLimit(u32),
-        PanelLimit(u32),
-        Busy,
-        PrivacyBusy,
-        Erased,
-        Stale,
-    }
     let mut history_lease = None;
     let result = async {
         let (_, state) = read_open_state(ctx, opener).await?;

@@ -16,7 +16,7 @@ pub(super) struct EraseMyData {
 }
 
 const DATA_OPERATION_PREFIX: &str = "ticket-data-operation:";
-const DATA_OPERATION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const DATA_OPERATION_TTL: std::time::Duration = std::time::Duration::from_mins(15);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DataOperationLease {
@@ -293,21 +293,21 @@ async fn ticket_messages(
     Ok((messages, cut))
 }
 
-fn message_quote_for_post<'a>(
-    ticket: &'a Ticket,
+fn message_quote_for_post(
+    ticket: &Ticket,
     posted_message_id: u64,
     guild_id: u64,
-) -> Option<&'a message_ticket::MessageQuote> {
+) -> Option<&message_ticket::MessageQuote> {
     ticket.message_quote.as_ref().filter(|quote| {
         ticket.message_quote_message_id == Some(posted_message_id) && quote.guild_id == guild_id
     })
 }
 
-fn ticket_quote_for_user<'a>(
-    ticket: &'a Ticket,
+fn ticket_quote_for_user(
+    ticket: &Ticket,
     user: UserId,
     guild_id: u64,
-) -> Option<&'a message_ticket::MessageQuote> {
+) -> Option<&message_ticket::MessageQuote> {
     ticket
         .message_quote
         .as_ref()
@@ -460,7 +460,7 @@ fn transcript_rich_message(
         .map(transcript_rich_components)
         .unwrap_or_default();
     let mentions =
-        transcript_rich_mentions(&raw, source_content, &author_name, &embeds, &components);
+        transcript_rich_mentions(&raw, source_content, author_name, &embeds, &components);
     if attachments.is_empty() && embeds.is_empty() && components.is_empty() && mentions.is_empty() {
         return None;
     }
@@ -812,16 +812,15 @@ fn collect_transcript_text_mentions(content: &str, mentions: &mut BTreeSet<(Stri
         let mut valid = true;
         while end < bytes.len() && bytes[end].is_ascii_digit() {
             let byte = bytes[end];
-            id = match id
+            if let Some(next_id) = id
                 .checked_mul(10)
-                .and_then(|id| id.checked_add(u64::from(byte - b'0')))
+                .and_then(|current| current.checked_add(u64::from(byte - b'0')))
             {
-                Some(id) => id,
-                None => {
-                    valid = false;
-                    break;
-                }
-            };
+                id = next_id;
+            } else {
+                valid = false;
+                break;
+            }
             end += 1;
         }
         if valid && end > start && bytes.get(end) == Some(&b'>') && id != 0 {
@@ -1308,6 +1307,7 @@ async fn record_export_notes(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn export_ticket_suggestion_state(
     ctx: &EventContext,
     channel: ChannelId,
@@ -1514,6 +1514,7 @@ async fn record_erase_notes(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn export_open_tickets(
     ctx: &EventContext,
     user: UserId,
@@ -1739,6 +1740,7 @@ async fn export_open_tickets(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn export_closed_histories(
     ctx: &EventContext,
     user: UserId,
@@ -2007,7 +2009,10 @@ async fn own_history_content(
                 &Args::new(),
             ));
             for (question, answer) in answers {
-                form_answers_text.push_str(&format!("\n- {question}: {answer}"));
+                form_answers_text.push_str("\n- ");
+                form_answers_text.push_str(question);
+                form_answers_text.push_str(": ");
+                form_answers_text.push_str(answer);
             }
         }
     }
@@ -2047,6 +2052,7 @@ struct EraseStats {
     pointers_removed: usize,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct HistoryErase {
     matched: bool,
     updated: bool,
@@ -2242,11 +2248,7 @@ async fn inspect_open_tickets(
                 })
                 .count();
             let own_messages = own_message_count
-                + if ticket_quote_for_user(&ticket, user, ctx.guild_id.get()).is_some() {
-                    1
-                } else {
-                    0
-                };
+                + usize::from(ticket_quote_for_user(&ticket, user, ctx.guild_id.get()).is_some());
             stats.active_user_messages += if ticket.closed { 0 } else { own_messages };
             stats.closed_retained_messages += if ticket.closed { own_messages } else { 0 };
             if ticket.closed && (owner || assigned || own_messages > 0) {
@@ -2284,10 +2286,10 @@ async fn erase_closed_histories(
             renew_data_operation(ctx, user, token).await?;
             match erase_history(ctx, key, user, token, confirm).await {
                 Ok(result) => {
-                    if result.matched {
-                        if let Some(channel) = result.channel_id {
-                            record_erase_notes(ctx, ChannelId::new(channel), stats).await?;
-                        }
+                    if result.matched
+                        && let Some(channel) = result.channel_id
+                    {
+                        record_erase_notes(ctx, ChannelId::new(channel), stats).await?;
                     }
                     if result.legacy {
                         stats.legacy_histories += 1;
@@ -2427,6 +2429,7 @@ async fn release_history_anonymizing_lease(
     Ok(false)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn erase_history(
     ctx: &EventContext,
     key: &str,
@@ -2628,7 +2631,7 @@ async fn erase_history(
                     finalized = true;
                     break;
                 }
-                Err(StorageError::Conflict) => continue,
+                Err(StorageError::Conflict) => {}
                 Err(error) => return Err(stored(&error)),
             }
         }

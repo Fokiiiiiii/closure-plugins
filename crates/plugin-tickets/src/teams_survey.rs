@@ -25,6 +25,7 @@ pub(super) struct StaffTeam {
     pub(super) permissions: TeamPermissions,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct TeamPermissions {
@@ -267,6 +268,9 @@ pub(super) fn staff_access_snapshot(
     Ok(Some(StaffAccessSnapshot { teams: snapshots }))
 }
 
+type PermissionSet = Vec<(u64, Permissions, Permissions)>;
+type ThreadScope = (Vec<u64>, Vec<u64>, Option<(PermissionSet, PermissionSet)>);
+
 pub(super) fn valid_thread_staff_team_configuration(config: &Config) -> bool {
     if !config
         .panels
@@ -276,8 +280,6 @@ pub(super) fn valid_thread_staff_team_configuration(config: &Config) -> bool {
         return true;
     }
 
-    type PermissionSet = Vec<(u64, Permissions, Permissions)>;
-    type ThreadScope = (Vec<u64>, Vec<u64>, Option<(PermissionSet, PermissionSet)>);
     let mut scopes = BTreeMap::<u64, ThreadScope>::new();
     let mut check_scope = |parent: u64, selected: &[String], panel_role_text: &[String]| -> bool {
         let mut panel_staff = panel_role_text
@@ -320,27 +322,25 @@ pub(super) fn valid_thread_staff_team_configuration(config: &Config) -> bool {
             };
         roles.sort_unstable();
         roles.dedup();
-        match scopes.get_mut(&parent) {
-            Some((existing_roles, existing_users, existing_permissions)) => {
-                if existing_roles != &roles || existing_users != &users {
+        if let Some((existing_roles, existing_users, existing_permissions)) =
+            scopes.get_mut(&parent)
+        {
+            if existing_roles != &roles || existing_users != &users {
+                return false;
+            }
+            if let Some(permission_scope) = permission_scope {
+                if existing_permissions
+                    .as_ref()
+                    .is_some_and(|existing| existing != &permission_scope)
+                {
                     return false;
                 }
-                if let Some(permission_scope) = permission_scope {
-                    if existing_permissions
-                        .as_ref()
-                        .is_some_and(|existing| existing != &permission_scope)
-                    {
-                        return false;
-                    }
-                    existing_permissions.get_or_insert(permission_scope);
-                }
-                true
+                existing_permissions.get_or_insert(permission_scope);
             }
-            None => {
-                scopes.insert(parent, (roles, users, permission_scope));
-                true
-            }
+            return true;
         }
+        scopes.insert(parent, (roles, users, permission_scope));
+        true
     };
 
     if let Some(parent) = super::id_of(config.thread_channel.as_ref())
@@ -554,7 +554,8 @@ fn parse_survey_form_request(data: &str) -> Option<(SurveyRequest, u32)> {
 fn survey_form_revision(questions: &[advanced_forms::FormQuestion]) -> u32 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     questions.hash(&mut hasher);
-    hasher.finish() as u32
+    let [first, second, third, fourth, _, _, _, _] = hasher.finish().to_le_bytes();
+    u32::from_le_bytes([first, second, third, fourth])
 }
 
 fn parse_survey_request(data: &str) -> Option<SurveyRequest> {
@@ -605,7 +606,7 @@ fn survey_history_matches(history: &TicketHistory, request: SurveyRequest, opene
 
 async fn open_survey_modal(cx: &ComponentCx, request: SurveyRequest) -> Result<bool, UserError> {
     let ctx = cx.ctx();
-    let Some((_, history)) = survey_history(&ctx, request).await.map_err(|error| {
+    let Some((_, history)) = survey_history(ctx, request).await.map_err(|error| {
         tracing::warn!(?error, channel = %request.channel, "could not read ticket exit survey");
         super::failed(&error)
     })?
@@ -624,10 +625,10 @@ async fn open_survey_modal(cx: &ComponentCx, request: SurveyRequest) -> Result<b
             super::failed(&error)
         })?;
     if let Some(answers) = response {
-        if !answers.is_empty() {
-            if let Err(error) = super::update_exit_survey_archive(&ctx, &history).await {
-                tracing::warn!(?error, channel = %request.channel, "could not update ticket exit survey archive");
-            }
+        if !answers.is_empty()
+            && let Err(error) = super::update_exit_survey_archive(ctx, &history).await
+        {
+            tracing::warn!(?error, channel = %request.channel, "could not update ticket exit survey archive");
         }
         return Ok(false);
     }
@@ -705,7 +706,7 @@ pub(super) async fn survey_command(cx: CommandCx, number: i64) -> Result<(), Use
             .await;
     }
     let ctx = cx.ctx();
-    let history = match super::history_by_number(&ctx, number).await {
+    let history = match super::history_by_number(ctx, number).await {
         Ok(Some(history)) => history,
         Ok(None) => {
             return cx
@@ -725,7 +726,7 @@ pub(super) async fn survey_command(cx: CommandCx, number: i64) -> Result<(), Use
             .await;
     }
     if !data::history_privacy_generation_current(
-        &ctx,
+        ctx,
         &super::history_key(number, request.channel),
         history.privacy_generation,
     )
@@ -750,7 +751,7 @@ pub(super) async fn survey_command(cx: CommandCx, number: i64) -> Result<(), Use
             )
             .await;
     }
-    let Some(button) = survey_open_component(&ctx, &history) else {
+    let Some(button) = survey_open_component(ctx, &history) else {
         return cx
             .reply_private_t("tickets-exit-survey-stale", &Args::new())
             .await;
@@ -895,6 +896,7 @@ pub(super) async fn send_exit_survey_prompt(ctx: &EventContext, history: &Ticket
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn submit_exit_survey(cx: ModalCx) -> Result<(), UserError> {
     let Some((module, custom_id)) = CustomId::parse(&cx.submission().custom_id) else {
         return say(&cx, "tickets-exit-survey-stale", &Args::new()).await;
@@ -909,7 +911,7 @@ pub(super) async fn submit_exit_survey(cx: ModalCx) -> Result<(), UserError> {
         return say(&cx, "tickets-exit-survey-stale", &Args::new()).await;
     };
     let ctx = cx.ctx();
-    let Some((history_key, history)) = survey_history(&ctx, request).await.map_err(|error| {
+    let Some((history_key, history)) = survey_history(ctx, request).await.map_err(|error| {
         tracing::warn!(?error, channel = %request.channel, "could not read ticket exit survey");
         super::failed(&error)
     })?
@@ -920,7 +922,7 @@ pub(super) async fn submit_exit_survey(cx: ModalCx) -> Result<(), UserError> {
         return say(&cx, "tickets-exit-survey-stale", &Args::new()).await;
     }
     if !data::history_privacy_generation_current(
-        &ctx,
+        ctx,
         &history_key,
         history.privacy_generation,
     )
@@ -979,10 +981,10 @@ pub(super) async fn submit_exit_survey(cx: ModalCx) -> Result<(), UserError> {
     {
         Ok(_) => {}
         Err(StorageError::Conflict) => {
-            if !answers.is_empty() {
-                if let Err(error) = super::update_exit_survey_archive(&ctx, &history).await {
-                    tracing::warn!(?error, channel = %request.channel, "could not update ticket exit survey archive");
-                }
+            if !answers.is_empty()
+                && let Err(error) = super::update_exit_survey_archive(ctx, &history).await
+            {
+                tracing::warn!(?error, channel = %request.channel, "could not update ticket exit survey archive");
             }
             return cx
                 .reply_private_t(
@@ -997,10 +999,10 @@ pub(super) async fn submit_exit_survey(cx: ModalCx) -> Result<(), UserError> {
         }
     }
 
-    let still_current = match survey_history(&ctx, request).await {
+    let still_current = match survey_history(ctx, request).await {
         Ok(Some((key, current))) => {
             let privacy_current = match data::history_privacy_generation_current(
-                &ctx,
+                ctx,
                 &history_key,
                 history.privacy_generation,
             )
@@ -1028,7 +1030,7 @@ pub(super) async fn submit_exit_survey(cx: ModalCx) -> Result<(), UserError> {
         return say(&cx, "tickets-exit-survey-stale", &Args::new()).await;
     }
     if !answers.is_empty()
-        && let Err(error) = super::update_exit_survey_archive(&ctx, &history).await
+        && let Err(error) = super::update_exit_survey_archive(ctx, &history).await
     {
         tracing::warn!(?error, channel = %request.channel, "could not update ticket exit survey archive");
     }
@@ -1070,7 +1072,7 @@ pub(super) async fn view_exit_survey(cx: ComponentCx) -> Result<(), UserError> {
         return say(&cx, "tickets-exit-survey-view-failed", &Args::new()).await;
     };
     let ctx = cx.ctx();
-    let Some((history_key, history)) = survey_history(&ctx, request).await.map_err(|error| {
+    let Some((history_key, history)) = survey_history(ctx, request).await.map_err(|error| {
         tracing::warn!(?error, channel = %request.channel, "could not read ticket exit survey history");
         super::failed(&error)
     })?
@@ -1091,7 +1093,7 @@ pub(super) async fn view_exit_survey(cx: ComponentCx) -> Result<(), UserError> {
         return say(&cx, "tickets-exit-survey-view-failed", &Args::new()).await;
     }
     let privacy_current = data::history_privacy_generation_current(
-        &ctx,
+        ctx,
         &history_key,
         history.privacy_generation,
     )
@@ -1116,7 +1118,7 @@ pub(super) async fn view_exit_survey(cx: ComponentCx) -> Result<(), UserError> {
         return say(&cx, "tickets-exit-survey-view-failed", &Args::new()).await;
     };
     if !data::history_privacy_generation_current(
-        &ctx,
+        ctx,
         &history_key,
         history.privacy_generation,
     )
@@ -1127,7 +1129,7 @@ pub(super) async fn view_exit_survey(cx: ComponentCx) -> Result<(), UserError> {
     })? {
         return say(&cx, "tickets-exit-survey-view-failed", &Args::new()).await;
     }
-    let embeds = advanced_forms::form_answers_embeds_in(&ctx, &answers)
+    let embeds = advanced_forms::form_answers_embeds_in(ctx, &answers)
         .map_err(|_| UserError::message("tickets-exit-survey-view-failed"))?;
     match ctx
         .api

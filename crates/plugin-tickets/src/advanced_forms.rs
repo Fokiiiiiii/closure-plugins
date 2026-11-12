@@ -393,23 +393,6 @@ impl FormQuestion {
         }
     }
 
-    fn required(&self) -> bool {
-        match self {
-            Self::Legacy(_) => true,
-            Self::Structured(FormQuestionKind::Display { .. }) => false,
-            Self::Structured(
-                FormQuestionKind::Text { required, .. }
-                | FormQuestionKind::StringSelect { required, .. }
-                | FormQuestionKind::UserSelect { required, .. }
-                | FormQuestionKind::RoleSelect { required, .. }
-                | FormQuestionKind::MentionableSelect { required, .. }
-                | FormQuestionKind::ChannelSelect { required, .. }
-                | FormQuestionKind::RadioGroup { required, .. }
-                | FormQuestionKind::CheckboxGroup { required, .. },
-            ) => *required,
-        }
-    }
-
     fn is_valid(&self) -> bool {
         match self {
             Self::Legacy(label) => valid_label(label),
