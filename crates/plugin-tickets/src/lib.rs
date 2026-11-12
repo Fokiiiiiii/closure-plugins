@@ -24,7 +24,7 @@ use closure_sdk::ui::{self, CustomId};
 use closure_sdk::{
     Args, Command, CommandArgs, CommandCx, ComponentCx, CoreError, Cx, Intents, InteractionRef,
     InteractionReply, JobCx, Level, Locale, ModalCx, ModuleBuilder, PermissionSpec, SdkModule,
-    Subscription, UserError,
+    SubcommandGroup, Subscription, UserError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10786,58 +10786,117 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<Unclaim>::new("unclaim").handler(unclaim),
                     Command::<Member>::new("transfer").handler(transfer),
                     Command::<Rename>::new("rename").handler(rename),
-                    Command::<operations::SetPanelArgs>::new("set-panel")
-                        .handler(operations::set_panel),
-                    Command::<operations::RoleArgs>::new("add-role").handler(operations::add_role),
-                    Command::<operations::RoleArgs>::new("remove-role")
-                        .handler(operations::remove_role),
-                    Command::<operations::WaitingArgs>::new("waiting").handler(operations::waiting),
-                    Command::<data::ExportMyData>::new("export").handler(data::export_my_data),
-                    Command::<data::EraseMyData>::new("erase").handler(data::erase_my_data),
-                    Command::<blacklist::UserArgs>::new("blacklist-add-user")
-                        .handler(blacklist::add_user),
-                    Command::<blacklist::UserArgs>::new("blacklist-remove-user")
-                        .handler(blacklist::remove_user),
-                    Command::<blacklist::RoleArgs>::new("blacklist-add-role")
-                        .handler(blacklist::add_role),
-                    Command::<blacklist::RoleArgs>::new("blacklist-remove-role")
-                        .handler(blacklist::remove_role),
-                    Command::<blacklist::ScopeArgs>::new("blacklist-list").handler(blacklist::list),
-                    Command::<knowledge::SearchArgs>::new("knowledge-search")
-                        .handler(knowledge::search),
-                    Command::<knowledge::ViewArgs>::new("knowledge-view").handler(knowledge::view),
+                    Command::<StatsArgs>::new("stats").handler(stats_command),
                     Command::<tags::TagCommandArgs>::new("tag")
                         .requires("tickets.use")
                         .handler(tags::tag_command),
-                    Command::<KnowledgeSendArgs>::new("knowledge-send").handler(knowledge_send),
-                    Command::<knowledge::AddArgs>::new("knowledge-add")
-                        .requires("tickets.manage")
-                        .handler(knowledge::add),
-                    Command::<knowledge::EditArgs>::new("knowledge-edit")
-                        .requires("tickets.manage")
-                        .handler(knowledge::edit),
-                    Command::<knowledge::DeleteArgs>::new("knowledge-delete")
-                        .requires("tickets.manage")
-                        .handler(knowledge::delete),
-                    Command::<StatsArgs>::new("stats").handler(stats_command),
-                    Command::<LabelArgs>::new("label-add").handler(add_label),
-                    Command::<LabelArgs>::new("label-remove").handler(remove_label),
-                    Command::<LabelListArgs>::new("label-list").handler(list_labels),
-                    Command::<OpeningsArgs>::new("openings")
-                        .requires("tickets.manage")
-                        .handler(openings_command),
-                    Command::<OpenReservationArgs>::new("recover-open")
-                        .requires("tickets.manage")
-                        .handler(recover_open_command),
-                    Command::<OpenReservationArgs>::new("release-open")
-                        .requires("tickets.manage")
-                        .handler(release_open_command),
                     Command::<NoteArgs>::new("note").handler(add_note),
                     Command::<NotesArgs>::new("notes").handler(list_notes),
-                    Command::<ReplySearchArgs>::new("reply-search").handler(search_replies),
-                    Command::<ReplyAddArgs>::new("reply-add").handler(add_reply),
-                    Command::<ReplyEditArgs>::new("reply-edit").handler(edit_reply),
-                    Command::<ReplyDeleteArgs>::new("reply-delete").handler(delete_reply),
+                ],
+            )
+            .groups(
+                "ticket",
+                [
+                    SubcommandGroup::new("settings")
+                        .subcommand(
+                            Command::<operations::SetPanelArgs>::new("set-panel")
+                                .handler(operations::set_panel),
+                        )
+                        .subcommand(
+                            Command::<operations::RoleArgs>::new("add-role")
+                                .handler(operations::add_role),
+                        )
+                        .subcommand(
+                            Command::<operations::RoleArgs>::new("remove-role")
+                                .handler(operations::remove_role),
+                        )
+                        .subcommand(
+                            Command::<operations::WaitingArgs>::new("waiting")
+                                .handler(operations::waiting),
+                        ),
+                    SubcommandGroup::new("data")
+                        .subcommand(
+                            Command::<data::ExportMyData>::new("export")
+                                .handler(data::export_my_data),
+                        )
+                        .subcommand(
+                            Command::<data::EraseMyData>::new("erase").handler(data::erase_my_data),
+                        ),
+                    SubcommandGroup::new("blacklist")
+                        .subcommand(
+                            Command::<blacklist::UserArgs>::new("add-user")
+                                .handler(blacklist::add_user),
+                        )
+                        .subcommand(
+                            Command::<blacklist::UserArgs>::new("remove-user")
+                                .handler(blacklist::remove_user),
+                        )
+                        .subcommand(
+                            Command::<blacklist::RoleArgs>::new("add-role")
+                                .handler(blacklist::add_role),
+                        )
+                        .subcommand(
+                            Command::<blacklist::RoleArgs>::new("remove-role")
+                                .handler(blacklist::remove_role),
+                        )
+                        .subcommand(
+                            Command::<blacklist::ScopeArgs>::new("list").handler(blacklist::list),
+                        ),
+                    SubcommandGroup::new("knowledge")
+                        .subcommand(
+                            Command::<knowledge::SearchArgs>::new("search")
+                                .handler(knowledge::search),
+                        )
+                        .subcommand(
+                            Command::<knowledge::ViewArgs>::new("view").handler(knowledge::view),
+                        )
+                        .subcommand(
+                            Command::<KnowledgeSendArgs>::new("send").handler(knowledge_send),
+                        )
+                        .subcommand(
+                            Command::<knowledge::AddArgs>::new("add")
+                                .requires("tickets.manage")
+                                .handler(knowledge::add),
+                        )
+                        .subcommand(
+                            Command::<knowledge::EditArgs>::new("edit")
+                                .requires("tickets.manage")
+                                .handler(knowledge::edit),
+                        )
+                        .subcommand(
+                            Command::<knowledge::DeleteArgs>::new("delete")
+                                .requires("tickets.manage")
+                                .handler(knowledge::delete),
+                        ),
+                    SubcommandGroup::new("label")
+                        .subcommand(Command::<LabelArgs>::new("add").handler(add_label))
+                        .subcommand(Command::<LabelArgs>::new("remove").handler(remove_label))
+                        .subcommand(Command::<LabelListArgs>::new("list").handler(list_labels)),
+                    SubcommandGroup::new("reply")
+                        .subcommand(
+                            Command::<ReplySearchArgs>::new("search").handler(search_replies),
+                        )
+                        .subcommand(Command::<ReplyAddArgs>::new("add").handler(add_reply))
+                        .subcommand(Command::<ReplyEditArgs>::new("edit").handler(edit_reply))
+                        .subcommand(
+                            Command::<ReplyDeleteArgs>::new("delete").handler(delete_reply),
+                        ),
+                    SubcommandGroup::new("maintenance")
+                        .subcommand(
+                            Command::<OpeningsArgs>::new("openings")
+                                .requires("tickets.manage")
+                                .handler(openings_command),
+                        )
+                        .subcommand(
+                            Command::<OpenReservationArgs>::new("recover-open")
+                                .requires("tickets.manage")
+                                .handler(recover_open_command),
+                        )
+                        .subcommand(
+                            Command::<OpenReservationArgs>::new("release-open")
+                                .requires("tickets.manage")
+                                .handler(release_open_command),
+                        ),
                 ],
             )
             .component("open", open)

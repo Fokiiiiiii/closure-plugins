@@ -556,8 +556,7 @@ tickets-knowledge-search-results = Results for “{ $query }” ({ $page } / { $
 tickets-knowledge-page-not-found = That result page does not exist.
 tickets-knowledge-invalid-id = Article IDs must use 1–32 lowercase letters, numbers, or hyphens.
 tickets-knowledge-not-found = Knowledge article not found.
-tickets-knowledge-view =
-    [{ $id }] { $title }
+tickets-knowledge-view = [{ $id }] { $title }
 
     { $body }
 tickets-knowledge-invalid-article = Enter a valid lowercase ID, a title up to 100 characters, and content up to 1,700 characters.
@@ -628,3 +627,55 @@ subcommand-ticket-knowledge-send = knowledge-send
 option-ticket-knowledge-send-id = id
     .description = Knowledge article ID, up to 32 characters
 tickets-knowledge-send-complete = Knowledge article sent to the ticket.
+
+subcommand-ticket-settings = settings
+    .description = Configure panel settings, staff roles, and waiting status.
+subcommand-ticket-settings-set-panel = set-panel
+    .description = Change the panel assigned to this ticket.
+subcommand-ticket-settings-add-role = add-role
+    .description = Give a role access to this ticket.
+subcommand-ticket-settings-remove-role = remove-role
+    .description = Remove a role's access to this ticket.
+subcommand-ticket-settings-waiting = waiting
+    .description = Mark whether this ticket is waiting for a reply.
+option-ticket-settings-set-panel-panel = panel
+    .description = Panel ID; omit for the current default settings.
+option-ticket-settings-add-role-role = role
+    .description = Role to add or remove from this ticket.
+option-ticket-settings-remove-role-role = role
+    .description = Role to add or remove from this ticket.
+option-ticket-settings-waiting-waiting = waiting
+    .description = Whether staff are waiting for a reply.
+
+subcommand-ticket-data = data
+    .description = Export or anonymize your ticket data.
+subcommand-ticket-data-export = export
+    .description = Send a private export of your ticket data.
+subcommand-ticket-data-erase = erase
+    .description = Preview or anonymize your personal data in closed tickets.
+option-ticket-data-erase-confirm = confirm
+    .description = Confirm anonymizing your closed ticket data.
+
+subcommand-ticket-blacklist = blacklist
+    .description = Manage members and roles blocked from opening tickets.
+subcommand-ticket-knowledge = knowledge
+    .description = Manage ticket knowledge articles.
+subcommand-ticket-label = label
+    .description = Manage ticket labels.
+subcommand-ticket-reply = reply
+    .description = Manage saved replies for ticket panels.
+
+subcommand-ticket-maintenance = maintenance
+    .description = Inspect and recover pending ticket openings.
+subcommand-ticket-maintenance-openings = openings
+    .description = List pending ticket openings for review.
+option-ticket-maintenance-openings-page = page
+    .description = The page number, starting at 1.
+subcommand-ticket-maintenance-recover-open = recover-open
+    .description = Retry recovery for a pending ticket opening.
+option-ticket-maintenance-recover-open-number = number
+    .description = The number of the pending ticket opening.
+subcommand-ticket-maintenance-release-open = release-open
+    .description = Release a pending ticket opening after safety checks.
+option-ticket-maintenance-release-open-number = number
+    .description = The number of the pending ticket opening.

@@ -556,8 +556,7 @@ tickets-knowledge-search-results = 「{ $query }」の検索結果（{ $page } /
 tickets-knowledge-page-not-found = 検索結果のページがありません。
 tickets-knowledge-invalid-id = 記事IDは英小文字、数字、ハイフンを使った1〜32文字で指定してください。
 tickets-knowledge-not-found = ナレッジ記事が見つかりません。
-tickets-knowledge-view =
-    [{ $id }] { $title }
+tickets-knowledge-view = [{ $id }] { $title }
 
     { $body }
 tickets-knowledge-invalid-article = 英小文字などで有効なID、100文字以内のタイトル、1,700文字以内の本文を入力してください。
@@ -628,3 +627,55 @@ subcommand-ticket-knowledge-send = knowledge-send
 option-ticket-knowledge-send-id = id
     .description = 送信するナレッジ記事のID（最大32文字）
 tickets-knowledge-send-complete = ナレッジ記事をチケットに送信しました。
+
+subcommand-ticket-settings = settings
+    .description = パネル設定、スタッフロール、返信待ち状態を管理します。
+subcommand-ticket-settings-set-panel = set-panel
+    .description = このチケットに割り当てるパネルを変更します。
+subcommand-ticket-settings-add-role = add-role
+    .description = このチケットにロールのアクセスを追加します。
+subcommand-ticket-settings-remove-role = remove-role
+    .description = このチケットからロールのアクセスを外します。
+subcommand-ticket-settings-waiting = waiting
+    .description = 返信待ち状態を設定します。
+option-ticket-settings-set-panel-panel = panel
+    .description = パネルIDです。省略すると現在のデフォルト設定を使います。
+option-ticket-settings-add-role-role = role
+    .description = このチケットのアクセス権を設定するロールです。
+option-ticket-settings-remove-role-role = role
+    .description = このチケットのアクセス権を設定するロールです。
+option-ticket-settings-waiting-waiting = waiting
+    .description = スタッフの返信を待っているかどうかを指定します。
+
+subcommand-ticket-data = data
+    .description = チケットに関する個人データをエクスポートまたは匿名化します。
+subcommand-ticket-data-export = export
+    .description = チケットに関する自分のデータをDMで受け取ります。
+subcommand-ticket-data-erase = erase
+    .description = クローズ済みチケットの個人データを確認または匿名化します。
+option-ticket-data-erase-confirm = confirm
+    .description = クローズ済みチケットの個人データを匿名化することを確認します。
+
+subcommand-ticket-blacklist = blacklist
+    .description = チケット作成を禁止するメンバーとロールを管理します。
+subcommand-ticket-knowledge = knowledge
+    .description = チケットで使うナレッジ記事を管理します。
+subcommand-ticket-label = label
+    .description = チケットのラベルを管理します。
+subcommand-ticket-reply = reply
+    .description = チケット用の定型返信を管理します。
+
+subcommand-ticket-maintenance = maintenance
+    .description = 未確定のチケット受付を確認・復旧します。
+subcommand-ticket-maintenance-openings = openings
+    .description = 確認が必要なチケット受付を一覧表示します。
+option-ticket-maintenance-openings-page = page
+    .description = ページ番号（1から）。
+subcommand-ticket-maintenance-recover-open = recover-open
+    .description = 未確定のチケット受付の復旧を再試行します。
+option-ticket-maintenance-recover-open-number = number
+    .description = 未確定のチケット受付番号です。
+subcommand-ticket-maintenance-release-open = release-open
+    .description = 安全を確認した未確定のチケット受付を解放します。
+option-ticket-maintenance-release-open-number = number
+    .description = 未確定のチケット受付番号です。
