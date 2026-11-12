@@ -397,14 +397,16 @@ impl FormQuestion {
         match self {
             Self::Legacy(_) => true,
             Self::Structured(FormQuestionKind::Display { .. }) => false,
-            Self::Structured(FormQuestionKind::Text { required, .. })
-            | Self::Structured(FormQuestionKind::StringSelect { required, .. })
-            | Self::Structured(FormQuestionKind::UserSelect { required, .. })
-            | Self::Structured(FormQuestionKind::RoleSelect { required, .. })
-            | Self::Structured(FormQuestionKind::MentionableSelect { required, .. })
-            | Self::Structured(FormQuestionKind::ChannelSelect { required, .. })
-            | Self::Structured(FormQuestionKind::RadioGroup { required, .. })
-            | Self::Structured(FormQuestionKind::CheckboxGroup { required, .. }) => *required,
+            Self::Structured(
+                FormQuestionKind::Text { required, .. }
+                | FormQuestionKind::StringSelect { required, .. }
+                | FormQuestionKind::UserSelect { required, .. }
+                | FormQuestionKind::RoleSelect { required, .. }
+                | FormQuestionKind::MentionableSelect { required, .. }
+                | FormQuestionKind::ChannelSelect { required, .. }
+                | FormQuestionKind::RadioGroup { required, .. }
+                | FormQuestionKind::CheckboxGroup { required, .. },
+            ) => *required,
         }
     }
 
@@ -455,34 +457,36 @@ impl FormQuestion {
                         options,
                     )
             }
-            Self::Structured(FormQuestionKind::UserSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            })
-            | Self::Structured(FormQuestionKind::RoleSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            })
-            | Self::Structured(FormQuestionKind::MentionableSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            })
-            | Self::Structured(FormQuestionKind::ChannelSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            }) => {
+            Self::Structured(
+                FormQuestionKind::UserSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                }
+                | FormQuestionKind::RoleSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                }
+                | FormQuestionKind::MentionableSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                }
+                | FormQuestionKind::ChannelSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                },
+            ) => {
                 valid_label(label)
                     && valid_description(description.as_deref())
                     && valid_value_range(*required, *min_values, *max_values, 25, false, &[])
@@ -595,34 +599,36 @@ impl FormQuestion {
                     ),
                 )
             }
-            Self::Structured(FormQuestionKind::UserSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            })
-            | Self::Structured(FormQuestionKind::RoleSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            })
-            | Self::Structured(FormQuestionKind::MentionableSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            })
-            | Self::Structured(FormQuestionKind::ChannelSelect {
-                label,
-                description,
-                required,
-                min_values,
-                max_values,
-            }) => {
+            Self::Structured(
+                FormQuestionKind::UserSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                }
+                | FormQuestionKind::RoleSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                }
+                | FormQuestionKind::MentionableSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                }
+                | FormQuestionKind::ChannelSelect {
+                    label,
+                    description,
+                    required,
+                    min_values,
+                    max_values,
+                },
+            ) => {
                 let kind = match self {
                     Self::Structured(FormQuestionKind::UserSelect { .. }) => SelectMenuType::User,
                     Self::Structured(FormQuestionKind::RoleSelect { .. }) => SelectMenuType::Role,

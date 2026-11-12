@@ -80,7 +80,7 @@ pub(crate) fn gallery_payload(form: &FormDefinition) -> Option<Value> {
     }
     let mut questions = serde_json::to_value(&form.questions).ok()?;
     let questions = questions.as_array_mut()?;
-    for question in questions {
+    for question in &mut *questions {
         let Some(question) = question.as_object_mut() else {
             continue;
         };

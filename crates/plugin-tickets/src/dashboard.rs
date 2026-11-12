@@ -404,8 +404,10 @@ pub async fn action(
                 }
             }
         }
-        (DashboardScope::Guild, "blacklist.add" | "blacklist.remove")
-        | (DashboardScope::Panel { .. }, "blacklist.add" | "blacklist.remove") => {
+        (
+            DashboardScope::Guild | DashboardScope::Panel { .. },
+            "blacklist.add" | "blacklist.remove",
+        ) => {
             let panel = match &request.scope {
                 DashboardScope::Panel { panel_id } => Some(panel_id.as_str()),
                 _ => None,

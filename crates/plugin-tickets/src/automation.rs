@@ -11,6 +11,7 @@ use twilight_model::channel::ChannelType;
 use twilight_model::guild::Permissions;
 
 const HOUR: i64 = 3_600;
+const STAFF_CHECK_ORDER_WAIT: i64 = 5;
 pub(super) const AUTOMATION: &str = "ticket-automation";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -491,7 +492,7 @@ pub(super) async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, 
             let check = PendingStaffCheck {
                 message_id,
                 author: message.author.id,
-                roles,
+                roles: message.author_roles.clone(),
             };
             ctx.store()
                 .set_for(

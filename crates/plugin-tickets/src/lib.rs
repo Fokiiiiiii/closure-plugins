@@ -8018,7 +8018,7 @@ async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
         .await
         .map_err(|error| failed(&error))?;
     if closed == Closed::Done || closed == Closed::RatingDmUnconfirmed {
-        let audit_key = format!("close-{}", cx.invocation().interaction_id.get());
+        let audit_key = format!("close-{}", cx.click().interaction_id.get());
         if let Err(error) = audit::record_event(
             ctx,
             cx.user().id.get(),
@@ -8750,7 +8750,7 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
             .await
         {
             Ok(_) => {
-                let audit_key = format!("ticket-claim-{}", cx.invocation().interaction_id.get());
+                let audit_key = format!("ticket-claim-{}", cx.click().interaction_id.get());
                 if let Err(error) = audit::record_event(
                     ctx,
                     cx.user().id.get(),

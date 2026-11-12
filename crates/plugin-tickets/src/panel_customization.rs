@@ -411,7 +411,7 @@ impl PanelCustomization {
             "color": {
                 "type": ["integer", "null"],
                 "minimum": 0,
-                "maximum": 16777215,
+                "maximum": 16_777_215,
                 "description": "tickets-panel-color",
                 "x-ui": { "level": "basic" }
             },
@@ -436,7 +436,7 @@ impl PanelCustomization {
             "welcome_color": {
                 "type": ["integer", "null"],
                 "minimum": 0,
-                "maximum": 16777215,
+                "maximum": 16_777_215,
                 "description": "tickets-welcome-color",
                 "x-ui": { "level": "basic" }
             },
@@ -546,7 +546,7 @@ impl PanelCustomization {
             "open_cooldown_seconds": {
                 "type": "integer",
                 "minimum": 0,
-                "maximum": 4294967295,
+                "maximum": 4_294_967_295,
                 "default": 0,
                 "description": "tickets-open-cooldown-seconds",
                 "x-ui": { "level": "basic" }

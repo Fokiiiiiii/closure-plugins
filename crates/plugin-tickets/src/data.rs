@@ -448,7 +448,12 @@ fn transcript_rich_message(
     let embeds = raw
         .get("embeds")
         .and_then(serde_json::Value::as_array)
-        .map(|embeds| embeds.iter().filter_map(transcript_rich_embed).collect())
+        .map(|embeds| {
+            embeds
+                .iter()
+                .filter_map(transcript_rich_embed)
+                .collect::<Vec<TranscriptRichEmbed>>()
+        })
         .unwrap_or_default();
     let components = raw
         .get("components")
@@ -461,7 +466,7 @@ fn transcript_rich_message(
     }
     Some(TranscriptRichMessage {
         author_name: author_name.replace(['\n', '\r'], " "),
-        created_at: Some(made_at(source_message_id)),
+        created_at: Some(made_at(source_message_id).to_string()),
         attachments,
         embeds,
         components,
@@ -780,7 +785,7 @@ fn collect_transcript_text_mentions(content: &str, mentions: &mut BTreeSet<(Stri
             cursor += 1;
             continue;
         }
-        let (kind, mut start) = match bytes[cursor + 1] {
+        let (kind, start) = match bytes[cursor + 1] {
             b'@' => {
                 let mut start = cursor + 2;
                 let kind = match bytes.get(start) {
@@ -1327,14 +1332,18 @@ async fn export_ticket_suggestion_state(
     else {
         return Ok(());
     };
-    let Some(state) = entry.value.as_object() else {
+    let Some(suggestion) = entry.value.as_object() else {
         stats.knowledge_suggestion_states_not_exported += 1;
         return Ok(());
     };
     let (Some(guild_id), Some(channel_id), Some(stored_ticket_number)) = (
-        state.get("guild_id").and_then(serde_json::Value::as_u64),
-        state.get("channel_id").and_then(serde_json::Value::as_u64),
-        state
+        suggestion
+            .get("guild_id")
+            .and_then(serde_json::Value::as_u64),
+        suggestion
+            .get("channel_id")
+            .and_then(serde_json::Value::as_u64),
+        suggestion
             .get("ticket_number")
             .and_then(serde_json::Value::as_i64),
     ) else {
@@ -1355,14 +1364,24 @@ async fn export_ticket_suggestion_state(
         Some(notified),
         Some(cancelled),
     ) = (
-        state.get("terms").and_then(serde_json::Value::as_array),
-        state
+        suggestion
+            .get("terms")
+            .and_then(serde_json::Value::as_array),
+        suggestion
             .get("candidates")
             .and_then(serde_json::Value::as_array),
-        state.get("expires_at").and_then(serde_json::Value::as_i64),
-        state.get("complete").and_then(serde_json::Value::as_bool),
-        state.get("notified").and_then(serde_json::Value::as_bool),
-        state.get("cancelled").and_then(serde_json::Value::as_bool),
+        suggestion
+            .get("expires_at")
+            .and_then(serde_json::Value::as_i64),
+        suggestion
+            .get("complete")
+            .and_then(serde_json::Value::as_bool),
+        suggestion
+            .get("notified")
+            .and_then(serde_json::Value::as_bool),
+        suggestion
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool),
     )
     else {
         stats.knowledge_suggestion_states_not_exported += 1;
@@ -1562,7 +1581,7 @@ async fn export_open_tickets(
                         if closed_retained {
                             stats.closed_retained_messages += 1;
                         }
-                        let state = if closed_retained {
+                        let lifecycle = if closed_retained {
                             "closed_retained"
                         } else {
                             "open"
@@ -1572,7 +1591,7 @@ async fn export_open_tickets(
                                 ctx,
                                 serde_json::json!({
                                     "kind": "message",
-                                    "state": state,
+                                    "state": lifecycle,
                                     "ticket_number": owns_ticket.then_some(ticket.number),
                                     "created_at": made_at(quote.message_id),
                                     "content": quote.content,
@@ -1595,7 +1614,7 @@ async fn export_open_tickets(
             if truncated && !closed_retained {
                 stats.active_truncated_tickets += 1;
             }
-            let state = if closed_retained {
+            let lifecycle = if closed_retained {
                 "closed_retained"
             } else {
                 "open"
@@ -1613,7 +1632,7 @@ async fn export_open_tickets(
                         ctx,
                         serde_json::json!({
                             "kind": "ticket",
-                            "state": state,
+                            "state": lifecycle,
                             "ticket_number": ticket.number,
                             "created_at": ticket.created,
                             "labels": &ticket.labels,
@@ -1627,7 +1646,7 @@ async fn export_open_tickets(
                             ctx,
                             serde_json::json!({
                                 "kind": "form_answer",
-                                "state": state,
+                                "state": lifecycle,
                                 "ticket_number": ticket.number,
                                 "index": index,
                                 "question": question,
@@ -1642,7 +1661,7 @@ async fn export_open_tickets(
                         ctx,
                         serde_json::json!({
                             "kind": "ticket_role",
-                            "state": state,
+                            "state": lifecycle,
                             "ticket_number": None::<i64>,
                             "role": "assignee"
                         }),
@@ -1666,7 +1685,7 @@ async fn export_open_tickets(
                         ctx,
                         serde_json::json!({
                             "kind": "message",
-                            "state": state,
+                            "state": lifecycle,
                             "ticket_number": owns_ticket.then_some(ticket.number),
                             "created_at": made_at(message.id.get()),
                             "content": message.content,
@@ -1691,7 +1710,7 @@ async fn export_open_tickets(
                         ctx,
                         serde_json::json!({
                             "kind": "message",
-                            "state": state,
+                            "state": lifecycle,
                             "ticket_number": owns_ticket.then_some(ticket.number),
                             "created_at": made_at(quote.message_id),
                             "content": quote.content,
@@ -1926,12 +1945,12 @@ async fn own_history_content(
             .await
             .map_err(|error| stored(&error))?
             .ok_or_else(|| ModuleError::other("ticket transcript spans are missing"))?;
-        let owned = spans.iter().any(|span| match &span.part {
+        let has_owned_data = spans.iter().any(|span| match &span.part {
             TranscriptSpanPart::Message { author_id, .. } => *author_id == user.get(),
             TranscriptSpanPart::FormAnswers { user_id } => owner && *user_id == user.get(),
             TranscriptSpanPart::Opener { .. } => false,
         });
-        if !owned {
+        if !has_owned_data {
             continue;
         }
         let text: String = ctx

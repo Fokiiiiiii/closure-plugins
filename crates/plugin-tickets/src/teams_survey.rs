@@ -636,6 +636,7 @@ async fn open_survey_modal(cx: &ComponentCx, request: SurveyRequest) -> Result<b
         return Ok(false);
     };
     let resolved_questions = advanced_forms::resolve_form_questions(
+        ctx,
         questions,
         &history.survey_integrations,
         ctx.guild_id.get(),
@@ -936,6 +937,7 @@ pub(super) async fn submit_exit_survey(cx: ModalCx) -> Result<(), UserError> {
     };
     cx.defer(true).await?;
     let questions = advanced_forms::resolve_form_questions_fresh(
+        ctx,
         raw_questions,
         &history.survey_integrations,
         ctx.guild_id.get(),
