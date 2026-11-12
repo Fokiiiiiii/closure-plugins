@@ -72,7 +72,7 @@ impl SafeFetcher {
     ///
     /// The request body is limited to 64 KiB and the response to 256 KiB.
     /// Use custom headers for non-reserved values; authentication uses
-    /// get_with_bearer or post_json_with_bearer.
+    /// `get_with_bearer` or `post_json_with_bearer`.
     ///
     /// # Errors
     /// The URL is invalid, resolves to a non-public address, cannot be reached
@@ -88,6 +88,10 @@ impl SafeFetcher {
     }
 
     /// Send a JSON POST with a caller deadline capped at five seconds.
+    ///
+    /// # Errors
+    /// The URL is invalid, resolves to a non-public address, cannot be reached
+    /// with valid TLS, redirects, times out, or exceeds a body limit.
     pub async fn post_json_with_timeout(
         &self,
         url: &str,
@@ -103,6 +107,11 @@ impl SafeFetcher {
     ///
     /// The token is added as Authorization internally and is not accepted in
     /// the custom header list. URL and token values are omitted from errors.
+    ///
+    /// # Errors
+    /// The URL, bearer token, or headers are invalid, the address is non-public,
+    /// the request fails or times out, the endpoint returns an error status,
+    /// or a request/response size limit is exceeded.
     pub async fn post_json_with_bearer(
         &self,
         url: &str,
@@ -126,6 +135,11 @@ impl SafeFetcher {
     ///
     /// The token is added as Authorization internally and is not accepted in
     /// the custom header list. URL and token values are omitted from errors.
+    ///
+    /// # Errors
+    /// The URL, bearer token, or headers are invalid, the address is non-public,
+    /// the request fails or times out, the endpoint returns an error status,
+    /// or the response exceeds the size limit.
     pub async fn get_with_bearer(
         &self,
         url: &str,
@@ -201,7 +215,7 @@ impl SafeFetcher {
             if body.len() > MAX_REQUEST_BYTES {
                 bail!("JSON request body exceeds the size limit");
             }
-            if bearer_token.is_some_and(|token| token.is_empty()) {
+            if bearer_token.is_some_and(str::is_empty) {
                 bail!("Bearer token is empty");
             }
 
