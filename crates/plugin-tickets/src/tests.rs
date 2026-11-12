@@ -802,6 +802,7 @@ async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_pla
         .unwrap()
         .parse::<u64>()
         .unwrap();
+    let ticket: Ticket = harness.store().get(&tickets[0].0).await.unwrap().unwrap();
     let close = |user| {
         Invocation::new("ticket")
             .subcommand("close")
@@ -819,8 +820,12 @@ async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_pla
     assert_eq!(deleted(&harness), [channel_id]);
     let saved = transcripts(&harness);
     assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].0, "ticket-0003.txt");
-    assert!(saved[0].1.contains("Ticket #3"), "{}", saved[0].1);
+    assert_eq!(saved[0].0, format!("ticket-{:04}.txt", ticket.number));
+    assert!(
+        saved[0].1.contains(&format!("Ticket #{}", ticket.number)),
+        "{}",
+        saved[0].1
+    );
     let late = harness.invoke(close(MEMBER)).await.unwrap();
     assert!(
         late.last().unwrap().content.contains("not an open ticket"),
@@ -2654,7 +2659,7 @@ async fn managers_can_inspect_recheck_and_release_an_unconfirmed_opening() {
     let listed = harness
         .invoke(
             Invocation::new("ticket")
-                .subcommand("openings")
+                .subcommand("maintenance openings")
                 .roles([MODERATOR])
                 .user(MODERATOR),
         )
@@ -2668,7 +2673,7 @@ async fn managers_can_inspect_recheck_and_release_an_unconfirmed_opening() {
     let queued = harness
         .invoke(
             Invocation::new("ticket")
-                .subcommand("recover-open")
+                .subcommand("maintenance recover-open")
                 .option("number", CommandOptionValue::Integer(42))
                 .roles([MODERATOR])
                 .user(MODERATOR),
@@ -2687,7 +2692,7 @@ async fn managers_can_inspect_recheck_and_release_an_unconfirmed_opening() {
     let released = harness
         .invoke(
             Invocation::new("ticket")
-                .subcommand("release-open")
+                .subcommand("maintenance release-open")
                 .option("number", CommandOptionValue::Integer(42))
                 .roles([MODERATOR])
                 .user(MODERATOR),
@@ -2726,6 +2731,11 @@ async fn an_unlimited_open_count_has_no_reservation_count_ceiling() {
             .await
             .unwrap();
     }
+    harness
+        .store()
+        .score_add(crate::NUMBER, 0_u64, 30)
+        .await
+        .unwrap();
 
     let opened = harness.click(press("open", MEMBER)).await.unwrap();
     assert_eq!(created(&harness).len(), 1, "{opened:?}");
@@ -2762,7 +2772,7 @@ async fn managers_can_page_through_all_reservations_beyond_the_store_list_limit(
     let first_page = harness
         .invoke(
             Invocation::new("ticket")
-                .subcommand("openings")
+                .subcommand("maintenance openings")
                 .option("page", CommandOptionValue::Integer(1))
                 .roles([MODERATOR])
                 .user(MODERATOR),
@@ -2778,7 +2788,7 @@ async fn managers_can_page_through_all_reservations_beyond_the_store_list_limit(
     let last_page = harness
         .invoke(
             Invocation::new("ticket")
-                .subcommand("openings")
+                .subcommand("maintenance openings")
                 .option("page", CommandOptionValue::Integer(126))
                 .roles([MODERATOR])
                 .user(MODERATOR),
@@ -2792,7 +2802,7 @@ async fn managers_can_page_through_all_reservations_beyond_the_store_list_limit(
     let invalid_page = harness
         .invoke(
             Invocation::new("ticket")
-                .subcommand("openings")
+                .subcommand("maintenance openings")
                 .option("page", CommandOptionValue::Integer(127))
                 .roles([MODERATOR])
                 .user(MODERATOR),
@@ -3614,19 +3624,20 @@ async fn panel_update_refuses_messages_that_are_not_ticket_panels() {
         )
         .await
         .unwrap();
+    let denied = replies.last().unwrap();
+    assert!(denied.ephemeral, "{replies:?}");
     assert!(
-        replies
-            .last()
-            .unwrap()
-            .content
-            .contains("panel message without embeds"),
+        denied.content.contains(
+            "Choose a valid ticket panel message created by this bot in the selected channel"
+        ),
         "{replies:?}"
     );
     assert!(
-        !harness
-            .actions()
-            .iter()
-            .any(|action| matches!(action, Action::PostMessage { .. }))
+        !harness.actions().iter().any(|action| matches!(
+            action,
+            Action::PostMessage { .. } | Action::EditMessage { .. }
+        )),
+        "the rejected update leaves the existing message unchanged"
     );
 }
 
@@ -4545,9 +4556,10 @@ async fn answers_are_saved_and_reposted_when_the_ticket_welcome_fails() {
     }));
 
     harness.click(panel_press("", MEMBER)).await.unwrap();
+    // CreateChannel and channel verification precede the welcome PostMessage.
     harness
         .api()
-        .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
+        .fail_nth(3, closure_core::error::DiscordError::Fatal("down".into()));
     harness
         .submit(
             Submit::new(form_submit_id("", MEMBER, &default_form_config(&questions)))
