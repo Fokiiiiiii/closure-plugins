@@ -59,6 +59,7 @@ const MAX_TICKET_CUSTOM_ID_BYTES: usize = 100;
 const MAX_FORM_QUESTION_CHARS: usize = advanced_forms::MAX_FORM_QUESTION_CHARS;
 const MAX_TICKET_BYTES: usize = 32 * 1024;
 const HISTORY_PREFIX: &str = "ticket-history:";
+const HISTORY_LINK_PREFIX: &str = "ticket-history-link:";
 const HISTORY_CONTENT_PREFIX: &str = "ticket-history-content:";
 const HISTORY_INDEX_PREFIX: &str = "ticket-history-index:";
 const HISTORY_ID_PREFIX: &str = "ticket-history-id:";
@@ -115,6 +116,8 @@ struct Config {
     thread_channel: Option<String>,
     /// The roles that see every ticket. Tickets are off without one.
     staff_roles: Vec<String>,
+    #[serde(default)]
+    staff_teams: Vec<teams_survey::StaffTeam>,
     /// The channel the transcripts go to. Without one no transcript is kept.
     log_channel: Option<String>,
     timezone: String,
@@ -122,9 +125,15 @@ struct Config {
     max_open: u32,
     /// A ticket nobody writes in for this many days is closed; 0 never closes one.
     close_after_days: u32,
+    waiting_after_hours: u32,
+    first_response_timeout_hours: u32,
+    last_message_timeout_hours: u32,
+    waiting_category: Option<String>,
     /// Hours before an unanswered close request is closed; 0 disables it.
     close_request_timeout_hours: u32,
     questions: Vec<advanced_forms::FormQuestion>,
+    forms: Vec<form_library::FormDefinition>,
+    integrations: Vec<integrations::Integration>,
     /// Close the member's open tickets when they leave the server.
     close_when_opener_leaves: bool,
     panel_display: PanelDisplay,
@@ -169,10 +178,19 @@ struct NamedPanel {
     category: Option<String>,
     thread_channel: Option<String>,
     staff_roles: Vec<String>,
+    staff_teams: Vec<String>,
     log_channel: Option<String>,
     timezone: Option<String>,
     close_after_days: u32,
+    waiting_after_hours: u32,
+    first_response_timeout_hours: u32,
+    last_message_timeout_hours: u32,
+    waiting_category: Option<String>,
+    form_id: Option<String>,
     questions: Vec<advanced_forms::FormQuestion>,
+    exit_survey: Vec<advanced_forms::FormQuestion>,
+    #[serde(flatten)]
+    customization: panel_customization::PanelCustomization,
     max_open: u32,
 }
 
@@ -182,13 +200,20 @@ impl Default for Config {
             category: None,
             thread_channel: None,
             staff_roles: Vec::new(),
+            staff_teams: Vec::new(),
             log_channel: None,
             timezone: "UTC".to_owned(),
             hours: Vec::new(),
             max_open: 1,
             close_after_days: 0,
+            waiting_after_hours: 0,
+            first_response_timeout_hours: 0,
+            last_message_timeout_hours: 0,
+            waiting_category: None,
             close_request_timeout_hours: 0,
             questions: Vec::new(),
+            forms: Vec::new(),
+            integrations: Vec::new(),
             close_when_opener_leaves: false,
             panel_display: PanelDisplay::Buttons,
             panels: Vec::new(),
@@ -226,10 +251,17 @@ impl Config {
     }
 
     fn with_panel(&self, panel: &NamedPanel) -> Self {
+        let questions = panel
+            .form_id
+            .as_deref()
+            .and_then(|id| form_library::resolve_form(&self.forms, id))
+            .map(|form| form.questions.clone())
+            .unwrap_or_else(|| panel.questions.clone());
         Self {
             category: panel.category.clone(),
             thread_channel: panel.thread_channel.clone(),
             staff_roles: panel.staff_roles.clone(),
+            staff_teams: self.staff_teams.clone(),
             log_channel: panel.log_channel.clone(),
             timezone: panel
                 .timezone
@@ -238,8 +270,14 @@ impl Config {
             hours: self.hours.clone(),
             max_open: self.max_open,
             close_after_days: panel.close_after_days,
+            waiting_after_hours: panel.waiting_after_hours,
+            first_response_timeout_hours: panel.first_response_timeout_hours,
+            last_message_timeout_hours: panel.last_message_timeout_hours,
+            waiting_category: panel.waiting_category.clone(),
             close_request_timeout_hours: self.close_request_timeout_hours,
-            questions: panel.questions.clone(),
+            questions,
+            forms: Vec::new(),
+            integrations: self.integrations.clone(),
             close_when_opener_leaves: self.close_when_opener_leaves,
             panel_display: self.panel_display,
             panels: Vec::new(),
@@ -292,6 +330,8 @@ struct Ticket {
     #[serde(default)]
     staff_roles: Option<Vec<u64>>,
     #[serde(default)]
+    staff_access: Option<teams_survey::StaffAccessSnapshot>,
+    #[serde(default)]
     form_answers: Vec<(String, String)>,
     #[serde(default)]
     form_answer_count: u8,
@@ -312,7 +352,17 @@ struct Ticket {
     #[serde(default)]
     participant_roles: Vec<operations::RoleAccess>,
     #[serde(default)]
+    panel_user_baselines: Vec<operations::UserAccess>,
+    #[serde(default)]
+    participant_users: Vec<u64>,
+    #[serde(default)]
     waiting_for_reply: bool,
+    #[serde(default)]
+    automation: automation::State,
+    #[serde(default)]
+    message_quote: Option<message_ticket::MessageQuote>,
+    #[serde(default)]
+    message_quote_message_id: Option<u64>,
 }
 
 impl Ticket {
@@ -337,6 +387,7 @@ struct TicketRating {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+
 struct TicketHistory {
     version: u8,
     #[serde(default)]
@@ -350,6 +401,8 @@ struct TicketHistory {
     closer: Option<u64>,
     reason: String,
     panel: Option<NamedPanel>,
+    #[serde(default)]
+    survey_integrations: Vec<integrations::Integration>,
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default)]
@@ -370,7 +423,11 @@ struct TicketHistory {
     #[serde(default)]
     log_copy_channel: Option<u64>,
     #[serde(default)]
+    log_copy_message: Option<u64>,
+    #[serde(default)]
     transcript_span_pages: u32,
+    #[serde(default)]
+    staff_access: Option<teams_survey::StaffAccessSnapshot>,
     staff_roles: Vec<u64>,
     status: HistoryStatus,
     /// Prevents recovery from posting the configured transcript copy more than once.
@@ -599,6 +656,8 @@ struct StaffNote {
 struct StaffNotePage {
     ticket_number: i64,
     panel: Option<NamedPanel>,
+    #[serde(default)]
+    staff_access: Option<teams_survey::StaffAccessSnapshot>,
     notes: Vec<StaffNote>,
 }
 
@@ -645,7 +704,17 @@ struct OpenReservation {
     panel: Option<NamedPanel>,
     settings: Config,
     staff_roles: Vec<u64>,
+    #[serde(default)]
+    staff_access: Option<teams_survey::StaffAccessSnapshot>,
     form_answers: Vec<(String, String)>,
+    #[serde(default)]
+    form_modal_revision: Option<u64>,
+    #[serde(default)]
+    message_quote: Option<message_ticket::MessageQuote>,
+    #[serde(default)]
+    channel_name: String,
+    #[serde(default)]
+    staff_opening: Option<bool>,
     generation: i64,
     until: i64,
     channel: Option<u64>,
@@ -672,6 +741,7 @@ enum OpenReservationResult {
     Reserved(OpenReservation),
     GlobalLimit(u32),
     PanelLimit(u32),
+    Cooldown(u32),
     TooLarge,
     Pending,
     Busy,
@@ -846,6 +916,7 @@ struct HistorySearchHit {
 }
 
 struct HistorySearchAccess<'a> {
+    actor_id: u64,
     roles: &'a [RoleId],
     can_manage: bool,
 }
@@ -899,6 +970,19 @@ struct RateArgs {
     ticket: i64,
     /// A rating from 1 to 5
     score: i64,
+}
+
+#[derive(Debug, Deserialize, CommandArgs)]
+struct SurveyArgs {
+    /// The closed ticket number
+    number: i64,
+}
+
+#[derive(Debug, Deserialize, CommandArgs)]
+struct KnowledgeSendArgs {
+    /// The knowledge article ID
+    #[arg(max_length = 32)]
+    id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1457,6 +1541,7 @@ fn ticket_from_reservation(reservation: &OpenReservation, user: u64) -> Ticket {
         close_request: None,
         panel: reservation.panel.clone(),
         staff_roles: Some(reservation.staff_roles.clone()),
+        staff_access: reservation.staff_access.clone(),
         form_answers: reservation.form_answers.clone(),
         form_answer_count: 0,
         labels: Vec::new(),
@@ -1467,7 +1552,29 @@ fn ticket_from_reservation(reservation: &OpenReservation, user: u64) -> Ticket {
         pending_operation: None,
         panel_role_baselines: Vec::new(),
         participant_roles: Vec::new(),
+        panel_user_baselines: Vec::new(),
+        participant_users: Vec::new(),
         waiting_for_reply: false,
+        automation: automation::State::default(),
+        message_quote: reservation.message_quote.clone(),
+        message_quote_message_id: None,
+    }
+}
+
+fn reservation_channel_name(reservation: &OpenReservation) -> String {
+    if !reservation.channel_name.trim().is_empty() {
+        return reservation.channel_name.clone();
+    }
+    if reservation
+        .settings
+        .thread_channel
+        .as_ref()
+        .and_then(|parent| id_of(Some(parent)))
+        .is_some()
+    {
+        format!("ticket-{:04}-r{}", reservation.number, reservation.token)
+    } else {
+        format!("ticket-{:04}", reservation.number)
     }
 }
 
@@ -1815,6 +1922,29 @@ async fn save_open_ticket_locked(
         }
     }
 
+    if reservation.staff_opening == Some(false)
+        && let Some(panel) = reservation.panel.as_ref()
+        && panel.customization.open_cooldown_seconds > 0
+    {
+        let cooldown_key = panel_customization::open_cooldown_key(user, &panel.id);
+        let previous = ctx
+            .store()
+            .get::<i64>(&cooldown_key)
+            .await
+            .map_err(|error| stored(&error))?;
+        if previous.is_none_or(|opened| opened < reservation.created) {
+            let opened = ctx.now();
+            ctx.store()
+                .set_for(
+                    &cooldown_key,
+                    &opened,
+                    Duration::from_secs(u64::from(panel.customization.open_cooldown_seconds)),
+                )
+                .await
+                .map_err(|error| stored(&error))?;
+        }
+    }
+
     let (_, state) = read_open_state(ctx, user).await?;
     if !owns_open_lock(&state, token, ctx.now()) {
         return Ok(false);
@@ -1844,6 +1974,12 @@ async fn save_open_ticket_locked(
 }
 
 async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket) {
+    if let Err(error) = add_team_users_to_thread(ctx, channel, ticket).await {
+        tracing::warn!(?error, %channel, "ticket team members could not be added to the thread");
+    }
+    if let Err(error) = post_ticket_message_quote(ctx, channel, ticket).await {
+        tracing::warn!(?error, %channel, "ticket source quote could not be posted");
+    }
     let config: Config = match ctx.parse_config::<Config>() {
         Ok(config) => config.for_ticket(ticket),
         Err(error) => {
@@ -1851,19 +1987,28 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
             return;
         }
     };
-    let answer_embeds = match advanced_forms::load_ticket_form_answers(ctx, ticket).await {
-        Ok(answers) => match advanced_forms::form_answers_embeds_in(ctx, &answers) {
-            Ok(embeds) => embeds,
-            Err(error) => {
-                tracing::warn!(?error, guild = %ctx.guild_id, number = ticket.number, "saved ticket answers could not be rendered");
-                Vec::new()
-            }
-        },
+    let saved_answers = match advanced_forms::load_ticket_form_answers(ctx, ticket).await {
+        Ok(answers) => answers,
         Err(error) => {
             tracing::warn!(?error, guild = %ctx.guild_id, number = ticket.number, "could not load saved ticket answers");
             Vec::new()
         }
     };
+    let answer_embeds = match advanced_forms::form_answers_embeds_in(ctx, &saved_answers) {
+        Ok(embeds) => embeds,
+        Err(error) => {
+            tracing::warn!(?error, guild = %ctx.guild_id, number = ticket.number, "saved ticket answers could not be rendered");
+            Vec::new()
+        }
+    };
+    let mut welcome_embeds = answer_embeds.clone();
+    match ticket_welcome_embed(ctx, channel, ticket, &config, &saved_answers).await {
+        Ok(Some(embed)) => welcome_embeds.insert(0, embed),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(?error, channel = %channel, "custom ticket welcome embed could not be built")
+        }
+    }
     let welcome = ctx
         .api
         .execute(Action::PostMessage {
@@ -1879,7 +2024,7 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
                         .with("number", ticket.number),
                 ),
             ),
-            embeds: answer_embeds.clone(),
+            embeds: welcome_embeds,
             components: vec![ui::row(vec![
                 button(ctx, "claim", ButtonStyle::Secondary, "tickets-claim-button"),
                 button(ctx, "close", ButtonStyle::Danger, "tickets-close-button"),
@@ -1895,6 +2040,11 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
         {
             tracing::warn!(?error, guild = %ctx.guild_id, "could not post saved ticket answers");
         }
+    }
+    if let Err(error) =
+        post_ticket_knowledge_suggestions(ctx, channel, ticket, &saved_answers).await
+    {
+        tracing::warn!(?error, channel = %channel, "published ticket knowledge suggestions could not be posted");
     }
     let mut staff = ticket.staff_roles.as_ref().map_or_else(
         || config.staff(),
@@ -1926,6 +2076,210 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
         )
         .await;
     }
+}
+
+async fn ticket_welcome_embed(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket: &Ticket,
+    config: &Config,
+    form_data: &[(String, String)],
+) -> Result<Option<twilight_model::channel::message::Embed>, ModuleError> {
+    let Some(panel) = ticket.panel.as_ref() else {
+        return Ok(None);
+    };
+    let ticket_id =
+        u64::try_from(ticket.number).map_err(|error| ModuleError::other(error.to_string()))?;
+    let placeholders = integrations::resolve_welcome_placeholders(
+        ctx,
+        &config.integrations,
+        &integrations::WelcomeContext {
+            guild_id: ctx.guild_id.get(),
+            user_id: ticket.opener,
+            ticket_id,
+            ticket_channel_id: channel.get(),
+            form_data,
+        },
+    )
+    .await;
+    let mut customization = panel.customization.clone();
+    let apply = |value: &mut Option<String>| {
+        if let Some(value) = value.as_mut() {
+            *value = integrations::apply_welcome_placeholders(value, &placeholders);
+        }
+    };
+    apply(&mut customization.welcome_title);
+    apply(&mut customization.welcome_description);
+    apply(&mut customization.welcome_author_name);
+    apply(&mut customization.welcome_footer_text);
+    for field in &mut customization.welcome_fields {
+        field.name = integrations::apply_welcome_placeholders(&field.name, &placeholders);
+        field.value = integrations::apply_welcome_placeholders(&field.value, &placeholders);
+    }
+    customization
+        .welcome_embed(ctx.now())
+        .map_err(|error| ModuleError::other(error.to_string()))
+}
+
+async fn post_ticket_knowledge_suggestions(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket: &Ticket,
+    answers: &[(String, String)],
+) -> Result<(), ModuleError> {
+    knowledge::schedule_ticket_suggestions(
+        ctx,
+        channel,
+        ticket.number,
+        ticket.panel.as_ref().map(|panel| panel.id.as_str()),
+        answers,
+    )
+    .await
+}
+
+async fn add_team_users_to_thread(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket: &Ticket,
+) -> Result<(), ModuleError> {
+    if !ticket.thread {
+        return Ok(());
+    }
+    let bot = ctx.bot();
+    for user in team_staff_users(ticket.staff_access.as_ref()) {
+        if user.get() == ticket.opener || Some(user) == bot {
+            continue;
+        }
+        thread::add_member(ctx, channel, user).await?;
+    }
+    Ok(())
+}
+
+async fn post_ticket_message_quote(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket: &Ticket,
+) -> Result<(), ModuleError> {
+    let Some(quote) = ticket.message_quote.as_ref() else {
+        return Ok(());
+    };
+    let key = ticket_key(channel);
+    let current = ctx
+        .store()
+        .get::<Ticket>(&key)
+        .await
+        .map_err(|error| stored(&error))?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if !current.is_open()
+        || current.message_quote.as_ref().is_none_or(|saved| {
+            saved.guild_id != quote.guild_id
+                || saved.channel_id != quote.channel_id
+                || saved.message_id != quote.message_id
+                || saved.author_id != quote.author_id
+        })
+    {
+        return Ok(());
+    }
+    if let Some(message_id) = current.message_quote_message_id {
+        match ctx
+            .api
+            .execute(Action::GetMessage {
+                channel_id: channel,
+                message_id: MessageId::new(message_id),
+            })
+            .await
+        {
+            Ok(Outcome::Message(message)) if message.id.get() == message_id => return Ok(()),
+            Err(DiscordError::NotFound) | Ok(_) => {}
+            Err(error) => return Err(stored(&error)),
+        }
+    }
+    let source_url = message_ticket::source_url(quote);
+    let bot = ctx.bot();
+    let recent = ctx
+        .api
+        .get_messages(channel, None, 100)
+        .await
+        .map_err(|error| stored(&error))?;
+    let existing = recent.iter().find(|message| {
+        bot.is_some_and(|bot| message.author.id.get() == bot.get())
+            && message.embeds.iter().any(|embed| {
+                embed
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains(&source_url))
+            })
+    });
+    let posted_id = if let Some(message) = existing {
+        message.id.get()
+    } else {
+        let embeds = message_ticket::quote_embeds(ctx, quote)?;
+        match ctx
+            .api
+            .execute(Action::PostMessage {
+                channel_id: channel,
+                message_id: None,
+                reply_to: None,
+                content: None,
+                embeds,
+                components: Vec::new(),
+                files: Vec::new(),
+            })
+            .await
+        {
+            Ok(Outcome::Message(message)) => message.id.get(),
+            Ok(_) => return Err(ModuleError::other("ticket quote post returned no message")),
+            Err(error) => return Err(stored(&error)),
+        }
+    };
+    for _ in 0..5 {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
+            return Ok(());
+        };
+        let mut latest: Ticket =
+            serde_json::from_value(entry.value).map_err(|error| stored(&error))?;
+        if !latest.is_open()
+            || latest.message_quote.as_ref().is_none_or(|saved| {
+                saved.guild_id != quote.guild_id
+                    || saved.channel_id != quote.channel_id
+                    || saved.message_id != quote.message_id
+                    || saved.author_id != quote.author_id
+            })
+        {
+            return Ok(());
+        }
+        if latest.message_quote_message_id.is_some() {
+            return Ok(());
+        }
+        latest.message_quote_message_id = Some(posted_id);
+        advanced_forms::refresh_ticket_form_answer_ttl(ctx, &latest)
+            .await
+            .map_err(|error| stored(&error))?;
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &latest,
+                Expect::Revision(entry.revision),
+                Some(ticket_ttl(&latest, ctx.now())),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(StorageError::Conflict) => {}
+            Err(error) => return Err(stored(&error)),
+        }
+    }
+    Err(ModuleError::other(
+        "ticket quote message could not be recorded",
+    ))
 }
 
 async fn release_open_reservation(
@@ -2536,10 +2890,15 @@ async fn release_open_command(cx: CommandCx, args: OpenReservationArgs) -> Resul
 async fn reserve_open(
     ctx: &EventContext,
     user: u64,
+    username: String,
+    nickname: Option<String>,
     panel: Option<NamedPanel>,
     settings: Config,
     staff_roles: Vec<u64>,
     form_answers: Vec<(String, String)>,
+    form_modal_revision: u64,
+    staff_access: Option<teams_survey::StaffAccessSnapshot>,
+    message_quote: Option<message_ticket::MessageQuote>,
     global_limit: u32,
     panel_limit: u32,
     staff: bool,
@@ -2550,10 +2909,15 @@ async fn reserve_open(
     let result = reserve_open_locked(
         ctx,
         user,
+        username,
+        nickname,
         panel,
         settings,
         staff_roles,
         form_answers,
+        form_modal_revision,
+        staff_access,
+        message_quote,
         global_limit,
         panel_limit,
         staff,
@@ -2571,10 +2935,15 @@ async fn reserve_open(
 async fn reserve_open_locked(
     ctx: &EventContext,
     user: u64,
+    username: String,
+    nickname: Option<String>,
     panel: Option<NamedPanel>,
     mut settings: Config,
     staff_roles: Vec<u64>,
     form_answers: Vec<(String, String)>,
+    form_modal_revision: u64,
+    staff_access: Option<teams_survey::StaffAccessSnapshot>,
+    message_quote: Option<message_ticket::MessageQuote>,
     global_limit: u32,
     panel_limit: u32,
     staff: bool,
@@ -2594,6 +2963,31 @@ async fn reserve_open_locked(
     }
     let panel_id = panel.as_ref().map(|panel| panel.id.as_str());
     let (open_count, panel_count) = open_counts(user, panel_id, &tickets, &reservations);
+    if !staff
+        && let Some(panel) = panel.as_ref()
+        && panel.customization.open_cooldown_seconds > 0
+    {
+        if reservations.iter().any(|reservation| {
+            reservation.released_at.is_none()
+                && reservation
+                    .panel
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == panel.id)
+        }) {
+            return Ok(OpenReservationResult::Pending);
+        }
+        let last_opened = ctx
+            .store()
+            .get::<i64>(&panel_customization::open_cooldown_key(user, &panel.id))
+            .await
+            .map_err(|error| stored(&error))?;
+        let remaining = panel
+            .customization
+            .cooldown_remaining(last_opened, ctx.now());
+        if remaining > 0 {
+            return Ok(OpenReservationResult::Cooldown(remaining));
+        }
+    }
     set_open_score(ctx, user, open_count).await?;
     if !staff {
         if global_limit > 0 && open_count >= u64::from(global_limit) {
@@ -2627,6 +3021,28 @@ async fn reserve_open_locked(
         .score_add(NUMBER, 0_u64, 1)
         .await
         .map_err(|error| stored(&error))?;
+    let thread_ticket = settings
+        .thread_channel
+        .as_ref()
+        .and_then(|parent| id_of(Some(parent)))
+        .is_some();
+    let channel_name = panel.as_ref().map_or_else(
+        || {
+            if thread_ticket {
+                format!("ticket-{number:04}-r{token}")
+            } else {
+                format!("ticket-{number:04}")
+            }
+        },
+        |panel| {
+            panel.customization.channel_name(
+                number,
+                &username,
+                nickname.as_deref(),
+                thread_ticket.then_some(token),
+            )
+        },
+    );
     let reservation = OpenReservation {
         opener: user,
         number,
@@ -2636,6 +3052,11 @@ async fn reserve_open_locked(
         settings,
         staff_roles,
         form_answers,
+        form_modal_revision: Some(form_modal_revision),
+        staff_access,
+        message_quote,
+        channel_name,
+        staff_opening: Some(staff),
         generation: 1,
         until: ctx.now() + OPEN_LEASE_SECONDS,
         channel: None,
@@ -2652,6 +3073,7 @@ async fn reserve_open_locked(
     reservation_size_check.until = i64::MAX;
     reservation_size_check.channel = Some(u64::MAX);
     reservation_size_check.attempts = u32::MAX;
+    reservation_size_check.form_modal_revision = Some(u64::MAX);
     let reservation_size = serde_json::to_vec(&reservation_size_check)
         .map_err(|error| ModuleError::other(error.to_string()))?
         .len();
@@ -3152,6 +3574,121 @@ async fn send_rating_prompt(
     }
 }
 
+async fn send_history_link_dm(ctx: &EventContext, history: &TicketHistory) -> bool {
+    if history.status != HistoryStatus::Closed || history.opener_erased {
+        return false;
+    }
+    let channel = ChannelId::new(history.channel_id);
+    let key = history_key(history.number, channel);
+    let current = match ctx.store().get::<TicketHistory>(&key).await {
+        Ok(Some(current))
+            if current.status == HistoryStatus::Closed
+                && current.number == history.number
+                && current.channel_id == history.channel_id
+                && current.attempt == history.attempt
+                && current.opener == history.opener
+                && !current.opener_erased
+                && current.privacy_generation == history.privacy_generation =>
+        {
+            current
+        }
+        Ok(_) => return false,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                number = history.number,
+                "could not read ticket history for owner link"
+            );
+            return false;
+        }
+    };
+    match data::history_privacy_generation_current(ctx, &key, current.privacy_generation).await {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                number = current.number,
+                "could not validate privacy for ticket history link"
+            );
+            return false;
+        }
+    }
+    let ttl = match history_ttl(&current, ctx.now()) {
+        Ok(ttl) => ttl,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                number = current.number,
+                "could not determine ticket history link retention"
+            );
+            return false;
+        }
+    };
+    let marker = format!(
+        "{HISTORY_LINK_PREFIX}{}:{}:{}",
+        current.channel_id, current.number, current.attempt
+    );
+    match ctx
+        .store()
+        .replace(&marker, &true, Expect::Missing, Some(ttl))
+        .await
+    {
+        Ok(_) => {}
+        Err(StorageError::Conflict) => return false,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                number = current.number,
+                "could not claim ticket history link DM"
+            );
+            return false;
+        }
+    }
+
+    let message = match ctx.dashboard_ticket_history_url(current.channel_id) {
+        Some(url) => ctx.t_in(
+            ctx.locale,
+            "tickets-history-dashboard-link",
+            &Args::new().with("url", url),
+        ),
+        None => ctx.t_in(
+            ctx.locale,
+            "tickets-history-command-fallback",
+            &Args::new().with("number", current.number),
+        ),
+    };
+    match ctx
+        .api
+        .execute(Action::SendDirectMessage {
+            guild_id: ctx.guild_id,
+            user_id: UserId::new(current.opener),
+            content: Some(message),
+            embeds: Vec::new(),
+            components: Vec::new(),
+            files: Vec::new(),
+        })
+        .await
+    {
+        Ok(Outcome::Message(_)) => true,
+        Ok(_) => {
+            tracing::warn!(
+                number = current.number,
+                "ticket history link DM returned no message"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                number = current.number,
+                "could not send ticket history link DM"
+            );
+            false
+        }
+    }
+}
+
 async fn claim_rating_prompt(
     ctx: &EventContext,
     channel: ChannelId,
@@ -3304,7 +3841,6 @@ enum RatingSubmission {
 }
 
 async fn post_close_request_message(
-    cx: &CommandCx,
     ctx: &EventContext,
     channel: ChannelId,
     opener: u64,
@@ -3313,8 +3849,9 @@ async fn post_close_request_message(
     let reason = request
         .reason
         .clone()
-        .unwrap_or_else(|| cx.t("tickets-close-request-no-reason", &Args::new()));
-    let content = cx.t(
+        .unwrap_or_else(|| ctx.t_in(ctx.locale, "tickets-close-request-no-reason", &Args::new()));
+    let content = ctx.t_in(
+        ctx.locale,
         "tickets-close-request-message",
         &Args::new()
             .with("staff", format!("<@{}>", request.requested_by))
@@ -3362,14 +3899,6 @@ async fn post_close_request_message(
         tracing::warn!(?error, channel = %channel, opener, "could not notify the ticket opener");
     }
     Ok(())
-}
-
-/// Whether the member may act as staff: a role of the settings, or the permission to manage.
-async fn is_staff<I: InteractionRef + 'static>(cx: &Cx<I>, config: &Config) -> bool {
-    let actor = cx.actor().await;
-    let roles = config.staff();
-    actor.roles.iter().any(|role| roles.contains(role))
-        || cx.require("tickets.manage").await.is_ok()
 }
 
 async fn is_staff_command(cx: &CommandCx, config: &Config) -> bool {
@@ -3709,7 +4238,9 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
         if !valid_panel_id(id) {
             return Err(UserError::message("tickets-panel-unavailable"));
         }
-        config.named(id)?;
+        if !config.named(id)?.customization.valid() {
+            return Err(UserError::message("tickets-panel-settings-invalid"));
+        }
     }
     let requested_page = match page {
         Some(page) if page > 0 => Some(
@@ -3735,6 +4266,16 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let channel = channel.unwrap_or(cx.invocation().channel_id);
     let pages = panel_components(ctx, &config, panel_id.as_deref())?;
+    let panel_embeds = match panel_id.as_deref() {
+        Some(id) => config
+            .named(id)?
+            .customization
+            .panel_embed()
+            .map_err(|_| UserError::message("tickets-panel-settings-invalid"))?
+            .into_iter()
+            .collect(),
+        None => Vec::new(),
+    };
     let page_count = pages.len();
     if requested_page.is_some_and(|page| page >= page_count) {
         return Err(UserError::message("tickets-panel-page-invalid"));
@@ -3760,7 +4301,6 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
             Outcome::Message(message)
                 if ctx.bot().is_some_and(|bot| message.author.id == bot)
                     && message.channel_id == channel
-                    && message.embeds.is_empty()
                     && is_panel_message(&message) =>
             {
                 Some(message)
@@ -3794,7 +4334,7 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
                 message_id: message_id.clone(),
                 reply_to: None,
                 content: Some(content),
-                embeds: Vec::new(),
+                embeds: panel_embeds.clone(),
                 components: pages[*page_index].clone(),
                 files: Vec::new(),
             })
@@ -3814,6 +4354,19 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
                 .await;
         }
         sent += 1;
+    }
+
+    let audit_key = format!("panel-resend-{}", cx.invocation().interaction_id.get());
+    if let Err(error) = audit::record_event(
+        ctx,
+        cx.user().id.get(),
+        audit::AuditAction::PanelResend,
+        audit::AuditOutcome::Success,
+        &audit_key,
+    )
+    .await
+    {
+        tracing::warn!(?error, channel = %channel, "could not record ticket panel audit event");
     }
 
     if updating {
@@ -3849,6 +4402,21 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
 }
 
 fn ticket_setup_error(config: &Config, guild_id: u64) -> Option<&'static str> {
+    if !valid_form_configuration(config) {
+        return Some("tickets-form-invalid");
+    }
+    if config
+        .panels
+        .iter()
+        .any(|panel| !panel.customization.valid())
+    {
+        return Some("tickets-panel-settings-invalid");
+    }
+    if !integrations::valid_integrations(&config.integrations)
+        || !teams_survey::valid_staff_teams(&config.staff_teams)
+    {
+        return Some("tickets-invalid-config");
+    }
     let staff = config.staff();
     if staff.is_empty() {
         Some("tickets-not-set-up")
@@ -3857,6 +4425,94 @@ fn ticket_setup_error(config: &Config, guild_id: u64) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn valid_staff_team_configuration(config: &Config) -> bool {
+    let panel_refs = config
+        .panels
+        .iter()
+        .map(|panel| panel.staff_teams.clone())
+        .collect::<Vec<_>>();
+    teams_survey::valid_team_references(&config.staff_teams, &panel_refs)
+        && config
+            .panels
+            .iter()
+            .all(|panel| valid_questions(&panel.exit_survey))
+}
+
+fn valid_form_configuration(config: &Config) -> bool {
+    form_library::valid_forms(&config.forms)
+        && config.panels.iter().all(|panel| {
+            panel
+                .form_id
+                .as_deref()
+                .is_none_or(|id| form_library::resolve_form(&config.forms, id).is_some())
+        })
+}
+
+fn panel_ticket_setup_error(
+    config: &Config,
+    guild_id: u64,
+    staff_access: Option<&teams_survey::StaffAccessSnapshot>,
+) -> Option<&'static str> {
+    let error = ticket_setup_error(config, guild_id);
+    if error != Some("tickets-not-set-up") {
+        return error;
+    }
+    staff_access
+        .filter(|snapshot| {
+            snapshot
+                .teams
+                .iter()
+                .any(|team| !team.roles.is_empty() || !team.users.is_empty())
+        })
+        .map_or(error, |_| None)
+}
+
+async fn is_staff_with_snapshot<I: InteractionRef + 'static>(
+    cx: &Cx<I>,
+    config: &Config,
+    staff_access: Option<&teams_survey::StaffAccessSnapshot>,
+) -> bool {
+    let actor = cx.actor().await;
+    let legacy_roles = config
+        .staff()
+        .iter()
+        .map(|role| role.get())
+        .collect::<Vec<_>>();
+    teams_survey::may_access(
+        staff_access,
+        &legacy_roles,
+        cx.user().id.get(),
+        &actor.roles,
+        cx.require("tickets.manage").await.is_ok(),
+    )
+}
+
+fn team_staff_users(staff_access: Option<&teams_survey::StaffAccessSnapshot>) -> Vec<UserId> {
+    let mut users = staff_access
+        .into_iter()
+        .flat_map(|snapshot| snapshot.teams.iter())
+        .flat_map(|team| team.users.iter().copied())
+        .collect::<Vec<_>>();
+    users.sort_unstable();
+    users.dedup();
+    users.into_iter().map(UserId::new).collect()
+}
+
+async fn is_ticket_staff<I: InteractionRef + 'static>(
+    cx: &Cx<I>,
+    ticket: &Ticket,
+    config: &Config,
+) -> bool {
+    let actor = cx.actor().await;
+    teams_survey::may_access(
+        ticket.staff_access.as_ref(),
+        &history_staff_roles(ticket, config),
+        cx.user().id.get(),
+        &actor.roles,
+        cx.require("tickets.manage").await.is_ok(),
+    )
 }
 
 fn valid_questions(questions: &[advanced_forms::FormQuestion]) -> bool {
@@ -3895,30 +4551,65 @@ fn ticket_config_revision(config: &Config, panel: Option<&NamedPanel>) -> u64 {
     config.max_open.hash(&mut hasher);
     config.thread_channel.hash(&mut hasher);
     panel.map_or(0, |panel| panel.max_open).hash(&mut hasher);
+    panel.map(|panel| panel.form_id.clone()).hash(&mut hasher);
     config.close_after_days.hash(&mut hasher);
+    config.waiting_after_hours.hash(&mut hasher);
+    config.first_response_timeout_hours.hash(&mut hasher);
+    config.last_message_timeout_hours.hash(&mut hasher);
+    config.waiting_category.hash(&mut hasher);
     config.close_request_timeout_hours.hash(&mut hasher);
     config.close_when_opener_leaves.hash(&mut hasher);
     config.questions.hash(&mut hasher);
+    config.staff_teams.hash(&mut hasher);
+    panel
+        .map(|panel| panel.staff_teams.clone())
+        .hash(&mut hasher);
+    panel
+        .map(|panel| panel.exit_survey.clone())
+        .hash(&mut hasher);
     config.timezone.hash(&mut hasher);
     config.hours.hash(&mut hasher);
+    config.integrations.hash(&mut hasher);
+    if let Some(panel) = panel {
+        match serde_json::to_vec(&panel.customization) {
+            Ok(customization) => customization.hash(&mut hasher),
+            Err(error) => error.to_string().hash(&mut hasher),
+        }
+    }
     hasher.finish()
 }
 
 async fn open(cx: ComponentCx) -> Result<(), UserError> {
     let panel_id = cx.data();
-    open_panel(cx, (!panel_id.is_empty()).then_some(panel_id)).await
+    open_panel(cx, (!panel_id.is_empty()).then_some(panel_id), None).await
 }
 
 async fn open_select(cx: ComponentCx) -> Result<(), UserError> {
-    let values = cx.values().to_vec();
+    let values = cx.values();
     if values.len() != 1 {
-        cx.require("tickets.use").await?;
         return say(&cx, "tickets-panel-select-invalid", &Args::new()).await;
     }
-    open_panel(cx, Some(values[0].clone())).await
+    let panel_id = values[0].clone();
+    open_panel(cx, Some(panel_id), None).await
 }
 
-async fn open_panel(cx: ComponentCx, panel_id: Option<String>) -> Result<(), UserError> {
+fn panel_name_needs_nickname(panel: &NamedPanel) -> bool {
+    match panel.customization.channel_name_scheme {
+        panel_customization::ChannelNameScheme::Nickname => true,
+        panel_customization::ChannelNameScheme::Custom => panel
+            .customization
+            .channel_name_custom
+            .as_deref()
+            .is_some_and(|template| template.contains("%nickname%")),
+        _ => false,
+    }
+}
+
+async fn open_panel(
+    cx: ComponentCx,
+    panel_id: Option<String>,
+    message_quote: Option<message_ticket::MessageQuote>,
+) -> Result<(), UserError> {
     cx.require("tickets.use").await?;
     let original: Config = match cx.config() {
         Ok(config) => config,
@@ -3931,15 +4622,31 @@ async fn open_panel(cx: ComponentCx, panel_id: Option<String>) -> Result<(), Use
         tracing::warn!("ticket opening hours refer to an unknown or duplicate panel");
         return say(&cx, "tickets-hours-invalid-config", &Args::new()).await;
     }
+    if !valid_form_configuration(&original) {
+        return say(&cx, "tickets-form-invalid", &Args::new()).await;
+    }
+    if !valid_staff_team_configuration(&original) {
+        return say(&cx, "tickets-team-invalid", &Args::new()).await;
+    }
+    if !teams_survey::valid_thread_staff_team_configuration(&original) {
+        return say(&cx, "tickets-team-thread-conflict", &Args::new()).await;
+    }
     let panel = panel_id
         .as_deref()
         .filter(|id| !id.is_empty())
         .map(|id| original.named(id).cloned())
         .transpose()?;
+    if panel
+        .as_ref()
+        .is_some_and(|panel| !panel.customization.valid())
+    {
+        return say(&cx, "tickets-panel-settings-invalid", &Args::new()).await;
+    }
     let config = panel
         .as_ref()
         .map_or_else(|| original.clone(), |panel| original.with_panel(panel));
     let ctx = cx.ctx();
+    let user = cx.user().id;
     match opening_hours(&config, panel.as_ref(), cx.now()) {
         Ok(true) => {}
         Ok(false) => return say(&cx, "tickets-hours-closed", &Args::new()).await,
@@ -3948,32 +4655,121 @@ async fn open_panel(cx: ComponentCx, panel_id: Option<String>) -> Result<(), Use
             return say(&cx, "tickets-hours-invalid-config", &Args::new()).await;
         }
     }
-    if let Some(key) = ticket_setup_error(&config, ctx.guild_id.get()) {
+    let mut staff = config.staff();
+    staff.sort_unstable();
+    staff.dedup();
+    let selected_teams = panel
+        .as_ref()
+        .map_or(&[][..], |panel| panel.staff_teams.as_slice());
+    let staff_access = teams_survey::staff_access_snapshot(
+        &original.staff_teams,
+        selected_teams,
+        &staff,
+        ctx.guild_id.get(),
+    )?;
+    let actor_roles = cx.actor().await.roles;
+    if panel.as_ref().is_some_and(|panel| {
+        let roles = actor_roles
+            .iter()
+            .map(|role| role.get())
+            .collect::<Vec<_>>();
+        !panel.customization.allows(&roles, ctx.guild_id.get())
+    }) {
+        return say(&cx, "tickets-panel-access-denied", &Args::new()).await;
+    }
+    if let Some(key) = panel_ticket_setup_error(&config, ctx.guild_id.get(), staff_access.as_ref())
+    {
         return say(&cx, key, &Args::new()).await;
     }
     if !valid_questions(&config.questions) {
         return say(&cx, "tickets-form-invalid", &Args::new()).await;
     }
-
-    let mut staff = config.staff();
-    staff.sort_unstable();
-    staff.dedup();
-    if let Some(parent) = config.thread_channel()? {
-        thread::ensure_thread_parent(ctx, parent, &staff, cx.user().id).await?;
+    if panel
+        .as_ref()
+        .is_some_and(|panel| !valid_questions(&panel.exit_survey))
+    {
+        return say(&cx, "tickets-form-invalid", &Args::new()).await;
     }
-    let staff_roles = staff.iter().map(|role| role.get()).collect();
-    let user = cx.user().id;
+    let resolved_questions = advanced_forms::resolve_form_questions(
+        ctx,
+        &config.questions,
+        &config.integrations,
+        ctx.guild_id.get(),
+    )
+    .await?;
+    let staff_roles = staff_access.as_ref().map_or_else(
+        || staff.iter().map(|role| role.get()).collect(),
+        teams_survey::staff_roles,
+    );
+    let effective_staff = staff_roles
+        .iter()
+        .copied()
+        .map(RoleId::new)
+        .collect::<Vec<_>>();
+    let staff_users = team_staff_users(staff_access.as_ref());
+    if let Some(parent) = config.thread_channel()? {
+        thread::ensure_thread_parent_with_access(
+            ctx,
+            parent,
+            &effective_staff,
+            cx.user().id,
+            &staff_users,
+            staff_access.as_ref(),
+        )
+        .await?;
+    }
+    if blacklist::is_blocked(
+        ctx,
+        user,
+        &actor_roles,
+        panel.as_ref().map(|panel| panel.id.as_str()),
+    )
+    .await?
+    {
+        return say(&cx, "tickets-blacklist-blocked", &Args::new()).await;
+    }
     let panel_limit = panel.as_ref().map_or(0, |panel| panel.max_open);
+    let revision = advanced_forms::form_modal_revision(
+        ticket_config_revision(&config, panel.as_ref()),
+        &resolved_questions,
+    );
+    let username = cx.user().name.clone();
+    let nickname = if panel.as_ref().is_some_and(panel_name_needs_nickname) {
+        match ctx
+            .api
+            .execute(Action::GetMember {
+                guild_id: ctx.guild_id,
+                user_id: user,
+            })
+            .await
+        {
+            Ok(Outcome::Member(member)) => member.nick,
+            Ok(_) | Err(DiscordError::NotFound) => {
+                return say(&cx, "tickets-failed", &Args::new()).await;
+            }
+            Err(error) => {
+                tracing::warn!(?error, guild = %ctx.guild_id, "could not resolve the opener nickname for ticket channel naming");
+                return say(&cx, "tickets-failed", &Args::new()).await;
+            }
+        }
+    } else {
+        None
+    };
     let reservation = match reserve_open(
         ctx,
         user.get(),
+        username,
+        nickname,
         panel.clone(),
         config.clone(),
         staff_roles,
         Vec::new(),
+        revision,
+        staff_access.clone(),
+        message_quote,
         config.max_open,
         panel_limit,
-        is_staff(&cx, &config).await,
+        is_staff_with_snapshot(&cx, &config, staff_access.as_ref()).await,
     )
     .await
     .map_err(|error| failed(&error))?
@@ -3995,6 +4791,14 @@ async fn open_panel(cx: ComponentCx, panel_id: Option<String>) -> Result<(), Use
             )
             .await;
         }
+        OpenReservationResult::Cooldown(seconds) => {
+            return say(
+                &cx,
+                "tickets-panel-cooldown",
+                &Args::new().with("seconds", seconds.to_string()),
+            )
+            .await;
+        }
         OpenReservationResult::TooLarge => {
             return say(&cx, "tickets-opening-too-large", &Args::new()).await;
         }
@@ -4005,12 +4809,11 @@ async fn open_panel(cx: ComponentCx, panel_id: Option<String>) -> Result<(), Use
             return say(&cx, "tickets-opening", &Args::new()).await;
         }
     };
-    let revision = ticket_config_revision(&config, panel.as_ref());
-    if config.questions.is_empty() {
-        return create_ticket(cx, reservation, revision).await;
+    if resolved_questions.is_empty() {
+        cx.defer(true).await?;
+        return create_ticket(cx, reservation, revision, resolved_questions).await;
     }
-    let inputs = config
-        .questions
+    let inputs = resolved_questions
         .iter()
         .enumerate()
         .map(|(index, question)| question.component(cx.module(), index));
@@ -4064,6 +4867,7 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
         return Err(UserError::message("tickets-form-invalid"));
     }
     let ctx = cx.ctx();
+    cx.defer(true).await?;
     let user = cx.user().id.get();
     let (Some(_entry), Some(mut reservation)) = read_open_reservation(ctx, user, number)
         .await
@@ -4084,7 +4888,8 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
             .reply_private_t("tickets-opening-pending", &Args::new())
             .await;
     }
-    let revision = ticket_config_revision(&reservation.settings, reservation.panel.as_ref());
+    let reserved_base_revision =
+        ticket_config_revision(&reservation.settings, reservation.panel.as_ref());
     let original: Config = match cx.config() {
         Ok(config) => config,
         Err(error) => {
@@ -4102,6 +4907,24 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
             .reply_private_t("tickets-hours-invalid-config", &Args::new())
             .await;
     }
+    if !valid_form_configuration(&original) {
+        let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+        return cx
+            .reply_private_t("tickets-form-invalid", &Args::new())
+            .await;
+    }
+    if !valid_staff_team_configuration(&original) {
+        let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+        return cx
+            .reply_private_t("tickets-team-invalid", &Args::new())
+            .await;
+    }
+    if !teams_survey::valid_thread_staff_team_configuration(&original) {
+        let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+        return cx
+            .reply_private_t("tickets-team-thread-conflict", &Args::new())
+            .await;
+    }
     let panel = match reservation.panel.as_ref() {
         Some(saved) => match original.named(&saved.id) {
             Ok(panel) => Some(panel.clone()),
@@ -4114,6 +4937,15 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
         },
         None => None,
     };
+    if panel
+        .as_ref()
+        .is_some_and(|panel| !panel.customization.valid())
+    {
+        let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+        return cx
+            .reply_private_t("tickets-panel-settings-invalid", &Args::new())
+            .await;
+    }
     let config = panel
         .as_ref()
         .map_or_else(|| original.clone(), |panel| original.with_panel(panel));
@@ -4129,21 +4961,80 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
             return say(&cx, "tickets-hours-invalid-config", &Args::new()).await;
         }
     }
-    if let Some(key) = ticket_setup_error(&config, ctx.guild_id.get()) {
+    if let Some(key) = panel_ticket_setup_error(
+        &config,
+        ctx.guild_id.get(),
+        reservation.staff_access.as_ref(),
+    ) {
         let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
         return say(&cx, key, &Args::new()).await;
     }
+    let actor_roles = cx.actor().await.roles;
+    if panel.as_ref().is_some_and(|panel| {
+        let roles = actor_roles
+            .iter()
+            .map(|role| role.get())
+            .collect::<Vec<_>>();
+        !panel.customization.allows(&roles, ctx.guild_id.get())
+    }) {
+        let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+        return cx
+            .reply_private_t("tickets-panel-access-denied", &Args::new())
+            .await;
+    }
+    if blacklist::is_blocked(
+        ctx,
+        UserId::new(user),
+        &actor_roles,
+        panel.as_ref().map(|panel| panel.id.as_str()),
+    )
+    .await?
+    {
+        let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+        return say(&cx, "tickets-blacklist-blocked", &Args::new()).await;
+    }
     if !valid_questions(&config.questions)
         || config.questions.is_empty()
-        || revision != ticket_config_revision(&config, panel.as_ref())
+        || reservation.settings.questions.is_empty()
     {
         let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
         return cx
             .reply_private_t("tickets-form-changed", &Args::new())
             .await;
     }
+    let resolved_questions = match advanced_forms::resolve_form_questions_fresh(
+        ctx,
+        &config.questions,
+        &config.integrations,
+        ctx.guild_id.get(),
+    )
+    .await
+    {
+        Ok(questions) => questions,
+        Err(error) => {
+            let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+            return Err(error);
+        }
+    };
+    let current_base_revision = ticket_config_revision(&config, panel.as_ref());
+    let current_form_revision =
+        advanced_forms::form_modal_revision(current_base_revision, &resolved_questions);
+    let expected_revision = reservation
+        .form_modal_revision
+        .unwrap_or(reserved_base_revision);
+    let revision_matches = if reservation.form_modal_revision.is_some() {
+        expected_revision == current_form_revision
+    } else {
+        reserved_base_revision == current_base_revision
+    };
+    if !revision_matches {
+        let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
+        return cx
+            .reply_private_t("tickets-form-changed", &Args::new())
+            .await;
+    }
     let mut answers = Vec::new();
-    for (index, question) in config.questions.iter().enumerate() {
+    for (index, question) in resolved_questions.iter().enumerate() {
         let value = cx.value(&format!("question-{index}"));
         match question.answer(value) {
             Ok(Some(answer)) => answers.push(answer),
@@ -4154,12 +5045,12 @@ async fn submit_form(cx: ModalCx) -> Result<(), UserError> {
             }
         }
     }
-    if !advanced_forms::valid_form_answers(&config.questions, &answers) {
+    if !advanced_forms::valid_form_answers(&resolved_questions, &answers) {
         let _ = release_unstarted_open_reservation(ctx, user, number, generation).await;
         return Err(UserError::message("tickets-form-invalid"));
     }
     reservation.form_answers = answers;
-    create_ticket(cx, reservation, revision).await
+    create_ticket(cx, reservation, expected_revision, resolved_questions).await
 }
 
 fn ticket_storage_size(ticket: &Ticket) -> Result<usize, serde_json::Error> {
@@ -4192,6 +5083,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
     cx: Cx<I>,
     reservation: OpenReservation,
     expected_revision: u64,
+    resolved_questions: Vec<advanced_forms::FormQuestion>,
 ) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let user = reservation.opener;
@@ -4199,7 +5091,8 @@ async fn create_ticket<I: InteractionRef + 'static>(
     let panel = reservation.panel.clone();
     let answers = reservation.form_answers.clone();
     if !valid_questions(&config.questions)
-        || !advanced_forms::valid_form_answers(&config.questions, &answers)
+        || !advanced_forms::valid_questions(&resolved_questions)
+        || !advanced_forms::valid_form_answers(&resolved_questions, &answers)
     {
         let _ = release_unstarted_open_reservation(
             ctx,
@@ -4236,6 +5129,40 @@ async fn create_ticket<I: InteractionRef + 'static>(
         .await;
         return say(&cx, "tickets-hours-invalid-config", &Args::new()).await;
     }
+    if !valid_form_configuration(&current_original) {
+        let _ = release_unstarted_open_reservation(
+            ctx,
+            user,
+            reservation.number,
+            reservation.generation,
+        )
+        .await;
+        return say(&cx, "tickets-form-invalid", &Args::new()).await;
+    }
+    if !valid_staff_team_configuration(&current_original) {
+        let _ = release_unstarted_open_reservation(
+            ctx,
+            user,
+            reservation.number,
+            reservation.generation,
+        )
+        .await;
+        return cx
+            .reply_private_t("tickets-team-invalid", &Args::new())
+            .await;
+    }
+    if !teams_survey::valid_thread_staff_team_configuration(&current_original) {
+        let _ = release_unstarted_open_reservation(
+            ctx,
+            user,
+            reservation.number,
+            reservation.generation,
+        )
+        .await;
+        return cx
+            .reply_private_t("tickets-team-thread-conflict", &Args::new())
+            .await;
+    }
     let current_panel = match panel.as_ref() {
         Some(saved) => match current_original.named(&saved.id) {
             Ok(panel) => Some(panel.clone()),
@@ -4254,11 +5181,32 @@ async fn create_ticket<I: InteractionRef + 'static>(
         },
         None => None,
     };
+    if current_panel
+        .as_ref()
+        .is_some_and(|panel| !panel.customization.valid())
+    {
+        let _ = release_unstarted_open_reservation(
+            ctx,
+            user,
+            reservation.number,
+            reservation.generation,
+        )
+        .await;
+        return cx
+            .reply_private_t("tickets-panel-settings-invalid", &Args::new())
+            .await;
+    }
     let current_config = current_panel.as_ref().map_or_else(
         || current_original.clone(),
         |panel| current_original.with_panel(panel),
     );
-    if expected_revision != ticket_config_revision(&current_config, current_panel.as_ref()) {
+    let current_base_revision = ticket_config_revision(&current_config, current_panel.as_ref());
+    let current_form_revision = if reservation.form_modal_revision.is_some() {
+        advanced_forms::form_modal_revision(current_base_revision, &resolved_questions)
+    } else {
+        current_base_revision
+    };
+    if expected_revision != current_form_revision {
         let _ = release_unstarted_open_reservation(
             ctx,
             user,
@@ -4294,7 +5242,11 @@ async fn create_ticket<I: InteractionRef + 'static>(
             return say(&cx, "tickets-hours-invalid-config", &Args::new()).await;
         }
     }
-    if let Some(key) = ticket_setup_error(&config, ctx.guild_id.get()) {
+    if let Some(key) = panel_ticket_setup_error(
+        &current_config,
+        ctx.guild_id.get(),
+        reservation.staff_access.as_ref(),
+    ) {
         let _ = release_unstarted_open_reservation(
             ctx,
             user,
@@ -4303,6 +5255,42 @@ async fn create_ticket<I: InteractionRef + 'static>(
         )
         .await;
         return say(&cx, key, &Args::new()).await;
+    }
+    let actor_roles = cx.actor().await.roles;
+    if current_panel.as_ref().is_some_and(|panel| {
+        let roles = actor_roles
+            .iter()
+            .map(|role| role.get())
+            .collect::<Vec<_>>();
+        !panel.customization.allows(&roles, ctx.guild_id.get())
+    }) {
+        let _ = release_unstarted_open_reservation(
+            ctx,
+            user,
+            reservation.number,
+            reservation.generation,
+        )
+        .await;
+        return cx
+            .reply_private_t("tickets-panel-access-denied", &Args::new())
+            .await;
+    }
+    if blacklist::is_blocked(
+        ctx,
+        UserId::new(user),
+        &actor_roles,
+        current_panel.as_ref().map(|panel| panel.id.as_str()),
+    )
+    .await?
+    {
+        let _ = release_unstarted_open_reservation(
+            ctx,
+            user,
+            reservation.number,
+            reservation.generation,
+        )
+        .await;
+        return say(&cx, "tickets-blacklist-blocked", &Args::new()).await;
     }
     let mut staff: Vec<RoleId> = reservation
         .staff_roles
@@ -4354,7 +5342,17 @@ async fn create_ticket<I: InteractionRef + 'static>(
         }
     };
     if let Some(parent) = thread_parent {
-        if let Err(error) = thread::ensure_thread_parent(ctx, parent, &staff, cx.user().id).await {
+        let staff_users = team_staff_users(reservation.staff_access.as_ref());
+        if let Err(error) = thread::ensure_thread_parent_with_access(
+            ctx,
+            parent,
+            &staff,
+            cx.user().id,
+            &staff_users,
+            reservation.staff_access.as_ref(),
+        )
+        .await
+        {
             let _ = release_unstarted_open_reservation(
                 ctx,
                 user,
@@ -4389,7 +5387,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
         ctx.api
             .execute(Action::CreateThread {
                 channel_id: parent,
-                name: format!("ticket-{:04}-r{}", reservation.number, reservation.token),
+                name: reservation_channel_name(&reservation),
                 source: None,
                 kind: ThreadKind::Private,
                 auto_archive_minutes: 10080,
@@ -4409,13 +5407,29 @@ async fn create_ticket<I: InteractionRef + 'static>(
                 Permissions::empty(),
             ),
         ];
-        overwrites.extend(staff.iter().map(|role| {
-            overwrite(
-                OverwriteTarget::Role(*role),
-                TICKET_PERMISSIONS,
-                Permissions::empty(),
-            )
-        }));
+        if let Some(snapshot) = reservation.staff_access.as_ref() {
+            let base = Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY;
+            overwrites.extend(teams_survey::role_overwrites(snapshot).into_iter().map(
+                |(role, allow, deny)| overwrite(OverwriteTarget::Role(role), base | allow, deny),
+            ));
+            let bot = ctx.bot();
+            overwrites.extend(
+                teams_survey::user_overwrites(snapshot)
+                    .into_iter()
+                    .filter(|(member, _, _)| *member != cx.user().id && Some(*member) != bot)
+                    .map(|(member, allow, deny)| {
+                        overwrite(OverwriteTarget::Member(member), base | allow, deny)
+                    }),
+            );
+        } else {
+            overwrites.extend(staff.iter().map(|role| {
+                overwrite(
+                    OverwriteTarget::Role(*role),
+                    TICKET_PERMISSIONS,
+                    Permissions::empty(),
+                )
+            }));
+        }
         if let Some(bot) = ctx.bot() {
             overwrites.push(overwrite(
                 OverwriteTarget::Member(bot),
@@ -4427,7 +5441,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
             .execute(Action::CreateChannel {
                 guild_id: ctx.guild_id,
                 spec: NewChannel {
-                    name: format!("ticket-{:04}", reservation.number),
+                    name: reservation_channel_name(&reservation),
                     kind: ChannelKind::Text,
                     parent_id: config.category(),
                     topic: Some(format!(
@@ -4509,6 +5523,27 @@ async fn create_ticket<I: InteractionRef + 'static>(
         }
     };
     if saved {
+        if let Err(error) = add_team_users_to_thread(ctx, channel, &ticket).await {
+            tracing::warn!(?error, %channel, "ticket team members could not be added to the thread");
+        }
+        let quote_failed =
+            if let Err(error) = post_ticket_message_quote(ctx, channel, &ticket).await {
+                tracing::warn!(?error, %channel, "ticket source quote could not be posted");
+                ticket.message_quote.is_some()
+            } else {
+                false
+            };
+        if let Err(error) = automation::start(ctx, channel).await {
+            tracing::warn!(?error, %channel, "ticket automation timers could not be started");
+        }
+        let mut welcome_embeds = embeds.clone();
+        match ticket_welcome_embed(ctx, channel, &ticket, &config, &answers).await {
+            Ok(Some(embed)) => welcome_embeds.insert(0, embed),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(?error, %channel, "custom ticket welcome embed could not be built")
+            }
+        }
         let welcome = ctx
             .api
             .execute(Action::PostMessage {
@@ -4523,7 +5558,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
                             .with("number", reservation.number),
                     ),
                 ),
-                embeds: embeds.clone(),
+                embeds: welcome_embeds,
                 components: vec![ui::row(vec![
                     button(ctx, "claim", ButtonStyle::Secondary, "tickets-claim-button"),
                     button(ctx, "close", ButtonStyle::Danger, "tickets-close-button"),
@@ -4540,6 +5575,10 @@ async fn create_ticket<I: InteractionRef + 'static>(
                 tracing::warn!(?error, guild = %ctx.guild_id, "could not post saved ticket answers");
                 answers_need_retry = true;
             }
+        }
+        if let Err(error) = post_ticket_knowledge_suggestions(ctx, channel, &ticket, &answers).await
+        {
+            tracing::warn!(?error, %channel, "published ticket knowledge suggestions could not be posted");
         }
         let _ = ctx
             .api
@@ -4562,6 +5601,14 @@ async fn create_ticket<I: InteractionRef + 'static>(
                 ctx,
                 channel,
                 reservation.created + i64::from(config.close_after_days) * DAY,
+            )
+            .await;
+        }
+        if quote_failed {
+            return say(
+                &cx,
+                "tickets-message-quote-failed",
+                &Args::new().with("channel", format!("<#{channel}>")),
             )
             .await;
         }
@@ -4621,17 +5668,9 @@ async fn ticket_answers(cx: CommandCx, (): ()) -> Result<(), UserError> {
         return Err(UserError::message("tickets-not-a-ticket"));
     };
     if cx.user().id.get() != ticket.opener {
-        let staff_roles = match ticket.staff_roles.as_ref() {
-            Some(staff_roles) => staff_roles.iter().copied().map(RoleId::new).collect(),
-            None => {
-                let config: Config = cx.config()?;
-                config.for_ticket(&ticket).staff()
-            }
-        };
-        let actor = cx.actor().await;
-        if !actor.roles.iter().any(|role| staff_roles.contains(role))
-            && cx.require("tickets.manage").await.is_err()
-        {
+        let config: Config = cx.config()?;
+        let access_config = config.for_ticket(&ticket);
+        if !is_ticket_staff(&cx, &ticket, &access_config).await {
             return Err(UserError::message("tickets-form-opener-only"));
         }
     }
@@ -4828,6 +5867,7 @@ enum Claim {
     Gone,
     Busy(i64),
     RequestChanged,
+    AutomationChanged,
 }
 
 async fn on_member_left(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
@@ -5153,15 +6193,20 @@ fn history_transcript(
 }
 
 fn history_staff_roles(ticket: &Ticket, config: &Config) -> Vec<u64> {
-    let mut roles = ticket.staff_roles.as_ref().map_or_else(
+    let mut roles = ticket.staff_access.as_ref().map_or_else(
         || {
-            config
-                .staff()
-                .into_iter()
-                .map(twilight_model::id::Id::get)
-                .collect()
+            ticket.staff_roles.as_ref().map_or_else(
+                || {
+                    config
+                        .staff()
+                        .into_iter()
+                        .map(twilight_model::id::Id::get)
+                        .collect()
+                },
+                Clone::clone,
+            )
         },
-        Clone::clone,
+        teams_survey::staff_roles,
     );
     roles.sort_unstable();
     roles.dedup();
@@ -5248,6 +6293,7 @@ fn history_record(
         closer: closing.closer.map(twilight_model::id::Id::get),
         reason: closing.reason.to_owned(),
         panel: closing.ticket.panel.clone(),
+        survey_integrations: closing.config.integrations.clone(),
         labels: closing.ticket.labels.clone(),
         rating: None,
         rating_prompt_attempted: false,
@@ -5257,7 +6303,9 @@ fn history_record(
         operation_token: None,
         operation_until: 0,
         log_copy_channel: closing.config.log().map(|channel| channel.get()),
+        log_copy_message: None,
         transcript_span_pages: transcript.span_pages,
+        staff_access: closing.ticket.staff_access.clone(),
         staff_roles: history_staff_roles(closing.ticket, closing.config),
         status: HistoryStatus::Closing,
         log_copy_sent: closing.config.log().is_none(),
@@ -5677,7 +6725,7 @@ async fn search_history_record(
     access: &HistorySearchAccess<'_>,
     page_budget: &mut usize,
 ) -> Result<HistoryRecordSearch, ModuleError> {
-    if !may_view_history(access.roles, access.can_manage, &history) {
+    if !may_view_history(access.actor_id, access.roles, access.can_manage, &history) {
         return Ok(HistoryRecordSearch::Inaccessible);
     }
     if history.status != HistoryStatus::Closed {
@@ -6082,11 +7130,19 @@ where
     lines.join("\n")
 }
 
-fn may_view_history(roles: &[RoleId], can_manage: bool, history: &TicketHistory) -> bool {
-    can_manage
-        || roles
-            .iter()
-            .any(|role| history.staff_roles.contains(&role.get()))
+fn may_view_history(
+    actor_id: u64,
+    roles: &[RoleId],
+    can_manage: bool,
+    history: &TicketHistory,
+) -> bool {
+    teams_survey::may_access(
+        history.staff_access.as_ref(),
+        &history.staff_roles,
+        actor_id,
+        roles,
+        can_manage,
+    )
 }
 
 async fn history_page(
@@ -6213,6 +7269,13 @@ async fn discard_history_generation(ctx: &EventContext, history: &TicketHistory)
         history.transcript_index_pages,
     )
     .await;
+    if let Err(error) = teams_survey::delete_exit_survey(ctx, history).await {
+        tracing::warn!(
+            ?error,
+            channel = history.channel_id,
+            "could not remove ticket exit survey with its transcript generation"
+        );
+    }
 }
 
 async fn validate_history_archive(
@@ -6359,7 +7422,16 @@ async fn complete_history_close(
 ) -> Result<Closed, ModuleError> {
     if history.status == HistoryStatus::Closed {
         forget(ctx, closing.channel, closing.ticket, true).await?;
-        if history.rating.is_some() || history.rating_prompt_attempted {
+        knowledge::cancel_ticket_suggestions(ctx, closing.channel, closing.ticket.number).await?;
+        let _ = send_history_link_dm(ctx, history).await;
+        let rating_enabled = history
+            .panel
+            .as_ref()
+            .is_none_or(|panel| panel.customization.rating_enabled);
+        if !rating_enabled || history.rating.is_some() {
+            let _ = teams_survey::send_exit_survey_prompt(ctx, history).await;
+        }
+        if !rating_enabled || history.rating.is_some() || history.rating_prompt_attempted {
             return Ok(Closed::Done);
         }
         return Ok(
@@ -6440,10 +7512,20 @@ async fn complete_history_close(
         closing.ticket.thread && !not_found,
     )
     .await?;
+    knowledge::cancel_ticket_suggestions(ctx, closing.channel, closing.ticket.number).await?;
+    let _ = send_history_link_dm(ctx, history).await;
+    let rating_enabled = history
+        .panel
+        .as_ref()
+        .is_none_or(|panel| panel.customization.rating_enabled);
+    if !rating_enabled || history.rating.is_some() {
+        let _ = teams_survey::send_exit_survey_prompt(ctx, history).await;
+    }
+    if !rating_enabled || history.rating.is_some() || history.rating_prompt_attempted {
+        return Ok(Closed::Done);
+    }
     Ok(
-        if history.rating.is_some() || history.rating_prompt_attempted {
-            Closed::Done
-        } else if send_rating_prompt(ctx, closing.channel, closing.ticket, closing.attempt).await {
+        if send_rating_prompt(ctx, closing.channel, closing.ticket, closing.attempt).await {
             Closed::Done
         } else {
             Closed::RatingDmUnconfirmed
@@ -6530,7 +7612,7 @@ async fn prepare_history(
                 )
                 .with("reason", closing.reason.to_owned()),
         );
-        if let Err(error) = ctx
+        let posted = ctx
             .api
             .execute(Action::PostMessage {
                 channel_id: log,
@@ -6544,11 +7626,15 @@ async fn prepare_history(
                     data: log_copy_text.into_bytes(),
                 }],
             })
-            .await
-        {
-            reopen(ctx, closing).await;
-            return Err(stored(&error));
-        }
+            .await;
+        history.log_copy_message = match posted {
+            Ok(Outcome::Message(message)) => Some(message.id.get()),
+            Ok(_) => None,
+            Err(error) => {
+                reopen(ctx, closing).await;
+                return Err(stored(&error));
+            }
+        };
         history.log_copy_sent = true;
         if let Err(error) = store_history_record(ctx, &key, &history).await {
             reopen(ctx, closing).await;
@@ -6564,10 +7650,83 @@ async fn prepare_history(
     Ok(history)
 }
 
+async fn update_exit_survey_archive(
+    ctx: &EventContext,
+    history: &TicketHistory,
+) -> Result<(), ModuleError> {
+    if history.status != HistoryStatus::Closed || history.opener_erased {
+        return Ok(());
+    }
+    let (Some(channel), Some(message)) = (history.log_copy_channel, history.log_copy_message)
+    else {
+        return Ok(());
+    };
+    if teams_survey::exit_survey_answers_for_export(ctx, history, UserId::new(history.opener))
+        .await
+        .map_err(|error| stored(&error))?
+        .is_none_or(|answers| answers.is_empty())
+    {
+        return Ok(());
+    }
+    let key = history_key(history.number, ChannelId::new(history.channel_id));
+    if !data::history_privacy_generation_current(ctx, &key, history.privacy_generation).await? {
+        return Ok(());
+    }
+
+    let channel = ChannelId::new(channel);
+    let message_id = MessageId::new(message);
+    // Preserve the transcript body and embeds while changing only its components.
+    let existing = match ctx
+        .api
+        .execute(Action::GetMessage {
+            channel_id: channel,
+            message_id: message_id.clone(),
+        })
+        .await
+    {
+        Ok(Outcome::Message(message))
+            if message.channel_id == channel
+                && ctx.bot().is_some_and(|bot| message.author.id == bot) =>
+        {
+            message
+        }
+        Ok(_) | Err(DiscordError::NotFound) => {
+            return Err(ModuleError::other("ticket archive message is missing"));
+        }
+        Err(error) => return Err(stored(&error)),
+    };
+    let components = teams_survey::survey_view_components(ctx, history);
+    if components.is_empty() {
+        return Err(ModuleError::other(
+            "ticket exit survey button could not be encoded",
+        ));
+    }
+    match ctx
+        .api
+        .execute(Action::PostMessage {
+            channel_id: channel,
+            message_id: Some(message_id),
+            reply_to: None,
+            content: Some(existing.content),
+            embeds: existing.embeds,
+            components,
+            files: Vec::new(),
+        })
+        .await
+    {
+        Ok(Outcome::Message(_)) => Ok(()),
+        Ok(_) => Err(ModuleError::other(
+            "ticket exit survey archive update returned no message",
+        )),
+        Err(error) => Err(stored(&error)),
+    }
+}
+
 async fn begin_closing(
     ctx: &EventContext,
     key: &str,
     request_id: Option<i64>,
+    automation_guard: Option<(i64, u64)>,
 ) -> Result<Claim, ModuleError> {
     for _ in 0..5 {
         let Some(entry) = ctx
@@ -6580,6 +7739,12 @@ async fn begin_closing(
         };
         let mut ticket: Ticket = serde_json::from_value(entry.value)
             .map_err(|error| ModuleError::other(error.to_string()))?;
+        if let Some((close_generation, automation_generation)) = automation_guard
+            && (ticket.close_generation != close_generation
+                || ticket.automation.generation != automation_generation)
+        {
+            return Ok(Claim::AutomationChanged);
+        }
         if ticket.closed {
             return Ok(Claim::Gone);
         }
@@ -6676,15 +7841,45 @@ async fn finish(
     reason: &str,
     request_id: Option<i64>,
 ) -> Result<Closed, ModuleError> {
+    finish_with_guard(ctx, channel, closer, reason, request_id, None).await
+}
+
+pub(crate) async fn finish_if_automation_generation(
+    ctx: &EventContext,
+    channel: ChannelId,
+    expected_close_generation: i64,
+    expected_automation_generation: u64,
+    reason: &str,
+) -> Result<Closed, ModuleError> {
+    finish_with_guard(
+        ctx,
+        channel,
+        None,
+        reason,
+        None,
+        Some((expected_close_generation, expected_automation_generation)),
+    )
+    .await
+}
+
+async fn finish_with_guard(
+    ctx: &EventContext,
+    channel: ChannelId,
+    closer: Option<UserId>,
+    reason: &str,
+    request_id: Option<i64>,
+    automation_guard: Option<(i64, u64)>,
+) -> Result<Closed, ModuleError> {
     if let Some(until) = operations::resume_pending(ctx, channel).await? {
         return Ok(Closed::BusyUntil(until));
     }
-    let ticket = match begin_closing(ctx, &ticket_key(channel), request_id).await? {
-        Claim::Taken(ticket) => *ticket,
-        Claim::Gone => return Ok(Closed::Unknown),
-        Claim::Busy(until) => return Ok(Closed::BusyUntil(until)),
-        Claim::RequestChanged => return Ok(Closed::RequestChanged),
-    };
+    let ticket =
+        match begin_closing(ctx, &ticket_key(channel), request_id, automation_guard).await? {
+            Claim::Taken(ticket) => *ticket,
+            Claim::Gone | Claim::AutomationChanged => return Ok(Closed::Unknown),
+            Claim::Busy(until) => return Ok(Closed::BusyUntil(until)),
+            Claim::RequestChanged => return Ok(Closed::RequestChanged),
+        };
     let fallback = Config::default();
     let raw_config: Config = match ctx.parse_config() {
         Ok(config) => config,
@@ -6807,7 +8002,11 @@ async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
     };
     let config: Config = cx.config()?;
     let config = config.for_ticket(&ticket);
-    if !may_close(&ticket, cx.user().id, is_staff(&cx, &config).await) {
+    if !may_close(
+        &ticket,
+        cx.user().id,
+        is_ticket_staff(&cx, &ticket, &config).await,
+    ) {
         return say(&cx, "tickets-not-yours", &Args::new()).await;
     }
     say(&cx, "tickets-closing", &Args::new()).await?;
@@ -6818,6 +8017,20 @@ async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
     let closed = finish(ctx, channel, Some(cx.user().id), &reason, None)
         .await
         .map_err(|error| failed(&error))?;
+    if closed == Closed::Done || closed == Closed::RatingDmUnconfirmed {
+        let audit_key = format!("close-{}", cx.invocation().interaction_id.get());
+        if let Err(error) = audit::record_event(
+            ctx,
+            cx.user().id.get(),
+            audit::AuditAction::TicketClose,
+            audit::AuditOutcome::Success,
+            &audit_key,
+        )
+        .await
+        {
+            tracing::warn!(?error, channel = %channel, "could not record ticket close audit event");
+        }
+    }
     if closed == Closed::RatingDmUnconfirmed {
         if let Err(error) = cx
             .reply_private_t(
@@ -6852,6 +8065,35 @@ async fn rate_button(cx: ComponentCx) -> Result<(), UserError> {
         request.score,
     )
     .await?;
+    if matches!(result, RatingSubmission::Saved) {
+        if let Some(history) = history_by_number(&ctx, request.number)
+            .await
+            .map_err(|error| failed(&error))?
+        {
+            let prompt_sent = teams_survey::send_exit_survey_prompt(&ctx, &history).await;
+            if !prompt_sent
+                && teams_survey::maybe_open_exit_survey(
+                    &cx,
+                    ChannelId::new(request.channel),
+                    request.number,
+                    request.attempt,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+        }
+    } else if matches!(result, RatingSubmission::AlreadyRated)
+        && teams_survey::maybe_open_exit_survey(
+            &cx,
+            ChannelId::new(request.channel),
+            request.number,
+            request.attempt,
+        )
+        .await?
+    {
+        return Ok(());
+    }
     let message = match result {
         RatingSubmission::Saved => "tickets-rating-saved",
         RatingSubmission::AlreadyRated => "tickets-rating-already",
@@ -6892,12 +8134,40 @@ async fn rate_command(cx: CommandCx, args: RateArgs) -> Result<(), UserError> {
         score,
     )
     .await?;
+    if matches!(
+        result,
+        RatingSubmission::Saved | RatingSubmission::AlreadyRated
+    ) && teams_survey::survey_open_component(&ctx, &history).is_some()
+    {
+        let prompt_sent = matches!(result, RatingSubmission::Saved)
+            && teams_survey::send_exit_survey_prompt(&ctx, &history).await;
+        if !prompt_sent {
+            return teams_survey::survey_command(cx, history.number).await;
+        }
+    }
     let message = match result {
         RatingSubmission::Saved => "tickets-rating-saved",
         RatingSubmission::AlreadyRated => "tickets-rating-already",
         RatingSubmission::Stale => "tickets-rating-stale",
     };
     cx.reply_private_t(message, &Args::new().with("number", history.number))
+        .await
+}
+
+async fn survey_command(cx: CommandCx, args: SurveyArgs) -> Result<(), UserError> {
+    teams_survey::survey_command(cx, args.number).await
+}
+
+async fn knowledge_send(cx: CommandCx, args: KnowledgeSendArgs) -> Result<(), UserError> {
+    cx.defer(true).await?;
+    let channel = cx.invocation().channel_id;
+    let ctx = cx.ctx();
+    staff_ticket(&cx, &ctx, channel).await?;
+    let can_manage = cx.require("tickets.manage").await.is_ok();
+    knowledge::send_article(&ctx, channel, &args.id, can_manage)
+        .await
+        .map_err(|error| failed(&error))?;
+    cx.reply_private_t("tickets-knowledge-send-complete", &Args::new())
         .await
 }
 
@@ -7131,22 +8401,47 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
     };
     let config: Config = cx.config()?;
     let config = config.for_ticket(&ticket);
-    if !may_close(&ticket, cx.user().id, is_staff_command(&cx, &config).await) {
+    if !may_close(
+        &ticket,
+        cx.user().id,
+        is_ticket_staff(&cx, &ticket, &config).await,
+    ) {
         return Err(UserError::message("tickets-not-yours"));
     }
+    let requested_reason = args.reason.filter(|text| !text.trim().is_empty());
+    if ticket.panel.as_ref().is_some_and(|panel| {
+        !panel
+            .customization
+            .close_reason_allowed(requested_reason.as_deref())
+    }) {
+        return cx
+            .reply_private_t("tickets-close-reason-invalid", &Args::new())
+            .await;
+    }
     cx.reply_private_t("tickets-closing", &Args::new()).await?;
-    let reason = args
-        .reason
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| {
-            cx.t(
-                "tickets-closed-by",
-                &Args::new().with("user", cx.user().name.clone()),
-            )
-        });
+    let reason = requested_reason.unwrap_or_else(|| {
+        cx.t(
+            "tickets-closed-by",
+            &Args::new().with("user", cx.user().name.clone()),
+        )
+    });
     let closed = finish(ctx, channel, Some(cx.user().id), &reason, None)
         .await
         .map_err(|error| failed(&error))?;
+    if closed == Closed::Done || closed == Closed::RatingDmUnconfirmed {
+        let audit_key = format!("close-{}", cx.invocation().interaction_id.get());
+        if let Err(error) = audit::record_event(
+            ctx,
+            cx.user().id.get(),
+            audit::AuditAction::TicketClose,
+            audit::AuditOutcome::Success,
+            &audit_key,
+        )
+        .await
+        {
+            tracing::warn!(?error, channel = %channel, "could not record ticket close audit event");
+        }
+    }
     if closed == Closed::RatingDmUnconfirmed {
         if let Err(error) = cx
             .reply_private_t(
@@ -7173,7 +8468,7 @@ async fn resend_close_request(
             .reply_private_t("tickets-close-request-pending", &Args::new())
             .await;
     }
-    match post_close_request_message(cx, cx.ctx(), channel, opener, request).await {
+    match post_close_request_message(cx.ctx(), channel, opener, request).await {
         Ok(()) => {
             if let Some(deadline) = request.expires_at {
                 if let Err(error) =
@@ -7231,7 +8526,7 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
         }
     };
     let config = config.for_ticket(&ticket);
-    if !is_staff_command(&cx, &config).await {
+    if !is_ticket_staff(&cx, &ticket, &config).await {
         return cx.reply_private_t("tickets-staff-only", &Args::new()).await;
     }
     if !ticket.is_open() {
@@ -7240,12 +8535,37 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
             .await;
     }
     let timeout_hours = config.close_request_timeout_hours;
+    let actor_id = cx.user().id.get();
+    let audit_key = format!("close-request-{}", cx.invocation().interaction_id.get());
     let reason = args.reason.filter(|text| !text.trim().is_empty());
-    if let Some(request) = ticket.close_request.clone() {
-        return resend_close_request(&cx, channel, ticket.opener, &request, reason.as_deref())
+    if ticket
+        .panel
+        .as_ref()
+        .is_some_and(|panel| !panel.customization.close_reason_allowed(reason.as_deref()))
+    {
+        return cx
+            .reply_private_t("tickets-close-reason-invalid", &Args::new())
             .await;
     }
-    create_close_request(cx, ticket, revision, reason, timeout_hours).await
+    let result = if let Some(request) = ticket.close_request.clone() {
+        resend_close_request(&cx, channel, ticket.opener, &request, reason.as_deref()).await
+    } else {
+        create_close_request(cx.clone(), ticket, revision, reason, timeout_hours).await
+    };
+    if result.is_ok() {
+        if let Err(error) = audit::record_event(
+            ctx,
+            actor_id,
+            audit::AuditAction::TicketCloseRequest,
+            audit::AuditOutcome::Success,
+            &audit_key,
+        )
+        .await
+        {
+            tracing::warn!(?error, channel = %channel, "could not record ticket close request audit event");
+        }
+    }
+    result
 }
 
 async fn create_close_request(
@@ -7375,7 +8695,7 @@ async fn create_close_request(
         cancel_close_request_timeout(ctx, channel, &request).await;
         return cx.reply_private_t("tickets-failed", &Args::new()).await;
     }
-    match post_close_request_message(&cx, ctx, channel, ticket.opener, &request).await {
+    match post_close_request_message(ctx, channel, ticket.opener, &request).await {
         Ok(()) => {
             cx.reply_private_t("tickets-close-request-sent", &Args::new())
                 .await
@@ -7392,10 +8712,6 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let key = ticket_key(channel);
     let config: Config = cx.config()?;
-    let config = ticket_config(ctx, &config, channel).await?;
-    if !is_staff(&cx, &config).await {
-        return say(&cx, "tickets-staff-only", &Args::new()).await;
-    }
     // Written against the revision read: two who press at once do not both take it, and a close
     // that began in between wins.
     for _ in 0..5 {
@@ -7406,6 +8722,10 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
             serde_json::from_value(entry.value).map_err(|error| failed(&error))?;
         if !ticket.is_open() {
             return say(&cx, "tickets-not-a-ticket", &Args::new()).await;
+        }
+        let access_config = config.for_ticket(&ticket);
+        if !is_ticket_staff(&cx, &ticket, &access_config).await {
+            return say(&cx, "tickets-staff-only", &Args::new()).await;
         }
         if let Some(holder) = ticket.claimed_by {
             return say(
@@ -7430,6 +8750,18 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
             .await
         {
             Ok(_) => {
+                let audit_key = format!("ticket-claim-{}", cx.invocation().interaction_id.get());
+                if let Err(error) = audit::record_event(
+                    ctx,
+                    cx.user().id.get(),
+                    audit::AuditAction::TicketClaim,
+                    audit::AuditOutcome::Success,
+                    &audit_key,
+                )
+                .await
+                {
+                    tracing::warn!(?error, channel = %channel, "could not record ticket claim audit event");
+                }
                 ctx.api
                     .execute(Action::SendMessage {
                         channel_id: channel,
@@ -7456,11 +8788,21 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
     let ctx = cx.ctx();
     let channel = cx.invocation().channel_id;
     let config: Config = cx.config()?;
-    let config = ticket_config(ctx, &config, channel).await?;
-    if !is_staff_command(&cx, &config).await {
+    let key = ticket_key(channel);
+    let initial_ticket = ctx
+        .store()
+        .get::<Ticket>(&key)
+        .await
+        .map_err(|error| failed(&error))?
+        .ok_or_else(|| UserError::message("tickets-not-a-ticket"))?;
+    let access_config = config.for_ticket(&initial_ticket);
+    if !is_ticket_staff(&cx, &initial_ticket, &access_config).await {
         return Err(UserError::message("tickets-staff-only"));
     }
-    let staff = config.staff();
+    if !initial_ticket.is_open() {
+        return Err(UserError::message("tickets-not-a-ticket"));
+    }
+    let staff_roles = history_staff_roles(&initial_ticket, &access_config);
     if let Some(user) = claimed_by {
         let member = match ctx
             .api
@@ -7476,13 +8818,17 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
             }
             Err(error) => return Err(failed(&error)),
         };
-        if !member.roles.iter().any(|role| staff.contains(role))
-            && !is_guild_owner_or_admin(ctx, user, &member.roles).await?
-        {
+        let is_ticket_staff = teams_survey::may_access(
+            initial_ticket.staff_access.as_ref(),
+            &staff_roles,
+            user.get(),
+            &member.roles,
+            false,
+        );
+        if !is_ticket_staff && !is_guild_owner_or_admin(ctx, user, &member.roles).await? {
             return Err(UserError::message("tickets-transfer-not-staff"));
         }
     }
-    let key = ticket_key(channel);
     // CAS lets a close that begins during the update win.
     for _ in 0..5 {
         let Some(entry) = ctx.store().entry(&key).await.map_err(|e| failed(&e))? else {
@@ -7518,6 +8864,24 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
             .await
         {
             Ok(_) => {
+                let audit_action = if claimed_by.is_some() {
+                    audit::AuditAction::TicketTransfer
+                } else {
+                    audit::AuditAction::TicketUnclaim
+                };
+                let audit_key =
+                    format!("ticket-assignment-{}", cx.invocation().interaction_id.get());
+                if let Err(error) = audit::record_event(
+                    ctx,
+                    cx.user().id.get(),
+                    audit_action,
+                    audit::AuditOutcome::Success,
+                    &audit_key,
+                )
+                .await
+                {
+                    tracing::warn!(?error, channel = %channel, "could not record ticket assignment audit event");
+                }
                 let content = cx.t(message, &args);
                 if let Err(error) = ctx
                     .api
@@ -7542,62 +8906,29 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
 }
 
 async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Result<(), UserError> {
-    let channel = cx.invocation().channel_id;
     let ctx = cx.ctx();
-    let ticket = ctx
-        .store()
-        .get::<Ticket>(&ticket_key(channel))
-        .await
-        .map_err(|error| failed(&error))?
-        .ok_or_else(|| UserError::message("tickets-not-a-ticket"))?;
-    let config: Config = cx.config()?;
-    let config = config.for_ticket(&ticket);
-    if !is_staff_command(&cx, &config).await {
-        return Err(UserError::message("tickets-staff-only"));
-    }
-    if !ticket.is_open() {
-        return Err(UserError::message("tickets-not-a-ticket"));
-    }
-
-    let reason = Reason::truncated(&cx.t("tickets-reason-member", &Args::new()));
-    if ticket.thread {
-        let parent = ticket
-            .thread_parent
-            .map(ChannelId::new)
-            .ok_or_else(|| UserError::message("tickets-thread-access-unknown"))?;
-        thread::change_member(ctx, channel, parent, user, add).await?;
-    } else {
+    let actor_id = cx.user().id.get();
+    let audit_key = format!("ticket-member-{}", cx.invocation().interaction_id.get());
+    let result = operations::change_member(cx.clone(), user, add).await;
+    if result.is_ok() {
         let action = if add {
-            Action::SetPermissionOverwrite {
-                channel_id: channel,
-                overwrite: overwrite(
-                    OverwriteTarget::Member(user),
-                    TICKET_PERMISSIONS,
-                    Permissions::empty(),
-                ),
-                reason,
-            }
+            audit::AuditAction::TicketMemberAdd
         } else {
-            Action::DeletePermissionOverwrite {
-                channel_id: channel,
-                target: OverwriteTarget::Member(user),
-                reason,
-            }
+            audit::AuditAction::TicketMemberRemove
         };
-        ctx.api
-            .execute(action)
-            .await
-            .map_err(|error| failed(&error))?;
+        if let Err(error) = audit::record_event(
+            ctx,
+            actor_id,
+            action,
+            audit::AuditOutcome::Success,
+            &audit_key,
+        )
+        .await
+        {
+            tracing::warn!(?error, "could not record ticket member audit event");
+        }
     }
-    cx.reply_private_t(
-        if add {
-            "tickets-added"
-        } else {
-            "tickets-removed"
-        },
-        &Args::new().with("user", format!("<@{user}>")),
-    )
-    .await
+    result
 }
 
 async fn add(cx: CommandCx, args: Member) -> Result<(), UserError> {
@@ -7629,14 +8960,7 @@ async fn change_label(cx: CommandCx, value: String, add: bool) -> Result<(), Use
         };
         let mut ticket: Ticket =
             serde_json::from_value(entry.value).map_err(|error| failed(&error))?;
-        let staff_roles = history_staff_roles(&ticket, &config.for_ticket(&ticket));
-        let actor = cx.actor().await;
-        if !actor
-            .roles
-            .iter()
-            .any(|role| staff_roles.contains(&role.get()))
-            && cx.require("tickets.manage").await.is_err()
-        {
+        if !is_ticket_staff(&cx, &ticket, &config.for_ticket(&ticket)).await {
             return Err(UserError::message("tickets-staff-only"));
         }
         if !ticket.is_open() {
@@ -7653,6 +8977,9 @@ async fn change_label(cx: CommandCx, value: String, add: bool) -> Result<(), Use
                     .reply_private_t("tickets-label-exists", &Args::new())
                     .await;
             }
+            transcript_management::register_label(ctx, &label)
+                .await
+                .map_err(|error| failed(&error))?;
             ticket.labels.push(label.clone());
             ticket.labels.sort_by_cached_key(|value| label_key(value));
         } else {
@@ -7681,6 +9008,23 @@ async fn change_label(cx: CommandCx, value: String, add: bool) -> Result<(), Use
             .await
         {
             Ok(_) => {
+                let audit_action = if add {
+                    audit::AuditAction::TicketLabelAssign
+                } else {
+                    audit::AuditAction::TicketLabelDelete
+                };
+                let audit_key = format!("ticket-label-{}", cx.invocation().interaction_id.get());
+                if let Err(error) = audit::record_event(
+                    ctx,
+                    cx.user().id.get(),
+                    audit_action,
+                    audit::AuditOutcome::Success,
+                    &audit_key,
+                )
+                .await
+                {
+                    tracing::warn!(?error, channel = %cx.invocation().channel_id, "could not record ticket label audit event");
+                }
                 return cx
                     .reply_private_t(
                         if add {
@@ -7770,11 +9114,6 @@ async fn transfer(cx: CommandCx, args: Member) -> Result<(), UserError> {
 async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let channel = cx.invocation().channel_id;
-    let config: Config = cx.config()?;
-    let config = ticket_config(ctx, &config, channel).await?;
-    if !is_staff_command(&cx, &config).await {
-        return Err(UserError::message("tickets-staff-only"));
-    }
     let Some(ticket) = ctx
         .store()
         .get::<Ticket>(&ticket_key(channel))
@@ -7783,6 +9122,11 @@ async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
     else {
         return Err(UserError::message("tickets-not-a-ticket"));
     };
+    let config: Config = cx.config()?;
+    let access_config = config.for_ticket(&ticket);
+    if !is_ticket_staff(&cx, &ticket, &access_config).await {
+        return Err(UserError::message("tickets-staff-only"));
+    }
     if !ticket.is_open() {
         return Err(UserError::message("tickets-not-a-ticket"));
     }
@@ -7805,6 +9149,18 @@ async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
             .execute(action)
             .await
             .map_err(|error| failed(&error))?;
+    }
+    let audit_key = format!("ticket-rename-{}", cx.invocation().interaction_id.get());
+    if let Err(error) = audit::record_event(
+        ctx,
+        cx.user().id.get(),
+        audit::AuditAction::TicketRename,
+        audit::AuditOutcome::Success,
+        &audit_key,
+    )
+    .await
+    {
+        tracing::warn!(?error, channel = %channel, "could not record ticket rename audit event");
     }
     cx.reply_private_t("tickets-renamed", &Args::new().with("name", args.name))
         .await
@@ -7834,14 +9190,8 @@ async fn staff_ticket(
         .map_err(|error| failed(&error))?
         .ok_or_else(|| UserError::message("tickets-not-a-ticket"))?;
     let config: Config = cx.config()?;
-    let staff_roles = history_staff_roles(&ticket, &config.for_ticket(&ticket));
-    let actor = cx.actor().await;
-    if !actor
-        .roles
-        .iter()
-        .any(|role| staff_roles.contains(&role.get()))
-        && cx.require("tickets.manage").await.is_err()
-    {
+    let access_config = config.for_ticket(&ticket);
+    if !is_ticket_staff(cx, &ticket, &access_config).await {
         return Err(UserError::message("tickets-staff-only"));
     }
     if !ticket.is_open() {
@@ -7898,6 +9248,7 @@ async fn save_note(
                     StaffNotePage {
                         ticket_number: ticket.number,
                         panel: ticket.panel.clone(),
+                        staff_access: ticket.staff_access.clone(),
                         notes: vec![note.clone()],
                     },
                     Expect::Missing,
@@ -7909,6 +9260,7 @@ async fn save_note(
                 StaffNotePage {
                     ticket_number: ticket.number,
                     panel: ticket.panel.clone(),
+                    staff_access: ticket.staff_access.clone(),
                     notes: vec![note.clone()],
                 },
                 Expect::Missing,
@@ -7968,11 +9320,18 @@ async fn note_access(
         },
         |ticket| config.for_ticket(ticket),
     );
-    if !is_staff_command(cx, &access_config).await {
+    let may_access = if let Some(ticket) = live_ticket.as_ref() {
+        is_ticket_staff(cx, ticket, &access_config).await
+    } else {
+        is_staff_with_snapshot(cx, &access_config, page.staff_access.as_ref()).await
+    };
+    if !may_access {
         return Err(UserError::message("tickets-staff-only"));
     }
     if live_ticket.as_ref().is_some_and(|ticket| {
-        ticket.panel.as_ref() != page.panel.as_ref() || ticket.number != page.ticket_number
+        ticket.panel.as_ref() != page.panel.as_ref()
+            || ticket.staff_access != page.staff_access
+            || ticket.number != page.ticket_number
     }) {
         return Err(UserError::message("tickets-failed"));
     }
@@ -8039,7 +9398,21 @@ async fn add_note(cx: CommandCx, args: NoteArgs) -> Result<(), UserError> {
         text: text.to_owned(),
     };
     match save_note(ctx, channel, &ticket, note).await? {
-        NoteSave::Saved => cx.reply_private_t("tickets-note-saved", &Args::new()).await,
+        NoteSave::Saved => {
+            let audit_key = format!("staff-note-{}", cx.invocation().interaction_id.get());
+            if let Err(error) = audit::record_event(
+                ctx,
+                cx.user().id.get(),
+                audit::AuditAction::StaffNoteAdd,
+                audit::AuditOutcome::Success,
+                &audit_key,
+            )
+            .await
+            {
+                tracing::warn!(?error, channel = %channel, "could not record ticket note audit event");
+            }
+            cx.reply_private_t("tickets-note-saved", &Args::new()).await
+        }
         NoteSave::LimitReached => {
             cx.reply_private_t("tickets-notes-limit", &Args::new())
                 .await
@@ -8109,6 +9482,7 @@ async fn search_history(cx: CommandCx, args: SearchHistory) -> Result<(), UserEr
     .map_err(|error| failed(&error))?;
     let roles = cx.actor().await.roles;
     let access = HistorySearchAccess {
+        actor_id: cx.user().id.get(),
         roles: &roles,
         can_manage: cx.require("tickets.manage").await.is_ok(),
     };
@@ -8223,6 +9597,7 @@ async fn search_history_next(cx: ComponentCx) -> Result<(), UserError> {
     let original = state.clone();
     let roles = cx.actor().await.roles;
     let access = HistorySearchAccess {
+        actor_id: cx.user().id.get(),
         roles: &roles,
         can_manage: cx.require("tickets.manage").await.is_ok(),
     };
@@ -8341,9 +9716,11 @@ async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError>
             .reply_private_t("tickets-history-not-found", &Args::new())
             .await;
     }
+    let actor_id = cx.user().id.get();
+    let opener_may_view = history.opener == actor_id && !history.opener_erased;
     let roles = cx.actor().await.roles;
     let can_manage = cx.require("tickets.manage").await.is_ok();
-    if !may_view_history(&roles, can_manage, &history) {
+    if !opener_may_view && !may_view_history(actor_id, &roles, can_manage, &history) {
         return cx
             .reply_private_t("tickets-history-not-found", &Args::new())
             .await;
@@ -8597,14 +9974,8 @@ async fn staff_component_ticket(
         })?
         .ok_or("tickets-not-a-ticket")?;
     let config: Config = cx.config().map_err(|_| "tickets-failed")?;
-    let staff_roles = history_staff_roles(&ticket, &config.for_ticket(&ticket));
-    let actor = cx.actor().await;
-    if !actor
-        .roles
-        .iter()
-        .any(|role| staff_roles.contains(&role.get()))
-        && cx.require("tickets.manage").await.is_err()
-    {
+    let access_config = config.for_ticket(&ticket);
+    if !is_ticket_staff(cx, &ticket, &access_config).await {
         return Err("tickets-staff-only");
     }
     if !ticket.is_open() {
@@ -9196,7 +10567,39 @@ async fn search_replies(cx: CommandCx, args: ReplySearchArgs) -> Result<(), User
 }
 
 fn schema() -> serde_json::Value {
-    let named_panel_schema = json!({
+    let forms_schema = form_library::schema();
+    let team_permissions_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "config-tickets-staff-team-permissions",
+        "properties": {
+            "add_reactions": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-add_reactions" },
+            "send_messages": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-send_messages" },
+            "send_tts_messages": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-send_tts_messages" },
+            "embed_links": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-embed_links" },
+            "attach_files": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-attach_files" },
+            "mention_everyone": { "type": "boolean", "default": false, "description": "config-tickets-team-permission-mention_everyone" },
+            "use_external_emojis": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-use_external_emojis" },
+            "use_application_commands": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-use_application_commands" },
+            "use_external_stickers": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-use_external_stickers" },
+            "send_voice_messages": { "type": "boolean", "default": true, "description": "config-tickets-team-permission-send_voice_messages" }
+        }
+    });
+    let staff_team_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name"],
+        "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9_-]+$", "description": "config-tickets-staff-team-id" },
+            "name": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": ".*\\S.*", "description": "config-tickets-staff-team-name" },
+            "roles": { "type": "array", "items": { "type": "string", "pattern": "^[0-9]{1,20}$" }, "description": "config-tickets-staff-team-roles", "x-ui": { "widget": "roles" } },
+            "users": { "type": "array", "items": { "type": "string", "pattern": "^[0-9]{1,20}$" }, "description": "config-tickets-staff-team-users", "x-ui": { "widget": "users" } },
+            "permissions": team_permissions_schema
+        }
+    });
+    let mut exit_survey_schema = advanced_forms::form_questions_schema();
+    exit_survey_schema["description"] = json!("config-tickets-panel-exit_survey");
+    let mut named_panel_schema = json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["id"],
@@ -9208,14 +10611,28 @@ fn schema() -> serde_json::Value {
             "category": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-category", "x-ui": { "widget": "channel", "channel_kinds": ["category"] } },
             "thread_channel": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-thread_channel", "x-ui": { "widget": "channel", "channel_kinds": ["text"] } },
             "staff_roles": { "type": "array", "maxItems": 20, "items": { "type": "string", "pattern": "^[0-9]{1,20}$" }, "description": "config-tickets-panel-staff", "x-ui": { "level": "basic", "widget": "roles" } },
+            "staff_teams": { "type": "array", "description": "config-tickets-panel-staff_teams", "x-ui": { "level": "basic", "widget": "ticket-staff-teams" }, "items": { "type": "string", "pattern": "^(default|[a-zA-Z0-9_-]{1,32})$" } },
             "log_channel": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-log_channel", "x-ui": { "widget": "channel" } },
             "timezone": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 64 }, { "type": "null" }], "description": "config-tickets-panel-timezone", "x-ui": { "level": "basic" } },
             "close_after_days": { "type": "integer", "minimum": 0, "maximum": 365, "description": "config-tickets-close_after_days" },
+            "waiting_after_hours": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "default": 0, "description": "config-tickets-panel-waiting_after_hours", "x-ui": { "level": "basic" } },
+            "first_response_timeout_hours": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "default": 0, "description": "config-tickets-panel-first_response_timeout_hours", "x-ui": { "level": "basic" } },
+            "last_message_timeout_hours": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "default": 0, "description": "config-tickets-panel-last_message_timeout_hours", "x-ui": { "level": "basic" } },
+            "waiting_category": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{1,20}$" }, { "type": "null" }], "description": "config-tickets-panel-waiting_category", "x-ui": { "widget": "channel", "channel_kinds": ["category"] } },
             "max_open": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "default": 0, "description": "config-tickets-panel-max_open", "x-ui": { "level": "basic" } },
-            "questions": advanced_forms::form_questions_schema()
+            "form_id": { "anyOf": [{ "type": "string", "pattern": "^[a-z0-9_-]{1,32}$" }, { "type": "null" }], "description": "tickets-form-id", "x-ui": { "widget": "ticket-form" } },
+            "questions": advanced_forms::form_questions_schema(),
+            "exit_survey": exit_survey_schema
         }
     });
-    json!({
+    let panel_customization_schema = panel_customization::PanelCustomization::schema_properties();
+    if let (Some(properties), Some(custom_properties)) = (
+        named_panel_schema["properties"].as_object_mut(),
+        panel_customization_schema.as_object(),
+    ) {
+        properties.extend(custom_properties.clone());
+    }
+    let mut config_schema = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -9238,6 +10655,12 @@ fn schema() -> serde_json::Value {
                 "description": "config-tickets-staff_roles",
                 "x-ui": { "level": "basic", "widget": "roles" }
             },
+            "staff_teams": {
+                "type": "array",
+                "description": "config-tickets-staff_teams",
+                "x-ui": { "level": "basic" },
+                "items": staff_team_schema
+            },
             "log_channel": {
                 "type": ["string", "null"],
                 "pattern": "^[0-9]{1,20}$",
@@ -9258,6 +10681,33 @@ fn schema() -> serde_json::Value {
                 "description": "config-tickets-close_after_days",
                 "x-ui": { "level": "basic" }
             },
+            "waiting_after_hours": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": u32::MAX,
+                "description": "config-tickets-waiting_after_hours",
+                "x-ui": { "level": "basic" }
+            },
+            "first_response_timeout_hours": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": u32::MAX,
+                "description": "config-tickets-first_response_timeout_hours",
+                "x-ui": { "level": "basic" }
+            },
+            "last_message_timeout_hours": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": u32::MAX,
+                "description": "config-tickets-last_message_timeout_hours",
+                "x-ui": { "level": "basic" }
+            },
+            "waiting_category": {
+                "type": ["string", "null"],
+                "pattern": "^[0-9]{1,20}$",
+                "description": "config-tickets-waiting_category",
+                "x-ui": { "level": "basic", "widget": "channel", "channel_kinds": ["category"] }
+            },
             "close_request_timeout_hours": {
                 "type": "integer",
                 "minimum": 0,
@@ -9266,6 +10716,7 @@ fn schema() -> serde_json::Value {
                 "x-ui": { "level": "basic" }
             },
             "questions": advanced_forms::form_questions_schema(),
+            "integrations": integrations::config_schema(),
             "timezone": {
                 "type": "string",
                 "minLength": 1,
@@ -9331,11 +10782,14 @@ fn schema() -> serde_json::Value {
                 "items": named_panel_schema
             }
         }
-    })
+    });
+    config_schema["properties"]
+        .as_object_mut()
+        .expect("ticket config schema has object properties")
+        .insert("forms".to_owned(), forms_schema);
+    config_schema
 }
 
-/// # Errors
-/// The module declaration is refused by the SDK.
 pub fn builder() -> Result<ModuleBuilder, CoreError> {
     let schema = schema();
     Ok(
@@ -9349,7 +10803,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .capability(closure_sdk::Capability::ManageChannels)
             .capability(closure_sdk::Capability::ManageThreads)
             .capability(closure_sdk::Capability::RespondToInteractions)
-            .intents(Intents::GUILD_MEMBERS)
+            .intents(Intents::GUILD_MEMBERS | Intents::GUILD_MESSAGES)
             .permission(PermissionSpec::new(
                 "tickets.manage",
                 Level::MODERATOR,
@@ -9366,13 +10820,21 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     "category": null,
                     "thread_channel": null,
                     "staff_roles": [],
+                    "staff_teams": [],
                     "log_channel": null,
                     "timezone": "UTC",
                     "hours": [],
                     "max_open": 1,
                     "close_after_days": 0,
+                    "waiting_after_hours": 0,
+                    "first_response_timeout_hours": 0,
+                    "last_message_timeout_hours": 0,
+                    "waiting_category": null,
                     "close_request_timeout_hours": 0,
                     "questions": [],
+                    "forms": [],
+                    "integrations": [],
+                    "staff_teams": [],
                     "close_when_opener_leaves": false,
                     "panel_display": "buttons",
                     "panels": []
@@ -9386,6 +10848,9 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                         .handler(panel),
                     Command::<SearchHistory>::new("search").handler(search_history),
                     Command::<RateArgs>::new("rate").handler(rate_command),
+                    Command::<SurveyArgs>::new("survey")
+                        .requires("tickets.use")
+                        .handler(survey_command),
                     Command::<ViewHistory>::new("history").handler(view_history),
                     Command::<Close>::new("close")
                         .requires("tickets.use")
@@ -9410,6 +10875,31 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<operations::WaitingArgs>::new("waiting").handler(operations::waiting),
                     Command::<data::ExportMyData>::new("export").handler(data::export_my_data),
                     Command::<data::EraseMyData>::new("erase").handler(data::erase_my_data),
+                    Command::<blacklist::UserArgs>::new("blacklist-add-user")
+                        .handler(blacklist::add_user),
+                    Command::<blacklist::UserArgs>::new("blacklist-remove-user")
+                        .handler(blacklist::remove_user),
+                    Command::<blacklist::RoleArgs>::new("blacklist-add-role")
+                        .handler(blacklist::add_role),
+                    Command::<blacklist::RoleArgs>::new("blacklist-remove-role")
+                        .handler(blacklist::remove_role),
+                    Command::<blacklist::ScopeArgs>::new("blacklist-list").handler(blacklist::list),
+                    Command::<knowledge::SearchArgs>::new("knowledge-search")
+                        .handler(knowledge::search),
+                    Command::<knowledge::ViewArgs>::new("knowledge-view").handler(knowledge::view),
+                    Command::<tags::TagCommandArgs>::new("tag")
+                        .requires("tickets.use")
+                        .handler(tags::tag_command),
+                    Command::<KnowledgeSendArgs>::new("knowledge-send").handler(knowledge_send),
+                    Command::<knowledge::AddArgs>::new("knowledge-add")
+                        .requires("tickets.manage")
+                        .handler(knowledge::add),
+                    Command::<knowledge::EditArgs>::new("knowledge-edit")
+                        .requires("tickets.manage")
+                        .handler(knowledge::edit),
+                    Command::<knowledge::DeleteArgs>::new("knowledge-delete")
+                        .requires("tickets.manage")
+                        .handler(knowledge::delete),
                     Command::<StatsArgs>::new("stats").handler(stats_command),
                     Command::<LabelArgs>::new("label-add").handler(add_label),
                     Command::<LabelArgs>::new("label-remove").handler(remove_label),
@@ -9440,16 +10930,65 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .component("close-request-reject", reject_close_request)
             .component("claim", claim)
             .component("history-search-next", search_history_next)
+            .job(knowledge::KNOWLEDGE_SEARCH_JOB, knowledge::search_job)
+            .job(
+                knowledge::KNOWLEDGE_SUGGESTION_JOB,
+                knowledge::suggestion_job,
+            )
             .component("reply-select", select_reply)
             .component("reply-retry", retry_reply)
             .component("reply-retry-uncertain", retry_uncertain_reply)
+            .component(message_ticket::PANEL_SELECT, message_ticket::select_panel)
+            .component("survey-open", teams_survey::open_exit_survey_button)
+            .component("survey-view", teams_survey::view_exit_survey)
+            .modal("survey-submit", teams_survey::submit_exit_survey)
+            .message_command(
+                message_ticket::COMMAND_NAME,
+                message_ticket::message_command,
+            )
+            .dashboard_state(dashboard::state)
+            .dashboard_public_state(dashboard::public_state)
+            .dashboard_action("blacklist.add", dashboard::action)
+            .dashboard_action("blacklist.remove", dashboard::action)
+            .dashboard_action("ticket.close", dashboard::action)
+            .dashboard_action("ticket.request_close", dashboard::action)
+            .dashboard_action("ticket.reply", dashboard::action)
+            .dashboard_action("ticket.add_label", dashboard::action)
+            .dashboard_action("ticket.remove_label", dashboard::action)
+            .dashboard_action("knowledge.create", dashboard::action)
+            .dashboard_action("knowledge.update", dashboard::action)
+            .dashboard_action("knowledge.delete", dashboard::action)
+            .dashboard_action("integration.secret.set", dashboard::action)
+            .dashboard_action("integration.secret.remove", dashboard::action)
+            .dashboard_action("tag.create", dashboard::action)
+            .dashboard_action("tag.update", dashboard::action)
+            .dashboard_action("tag.clone", dashboard::action)
+            .dashboard_action("tag.delete", dashboard::action)
+            .dashboard_action("gallery.import", dashboard::action)
+            .dashboard_action("gallery.export", dashboard::action)
+            .dashboard_action("audit.search", dashboard::action)
+            .dashboard_action("ticket.history.update", dashboard::action)
+            .dashboard_action("ticket.label.create", dashboard::action)
+            .dashboard_action("ticket.label.delete", dashboard::action)
             .on(Subscription::new(EventKind::MemberLeft), on_member_left)
+            .on(
+                Subscription::new(EventKind::MessageCreated),
+                automation::on_message,
+            )
             .job(IDLE, idle_job)
+            .job(automation::AUTOMATION, automation::job)
+            .job("ticket-operation-recovery", operations::retry_pending_job)
+            .job(
+                transcript_management::LABEL_BACKFILL_JOB,
+                transcript_management::backfill_job,
+            )
             .job(LEFT_SCAN, left_scan_job)
             .job(LEFT_CLOSE, left_close_job)
             .job(CLOSING, closing_job)
             .job(OPEN_RECOVERY, open_recovery_job)
             .job(CLOSE_REQUEST_TIMEOUT, close_request_timeout_job)
+            .dynamic_command_aliases(tags::dynamic_command_aliases)
+            .dynamic_command_alias(tags::dynamic_command_alias)
             .catalog(Locale::En, EN)
             .catalog(Locale::Ja, JA),
     )
@@ -9462,10 +11001,23 @@ pub fn module() -> Result<SdkModule, CoreError> {
 }
 
 mod advanced_forms;
+mod analytics;
+mod audit;
+mod automation;
+mod blacklist;
+mod dashboard;
 mod data;
+mod form_library;
 mod hours;
+mod integrations;
+mod knowledge;
+mod message_ticket;
 mod operations;
+mod panel_customization;
+mod tags;
+mod teams_survey;
 mod thread;
+mod transcript_management;
 
 #[cfg(test)]
 mod tests;

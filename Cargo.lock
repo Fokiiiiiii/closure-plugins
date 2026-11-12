@@ -109,10 +109,12 @@ dependencies = [
 [[package]]
 name = "closure-core"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#11d4306adbf9367c4dc4f4ccb458474b5e050a37"
+source = "git+https://github.com/Fokiiiiiii/closure#b3d682e344be52aa0ad677af066f47de074eed66"
 dependencies = [
  "async-trait",
  "futures-util",
+ "ring",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
@@ -120,12 +122,13 @@ dependencies = [
  "tracing",
  "twilight-model",
  "url",
+ "zeroize",
 ]
 
 [[package]]
 name = "closure-i18n"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#11d4306adbf9367c4dc4f4ccb458474b5e050a37"
+source = "git+https://github.com/Fokiiiiiii/closure#b3d682e344be52aa0ad677af066f47de074eed66"
 dependencies = [
  "closure-core",
  "fluent-bundle",
@@ -152,7 +155,7 @@ dependencies = [
 [[package]]
 name = "closure-sdk"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#11d4306adbf9367c4dc4f4ccb458474b5e050a37"
+source = "git+https://github.com/Fokiiiiiii/closure#b3d682e344be52aa0ad677af066f47de074eed66"
 dependencies = [
  "async-trait",
  "closure-core",
@@ -170,7 +173,7 @@ dependencies = [
 [[package]]
 name = "closure-sdk-macros"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#11d4306adbf9367c4dc4f4ccb458474b5e050a37"
+source = "git+https://github.com/Fokiiiiiii/closure#b3d682e344be52aa0ad677af066f47de074eed66"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -772,6 +775,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "tokio",
+ "tower-service",
  "twilight-model",
  "twilight-util",
 ]
@@ -835,12 +839,14 @@ dependencies = [
  "closure-core",
  "closure-i18n",
  "closure-sdk",
+ "plugin-kit",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "twilight-model",
  "twilight-util",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1043,6 +1049,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
 ]
 
 [[package]]
@@ -1311,6 +1326,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1453,6 +1474,15 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "untrusted"

@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use closure_core::action::{Action, MentionPolicy};
 use closure_core::event::ChannelId;
+use closure_core::integration_secrets::{IntegrationSecretError, SecretString};
 use closure_core::module::{
-    DashboardActionError, DashboardActionRequest, DashboardActionResult, DashboardScope,
-    EventContext,
+    DashboardActionError, DashboardActionRequest, DashboardActionResult, DashboardPublicScope,
+    DashboardScope, EventContext,
 };
 use closure_core::permission::{Actor, PermissionKey};
 use closure_core::storage::{Expect, StorageError};
@@ -16,15 +17,17 @@ use serde_json::{Value, json};
 
 use super::{
     Args, CloseRequest, CloseRequestExpiry, Config, HistoryStatus, ReplySendAttempt, Ticket,
-    blacklist, cancel_close_request_timeout, close_request_expiry, finish, history_key,
-    history_staff_roles, knowledge, label_key, may_close, post_close_request_message,
-    refresh_ticket_form_answer_ttl, reply_send_attempt_key, split_reply, teams_survey, ticket_key,
-    ticket_ttl, valid_reply_content, watch_close_request_timeout,
+    analytics, audit, blacklist, cancel_close_request_timeout, close_request_expiry, finish,
+    form_library, history_key, history_staff_roles, integrations, knowledge, label_key, may_close,
+    post_close_request_message, refresh_ticket_form_answer_ttl, reply_send_attempt_key,
+    split_reply, tags, teams_survey, ticket_key, ticket_ttl, transcript_management,
+    valid_reply_content, watch_close_request_timeout,
 };
 
 const RECEIPT_PREFIX: &str = "ticket-dashboard-action:";
 const RECEIPT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECEIPT_LEASE_SECONDS: i64 = 300;
+const GALLERY_SOURCE_LIMIT: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -90,16 +93,142 @@ struct LabelData {
     label: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationSecretSetData {
+    integration_id: String,
+    generation: String,
+    secret_name: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationSecretRemoveData {
+    integration_id: String,
+    generation: String,
+    secret_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GalleryImportData {
+    kind: String,
+    name: String,
+    payload: Value,
+    new_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GalleryExportData {
+    kind: String,
+    source_id: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GalleryPanelPayload {
+    name: Option<String>,
+    description: Option<String>,
+    button_style: Option<super::PanelButtonStyle>,
+    customization: GalleryPanelCustomization,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GalleryPanelCustomization {
+    title: Option<String>,
+    color: Option<u32>,
+    content: Option<String>,
+    welcome_title: Option<String>,
+    welcome_title_url: Option<String>,
+    welcome_color: Option<u32>,
+    welcome_description: Option<String>,
+    welcome_author_name: Option<String>,
+    welcome_author_url: Option<String>,
+    welcome_author_icon_url: Option<String>,
+    welcome_thumbnail_url: Option<String>,
+    welcome_image_url: Option<String>,
+    welcome_footer_text: Option<String>,
+    welcome_footer_icon_url: Option<String>,
+    welcome_timestamp: bool,
+    welcome_fields: Vec<super::panel_customization::WelcomeEmbedField>,
+}
+
+pub async fn public_state(
+    ctx: EventContext,
+    scope: DashboardPublicScope,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    match scope {
+        DashboardPublicScope::KnowledgeIndex {
+            query,
+            category,
+            cursor,
+        } => {
+            knowledge::public_state(
+                &ctx,
+                query.as_deref(),
+                category.as_deref(),
+                cursor.as_deref(),
+            )
+            .await
+        }
+        DashboardPublicScope::KnowledgeArticle { slug } => {
+            let article = knowledge::public_article(&ctx, &slug)
+                .await?
+                .ok_or(DashboardActionError::NotFound)?;
+            let value = serde_json::to_value(article).map_err(internal)?;
+            Ok(result(value, 0))
+        }
+    }
+}
+
 pub async fn state(
     ctx: EventContext,
     actor: Actor,
     scope: DashboardScope,
 ) -> Result<DashboardActionResult, DashboardActionError> {
+    if matches!(&scope, DashboardScope::IntegrationSecrets) {
+        return integration_secret_state(&ctx, &actor).await;
+    }
+    if matches!(&scope, DashboardScope::Gallery) {
+        let can_manage = tickets_manage(&ctx, &actor)?;
+        if !can_manage {
+            return Err(DashboardActionError::Forbidden);
+        }
+        let config: Config = ctx.parse_config().map_err(internal)?;
+        return gallery_state(&ctx, &config).await;
+    }
+    if let DashboardScope::Tags { query, cursor } = &scope {
+        if !tickets_manage(&ctx, &actor)? {
+            return Err(DashboardActionError::Forbidden);
+        }
+        return tags::dashboard_state(&ctx, &actor, query.as_deref(), cursor.as_deref()).await;
+    }
+    if let DashboardScope::TicketHistory { channel_id } = &scope {
+        let can_manage = tickets_manage(&ctx, &actor)?;
+        let (value, revision) =
+            transcript_management::state(&ctx, &actor, *channel_id, can_manage).await?;
+        return Ok(result(value, revision));
+    }
+    if let DashboardScope::TicketLabels { cursor } = &scope {
+        let (value, revision) =
+            transcript_management::labels_state(&ctx, &actor, cursor.as_deref()).await?;
+        return Ok(result(value, revision));
+    }
     if let DashboardScope::Knowledge { query, cursor } = &scope {
         if !tickets_manage(&ctx, &actor)? {
             return Err(DashboardActionError::Forbidden);
         }
         return knowledge::dashboard_state(&ctx, &actor, query.as_deref(), cursor.as_deref()).await;
+    }
+    if let DashboardScope::Analytics {
+        period_days,
+        cursor,
+    } = &scope
+    {
+        return analytics::dashboard_state(&ctx, &actor, *period_days, cursor.as_deref()).await;
     }
 
     let config: Config = ctx.parse_config().map_err(internal)?;
@@ -174,7 +303,15 @@ pub async fn state(
                 entry.revision,
             ))
         }
-        DashboardScope::Knowledge { .. } => unreachable!("knowledge scope returned above"),
+        DashboardScope::Knowledge { .. }
+        | DashboardScope::Analytics { .. }
+        | DashboardScope::Tags { .. }
+        | DashboardScope::TicketHistory { .. }
+        | DashboardScope::TicketLabels { .. }
+        | DashboardScope::IntegrationSecrets
+        | DashboardScope::Gallery => {
+            unreachable!("aggregate dashboard scope returned above")
+        }
     }
 }
 
@@ -194,31 +331,76 @@ pub async fn action(
         ));
     }
 
+    if matches!(&request.scope, DashboardScope::IntegrationSecrets) {
+        let audit_request = DashboardActionRequest {
+            scope: request.scope.clone(),
+            action: request.action.clone(),
+            data: Value::Null,
+            expected_revision: request.expected_revision,
+            idempotency_key: request.idempotency_key.clone(),
+        };
+        let outcome = integration_secret_action(&ctx, &actor, request).await;
+        audit::record_dashboard_action(&ctx, &actor, &audit_request, &outcome).await?;
+        return outcome;
+    }
+    if matches!(&request.scope, DashboardScope::Gallery) {
+        let outcome = gallery_action(&ctx, &actor, &request).await;
+        audit::record_dashboard_action(&ctx, &actor, &request, &outcome).await?;
+        return outcome;
+    }
+    if matches!(&request.scope, DashboardScope::Tags { .. }) {
+        let outcome = tag_action(&ctx, &actor, &request).await;
+        audit::record_dashboard_action(&ctx, &actor, &request, &outcome).await?;
+        return outcome;
+    }
+    if let DashboardScope::TicketHistory { channel_id } = &request.scope {
+        let outcome = ticket_history_action(&ctx, &actor, &request, *channel_id).await;
+        audit::record_dashboard_action(&ctx, &actor, &request, &outcome).await?;
+        return outcome;
+    }
+    if let DashboardScope::TicketLabels { cursor } = &request.scope {
+        let outcome = ticket_labels_action(&ctx, &actor, &request, cursor.as_deref()).await;
+        audit::record_dashboard_action(&ctx, &actor, &request, &outcome).await?;
+        return outcome;
+    }
+
     let config: Config = ctx.parse_config().map_err(internal)?;
     let can_manage = tickets_manage(&ctx, &actor)?;
-    match (&request.scope, request.action.as_str()) {
+    let outcome = match (&request.scope, request.action.as_str()) {
+        (DashboardScope::Guild, "audit.search") => {
+            if !can_manage {
+                Err(DashboardActionError::Forbidden)
+            } else {
+                audit::query(&ctx, &request, can_manage).await
+            }
+        }
         (
             DashboardScope::Knowledge { .. },
             "knowledge.create" | "knowledge.update" | "knowledge.delete",
         ) => {
             if !can_manage {
-                return Err(DashboardActionError::Forbidden);
-            }
-            let start = begin_action(&ctx, &actor, &request).await?;
-            let (key, mut receipt, revision) = match start {
-                Start::Replay(result) => return Ok(result),
-                Start::Claimed {
-                    key,
-                    receipt,
-                    revision,
-                    ..
-                } => (key, receipt, revision),
-            };
-            match knowledge::dashboard_action(&ctx, &actor, &request, can_manage).await {
-                Ok(result) => complete_action(&ctx, &key, &mut receipt, revision, result).await,
-                Err(error) => {
-                    fail_action(&ctx, &key, &mut receipt, revision).await;
-                    Err(error)
+                Err(DashboardActionError::Forbidden)
+            } else {
+                let start = begin_action(&ctx, &actor, &request).await?;
+                match start {
+                    Start::Replay(result) => Ok(result),
+                    Start::Claimed {
+                        key,
+                        mut receipt,
+                        revision,
+                        ..
+                    } => {
+                        match knowledge::dashboard_action(&ctx, &actor, &request, can_manage).await
+                        {
+                            Ok(result) => {
+                                complete_action(&ctx, &key, &mut receipt, revision, result).await
+                            }
+                            Err(error) => {
+                                fail_action(&ctx, &key, &mut receipt, revision).await;
+                                Err(error)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -240,6 +422,471 @@ pub async fn action(
             | "ticket.remove_label",
         ) => ticket_action(&ctx, &actor, &config, can_manage, &request, *channel_id).await,
         _ => Err(DashboardActionError::Unsupported),
+    };
+    audit::record_dashboard_action(&ctx, &actor, &request, &outcome).await?;
+    outcome
+}
+
+async fn gallery_state(
+    ctx: &EventContext,
+    config: &Config,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    let mut sources = Vec::new();
+    let mut truncated = false;
+
+    for panel in config
+        .panels
+        .iter()
+        .take(GALLERY_SOURCE_LIMIT.saturating_add(1))
+    {
+        if sources.len() == GALLERY_SOURCE_LIMIT {
+            truncated = true;
+            break;
+        }
+        if !panel.customization.valid() {
+            continue;
+        }
+        sources.push(json!({
+            "kind": "panel",
+            "id": panel.id,
+            "name": panel.name.as_deref().unwrap_or(&panel.id),
+            "payload": panel_gallery_payload(panel),
+        }));
+    }
+
+    if !truncated {
+        for form in config
+            .forms
+            .iter()
+            .take(GALLERY_SOURCE_LIMIT.saturating_add(1))
+        {
+            let Some(payload) = form_library::gallery_payload(form) else {
+                continue;
+            };
+            if sources.len() == GALLERY_SOURCE_LIMIT {
+                truncated = true;
+                break;
+            }
+            sources.push(json!({
+                "kind": "form",
+                "id": form.id,
+                "name": form.title,
+                "payload": payload,
+            }));
+        }
+    }
+
+    let tags_page = tags::gallery_sources(ctx, None, None).await?;
+    if let Some(tag_sources) = tags_page.value.get("sources").and_then(Value::as_array) {
+        for source in tag_sources {
+            if sources.len() == GALLERY_SOURCE_LIMIT {
+                truncated = true;
+                break;
+            }
+            sources.push(source.clone());
+        }
+    } else {
+        return Err(DashboardActionError::Internal(
+            "invalid gallery tag source state".into(),
+        ));
+    }
+    truncated |= tags_page
+        .value
+        .get("next_cursor")
+        .is_some_and(|cursor| !cursor.is_null());
+
+    Ok(result(
+        json!({ "sources": sources, "truncated": truncated }),
+        0,
+    ))
+}
+
+async fn gallery_action(
+    ctx: &EventContext,
+    actor: &Actor,
+    request: &DashboardActionRequest,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    if !matches!(&request.scope, DashboardScope::Gallery) {
+        return Err(DashboardActionError::Unsupported);
+    }
+    if !matches!(request.action.as_str(), "gallery.import" | "gallery.export") {
+        return Err(DashboardActionError::Unsupported);
+    }
+    if !tickets_manage(ctx, actor)? {
+        return Err(DashboardActionError::Forbidden);
+    }
+    if request.expected_revision != 0 {
+        return Err(DashboardActionError::PreconditionFailed { current: 0 });
+    }
+
+    let start = begin_action(ctx, actor, request).await?;
+    let (key, mut receipt, receipt_revision, recovering) = match start {
+        Start::Replay(result) => return Ok(result),
+        Start::Claimed {
+            key,
+            receipt,
+            revision,
+            recovering,
+        } => (key, receipt, revision, recovering),
+    };
+
+    let operation = match request.action.as_str() {
+        "gallery.export" => gallery_export_action(ctx, request).await,
+        "gallery.import" => gallery_import_action(ctx, request, recovering).await,
+        _ => Err(DashboardActionError::Unsupported),
+    };
+    match operation {
+        Ok(result) => complete_action(ctx, &key, &mut receipt, receipt_revision, result).await,
+        Err(error) => {
+            fail_action(ctx, &key, &mut receipt, receipt_revision).await;
+            Err(error)
+        }
+    }
+}
+
+async fn gallery_export_action(
+    ctx: &EventContext,
+    request: &DashboardActionRequest,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    let input: GalleryExportData =
+        serde_json::from_value(request.data.clone()).map_err(invalid_data)?;
+    if input.source_id.is_empty() || input.source_id.chars().any(char::is_control) {
+        return Err(DashboardActionError::Invalid(
+            "invalid gallery source ID".into(),
+        ));
+    }
+
+    let payload = match input.kind.as_str() {
+        "tag" => tags::gallery_export(ctx, &input.source_id).await?,
+        "panel" => {
+            let config: Config = ctx.parse_config().map_err(internal)?;
+            let panel = config
+                .panels
+                .iter()
+                .find(|panel| panel.id == input.source_id)
+                .ok_or(DashboardActionError::NotFound)?;
+            if !panel.customization.valid() {
+                return Err(DashboardActionError::Invalid(
+                    "panel cannot be exported".into(),
+                ));
+            }
+            panel_gallery_payload(panel)
+        }
+        "form" => {
+            let config: Config = ctx.parse_config().map_err(internal)?;
+            let form = config
+                .forms
+                .iter()
+                .find(|form| form.id == input.source_id)
+                .ok_or(DashboardActionError::NotFound)?;
+            form_library::gallery_payload(form)
+                .ok_or_else(|| DashboardActionError::Invalid("form cannot be exported".into()))?
+        }
+        _ => {
+            return Err(DashboardActionError::Invalid(
+                "invalid gallery source kind".into(),
+            ));
+        }
+    };
+    Ok(result(json!({ "kind": input.kind, "payload": payload }), 0))
+}
+
+async fn gallery_import_action(
+    ctx: &EventContext,
+    request: &DashboardActionRequest,
+    recovering: bool,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    let input: GalleryImportData =
+        serde_json::from_value(request.data.clone()).map_err(invalid_data)?;
+    if !valid_gallery_name(&input.name) {
+        return Err(DashboardActionError::Invalid(
+            "invalid gallery import name".into(),
+        ));
+    }
+
+    match input.kind.as_str() {
+        "tag" => {
+            let id = input
+                .new_id
+                .as_deref()
+                .ok_or_else(|| DashboardActionError::Invalid("new tag ID is required".into()))?;
+            let imported =
+                tags::gallery_import(ctx, id, &input.payload, &request.idempotency_key).await?;
+            Ok(result(
+                json!({ "kind": "tag", "id": id }),
+                imported.revision,
+            ))
+        }
+        "panel" => {
+            if input.new_id.is_some() {
+                return Err(DashboardActionError::Invalid(
+                    "panel IDs are generated by the plugin".into(),
+                ));
+            }
+            let payload: GalleryPanelPayload =
+                serde_json::from_value(input.payload).map_err(invalid_data)?;
+            let panel_name = payload.name.as_deref().unwrap_or(&input.name);
+            if !valid_gallery_name(panel_name)
+                || payload
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| !valid_gallery_description(description))
+            {
+                return Err(DashboardActionError::Invalid(
+                    "invalid panel template".into(),
+                ));
+            }
+
+            let mut customization = super::panel_customization::PanelCustomization::default();
+            customization.title = payload.customization.title;
+            customization.color = payload.customization.color;
+            customization.content = payload.customization.content;
+            customization.welcome_title = payload.customization.welcome_title;
+            customization.welcome_title_url = payload.customization.welcome_title_url;
+            customization.welcome_color = payload.customization.welcome_color;
+            customization.welcome_description = payload.customization.welcome_description;
+            customization.welcome_author_name = payload.customization.welcome_author_name;
+            customization.welcome_author_url = payload.customization.welcome_author_url;
+            customization.welcome_author_icon_url = payload.customization.welcome_author_icon_url;
+            customization.welcome_thumbnail_url = payload.customization.welcome_thumbnail_url;
+            customization.welcome_image_url = payload.customization.welcome_image_url;
+            customization.welcome_footer_text = payload.customization.welcome_footer_text;
+            customization.welcome_footer_icon_url = payload.customization.welcome_footer_icon_url;
+            customization.welcome_timestamp = payload.customization.welcome_timestamp;
+            customization.welcome_fields = payload.customization.welcome_fields;
+            if !customization.valid() {
+                return Err(DashboardActionError::Invalid(
+                    "invalid panel customization".into(),
+                ));
+            }
+
+            let config: Config = ctx.parse_config().map_err(internal)?;
+            let id = generated_gallery_id("gallery-", &request.idempotency_key, 32);
+            let mut panel = super::NamedPanel::default();
+            panel.id = id.clone();
+            panel.name = Some(panel_name.to_owned());
+            panel.description = payload.description;
+            panel.button_style = payload.button_style;
+            panel.customization = customization;
+
+            if let Some(existing) = config.panels.iter().find(|existing| existing.id == id) {
+                if recovering && existing == &panel {
+                    let definition = serde_json::to_value(&panel).map_err(internal)?;
+                    return Ok(result(
+                        json!({ "kind": "panel", "id": id, "definition": definition }),
+                        0,
+                    ));
+                }
+                return Err(DashboardActionError::Conflict);
+            }
+            let definition = serde_json::to_value(&panel).map_err(internal)?;
+            Ok(result(
+                json!({ "kind": "panel", "id": id, "definition": definition }),
+                0,
+            ))
+        }
+        "form" => {
+            if input.new_id.is_some() {
+                return Err(DashboardActionError::Invalid(
+                    "form IDs are generated by the plugin".into(),
+                ));
+            }
+            let config: Config = ctx.parse_config().map_err(internal)?;
+            let id = generated_gallery_id("f-", &request.idempotency_key, 32);
+            let definition =
+                match form_library::from_gallery(&id, input.payload.clone(), &config.forms) {
+                    Ok(definition) => definition,
+                    Err("form id already exists") if recovering => {
+                        let desired = form_library::from_gallery(&id, input.payload, &[])
+                            .map_err(|error| DashboardActionError::Invalid(error.into()))?;
+                        if config.forms.iter().any(|form| form == &desired) {
+                            desired
+                        } else {
+                            return Err(DashboardActionError::Conflict);
+                        }
+                    }
+                    Err("form id already exists") => return Err(DashboardActionError::Conflict),
+                    Err(error) => return Err(DashboardActionError::Invalid(error.into())),
+                };
+            Ok(result(
+                json!({
+                    "kind": "form",
+                    "id": id,
+                    "definition": definition,
+                }),
+                0,
+            ))
+        }
+        _ => Err(DashboardActionError::Invalid(
+            "invalid gallery import kind".into(),
+        )),
+    }
+}
+
+fn panel_gallery_payload(panel: &super::NamedPanel) -> Value {
+    json!({
+        "name": panel.name,
+        "description": panel.description,
+        "button_style": panel.button_style,
+        "customization": {
+            "title": &panel.customization.title,
+            "color": &panel.customization.color,
+            "content": &panel.customization.content,
+            "welcome_title": &panel.customization.welcome_title,
+            "welcome_title_url": &panel.customization.welcome_title_url,
+            "welcome_color": &panel.customization.welcome_color,
+            "welcome_description": &panel.customization.welcome_description,
+            "welcome_author_name": &panel.customization.welcome_author_name,
+            "welcome_author_url": &panel.customization.welcome_author_url,
+            "welcome_author_icon_url": &panel.customization.welcome_author_icon_url,
+            "welcome_thumbnail_url": &panel.customization.welcome_thumbnail_url,
+            "welcome_image_url": &panel.customization.welcome_image_url,
+            "welcome_footer_text": &panel.customization.welcome_footer_text,
+            "welcome_footer_icon_url": &panel.customization.welcome_footer_icon_url,
+            "welcome_timestamp": panel.customization.welcome_timestamp,
+            "welcome_fields": &panel.customization.welcome_fields,
+        },
+    })
+}
+
+fn valid_gallery_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.trim() == name
+        && name.chars().count() <= 100
+        && !name.chars().any(char::is_control)
+}
+
+fn valid_gallery_description(description: &str) -> bool {
+    description.chars().count() <= 1000 && !description.chars().any(char::is_control)
+}
+
+fn generated_gallery_id(prefix: &str, idempotency_key: &str, max_chars: usize) -> String {
+    let suffix: String = idempotency_key
+        .bytes()
+        .take(max_chars.saturating_sub(prefix.len()))
+        .map(|byte| char::from(byte.to_ascii_lowercase()))
+        .collect();
+    format!("{prefix}{suffix}")
+}
+
+async fn tag_action(
+    ctx: &EventContext,
+    actor: &Actor,
+    request: &DashboardActionRequest,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    let can_manage = tickets_manage(ctx, actor)?;
+    if !can_manage {
+        return Err(DashboardActionError::Forbidden);
+    }
+    let start = begin_action(ctx, actor, request).await?;
+    let (key, mut receipt, revision) = match start {
+        Start::Replay(result) => return Ok(result),
+        Start::Claimed {
+            key,
+            receipt,
+            revision,
+            ..
+        } => (key, receipt, revision),
+    };
+    match tags::dashboard_action(ctx, actor, request, can_manage).await {
+        Ok(result) => complete_action(ctx, &key, &mut receipt, revision, result).await,
+        Err(error) => {
+            fail_action(ctx, &key, &mut receipt, revision).await;
+            Err(error)
+        }
+    }
+}
+
+async fn ticket_history_action(
+    ctx: &EventContext,
+    actor: &Actor,
+    request: &DashboardActionRequest,
+    channel_id: u64,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    if request.action != "ticket.history.update" {
+        return Err(DashboardActionError::Unsupported);
+    }
+    let can_manage = tickets_manage(ctx, actor)?;
+    transcript_management::state(ctx, actor, channel_id, can_manage).await?;
+    let start = begin_action(ctx, actor, request).await?;
+    let (key, mut receipt, revision) = match start {
+        Start::Replay(result) => return Ok(result),
+        Start::Claimed {
+            key,
+            receipt,
+            revision,
+            ..
+        } => (key, receipt, revision),
+    };
+    match transcript_management::update(
+        ctx,
+        actor,
+        channel_id,
+        request.expected_revision,
+        &request.data,
+        can_manage,
+    )
+    .await
+    {
+        Ok((value, revision)) => {
+            complete_action(ctx, &key, &mut receipt, revision, result(value, revision)).await
+        }
+        Err(error) => {
+            fail_action(ctx, &key, &mut receipt, revision).await;
+            Err(error)
+        }
+    }
+}
+
+async fn ticket_labels_action(
+    ctx: &EventContext,
+    actor: &Actor,
+    request: &DashboardActionRequest,
+    cursor: Option<&str>,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    if !matches!(
+        request.action.as_str(),
+        "ticket.label.create" | "ticket.label.delete"
+    ) {
+        return Err(DashboardActionError::Unsupported);
+    }
+    if cursor.is_some() {
+        return Err(DashboardActionError::Invalid(
+            "label mutations require the current registry scope".into(),
+        ));
+    }
+    if !super::is_guild_owner_or_admin(ctx, actor.user, &actor.roles)
+        .await
+        .map_err(user_error)?
+    {
+        return Err(DashboardActionError::Forbidden);
+    }
+    let start = begin_action(ctx, actor, request).await?;
+    let (key, mut receipt, revision) = match start {
+        Start::Replay(result) => return Ok(result),
+        Start::Claimed {
+            key,
+            receipt,
+            revision,
+            ..
+        } => (key, receipt, revision),
+    };
+    match transcript_management::labels_action(
+        ctx,
+        actor,
+        &request.action,
+        request.expected_revision,
+        &request.data,
+    )
+    .await
+    {
+        Ok((value, revision)) => {
+            complete_action(ctx, &key, &mut receipt, revision, result(value, revision)).await
+        }
+        Err(error) => {
+            fail_action(ctx, &key, &mut receipt, revision).await;
+            Err(error)
+        }
     }
 }
 
@@ -440,6 +1087,26 @@ async fn ticket_action(
     if request.action != "ticket.close" && !ticket.is_open() {
         return Err(DashboardActionError::Conflict);
     }
+    let reason = if matches!(
+        request.action.as_str(),
+        "ticket.close" | "ticket.request_close"
+    ) {
+        let payload: ReasonData =
+            serde_json::from_value(request.data.clone()).map_err(invalid_data)?;
+        let reason = normalized_reason(payload.reason, 1000)?;
+        if ticket
+            .panel
+            .as_ref()
+            .is_some_and(|panel| !panel.customization.close_reason_allowed(reason.as_deref()))
+        {
+            return Err(DashboardActionError::Invalid(
+                "tickets-close-reason-invalid".into(),
+            ));
+        }
+        reason
+    } else {
+        None
+    };
 
     let start = begin_action(ctx, actor, request).await?;
     let (receipt_key, mut receipt, mut receipt_revision, recovering) = match start {
@@ -477,9 +1144,6 @@ async fn ticket_action(
                 )
                 .await?
             };
-            let payload: ReasonData =
-                serde_json::from_value(request.data.clone()).map_err(invalid_data)?;
-            let reason = normalized_reason(payload.reason, 1000)?;
             let reason = reason.unwrap_or_else(|| {
                 ctx.t_in(
                     ctx.locale,
@@ -520,9 +1184,6 @@ async fn ticket_action(
             }
         }
         "ticket.request_close" => {
-            let payload: ReasonData =
-                serde_json::from_value(request.data.clone()).map_err(invalid_data)?;
-            let reason = normalized_reason(payload.reason, 1000)?;
             request_close(
                 ctx,
                 actor,
@@ -980,6 +1641,11 @@ async fn change_label(
         .any(|value| label_key(value) == normalized);
     if recovering && current_revision != request.expected_revision {
         if present == add {
+            if add {
+                transcript_management::register_label(ctx, &label)
+                    .await
+                    .map_err(internal)?;
+            }
             return complete_action(
                 ctx,
                 key,
@@ -1000,6 +1666,11 @@ async fn change_label(
         return Err(DashboardActionError::PreconditionFailed {
             current: current_revision,
         });
+    }
+    if add {
+        transcript_management::register_label(ctx, &label)
+            .await
+            .map_err(internal)?;
     }
     if present == add {
         return complete_action(
@@ -1308,9 +1979,22 @@ fn scope_identity(scope: &DashboardScope) -> String {
         DashboardScope::PanelList => "panels".into(),
         DashboardScope::Panel { panel_id } => format!("panel:{panel_id}"),
         DashboardScope::Ticket { channel_id } => format!("ticket:{channel_id}"),
+        DashboardScope::TicketHistory { channel_id } => format!("ticket-history:{channel_id}"),
+        DashboardScope::TicketLabels { cursor } => format!("ticket-labels:{cursor:?}"),
         DashboardScope::Knowledge { query, cursor } => {
             format!("knowledge:{query:?}:{cursor:?}")
         }
+        DashboardScope::Tags { query, cursor } => {
+            format!("tags:{query:?}:{cursor:?}")
+        }
+        DashboardScope::Analytics {
+            period_days,
+            cursor,
+        } => {
+            format!("analytics:{period_days}:{cursor:?}")
+        }
+        DashboardScope::IntegrationSecrets => "integration-secrets".into(),
+        DashboardScope::Gallery => "gallery".into(),
     }
 }
 
@@ -1336,6 +2020,14 @@ fn panel_visible(
     actor: &Actor,
     can_manage: bool,
 ) -> Result<bool, DashboardActionError> {
+    let actor_roles = actor
+        .roles
+        .iter()
+        .map(|role| role.get())
+        .collect::<Vec<_>>();
+    if !can_manage && !panel.customization.allows(&actor_roles, ctx.guild_id.get()) {
+        return Ok(false);
+    }
     let scoped = config.with_panel(panel);
     let roles = scoped.staff();
     let legacy_roles = roles.iter().map(|role| role.get()).collect::<Vec<_>>();
@@ -1398,7 +2090,185 @@ fn panel_summary(panel: &super::NamedPanel) -> Value {
     })
 }
 
-fn normalized_reason(
+async fn integration_secret_state(
+    ctx: &EventContext,
+    actor: &Actor,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    if !is_secret_admin(actor) {
+        return Ok(result(
+            json!({"can_manage_secrets": false, "integrations": []}),
+            0,
+        ));
+    }
+    let config: Config = ctx.parse_config().map_err(internal)?;
+    let mut state = integrations::dashboard_secret_state(ctx, &config.integrations).await?;
+    let object = state
+        .as_object_mut()
+        .ok_or_else(|| DashboardActionError::Internal("invalid integration secret state".into()))?;
+    object.insert("can_manage_secrets".into(), Value::Bool(true));
+    Ok(result(state, 0))
+}
+
+async fn integration_secret_action(
+    ctx: &EventContext,
+    actor: &Actor,
+    request: DashboardActionRequest,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    require_secret_admin(actor)?;
+    if request.expected_revision != 0 {
+        return Err(DashboardActionError::PreconditionFailed { current: 0 });
+    }
+    let DashboardActionRequest {
+        scope,
+        action,
+        data,
+        idempotency_key,
+        ..
+    } = request;
+    if !matches!(scope, DashboardScope::IntegrationSecrets) {
+        return Err(DashboardActionError::Unsupported);
+    }
+    let config: Config = ctx.parse_config().map_err(internal)?;
+    match action.as_str() {
+        "integration.secret.set" => {
+            let payload: IntegrationSecretSetData = serde_json::from_value(data)
+                .map_err(|_| DashboardActionError::Invalid("invalid secret payload".into()))?;
+            let integration = configured_integration(
+                &config,
+                &payload.integration_id,
+                &payload.generation,
+                &payload.secret_name,
+            )?;
+            if payload.value.is_empty()
+                || payload.value.chars().count() > 255
+                || payload.value.chars().any(char::is_control)
+            {
+                return Err(DashboardActionError::Invalid(
+                    "invalid integration secret".into(),
+                ));
+            }
+            ctx.set_integration_secret(
+                actor,
+                &integration.id,
+                &integration.generation,
+                &payload.secret_name,
+                SecretString::from(payload.value),
+                &idempotency_key,
+            )
+            .await
+            .map_err(integration_secret_error)?;
+            integrations::invalidate_options_cache(ctx.guild_id.get(), &integration.id);
+            Ok(result(json!({"configured": true}), 0))
+        }
+        "integration.secret.remove" => {
+            let payload: IntegrationSecretRemoveData = serde_json::from_value(data)
+                .map_err(|_| DashboardActionError::Invalid("invalid secret payload".into()))?;
+            let integration = configured_integration(
+                &config,
+                &payload.integration_id,
+                &payload.generation,
+                &payload.secret_name,
+            )?;
+            ctx.remove_integration_secret(
+                actor,
+                &integration.id,
+                &integration.generation,
+                &payload.secret_name,
+                &idempotency_key,
+            )
+            .await
+            .map_err(integration_secret_error)?;
+            integrations::invalidate_options_cache(ctx.guild_id.get(), &integration.id);
+            Ok(result(json!({"configured": false}), 0))
+        }
+        _ => Err(DashboardActionError::Unsupported),
+    }
+}
+
+fn configured_integration<'a>(
+    config: &'a Config,
+    integration_id: &str,
+    generation: &str,
+    secret_name: &str,
+) -> Result<&'a super::integrations::Integration, DashboardActionError> {
+    let mut matches = config
+        .integrations
+        .iter()
+        .filter(|integration| integration.id == integration_id);
+    let integration = matches.next().ok_or(DashboardActionError::NotFound)?;
+    if matches.next().is_some() {
+        return Err(DashboardActionError::Internal(
+            "duplicate integration ID".into(),
+        ));
+    }
+    if !valid_integration_generation(&integration.generation)
+        || integration.generation != generation
+    {
+        return Err(DashboardActionError::Conflict);
+    }
+    if !valid_integration_secret_name(secret_name)
+        || !integration.secrets.iter().any(|name| name == secret_name)
+    {
+        return Err(DashboardActionError::Invalid(
+            "invalid integration secret name".into(),
+        ));
+    }
+    Ok(integration)
+}
+
+fn is_secret_admin(actor: &Actor) -> bool {
+    actor.owner || actor.administrator
+}
+
+fn valid_integration_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.as_bytes()[0].is_ascii_lowercase()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+        && !matches!(
+            name,
+            "token" | "guild_id" | "user_id" | "ticket_id" | "ticket_channel_id"
+        )
+}
+
+fn require_secret_admin(actor: &Actor) -> Result<(), DashboardActionError> {
+    if is_secret_admin(actor) {
+        Ok(())
+    } else {
+        Err(DashboardActionError::Forbidden)
+    }
+}
+
+fn valid_integration_generation(generation: &str) -> bool {
+    generation.len() == 32
+        && generation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn integration_secret_error(error: IntegrationSecretError) -> DashboardActionError {
+    match error {
+        IntegrationSecretError::PermissionDenied => DashboardActionError::Forbidden,
+        IntegrationSecretError::InvalidIdempotencyKey => {
+            DashboardActionError::Invalid("invalid Idempotency-Key".into())
+        }
+        IntegrationSecretError::IdempotencyConflict => DashboardActionError::Conflict,
+        IntegrationSecretError::InvalidScope | IntegrationSecretError::GenerationRetired => {
+            DashboardActionError::Conflict
+        }
+        IntegrationSecretError::InvalidSecret => {
+            DashboardActionError::Invalid("invalid integration secret".into())
+        }
+        IntegrationSecretError::Unavailable
+        | IntegrationSecretError::Storage
+        | IntegrationSecretError::Authentication
+        | IntegrationSecretError::InvalidMasterKey => DashboardActionError::Unavailable,
+    }
+}
+
+pub(super) fn normalized_reason(
     reason: Option<String>,
     max_chars: usize,
 ) -> Result<Option<String>, DashboardActionError> {
@@ -1422,10 +2292,10 @@ fn invalid_data(error: impl Display) -> DashboardActionError {
     DashboardActionError::Invalid(error.to_string())
 }
 
-fn user_error(error: super::UserError) -> DashboardActionError {
+pub(super) fn user_error(error: super::UserError) -> DashboardActionError {
     DashboardActionError::Internal(format!("{error:?}"))
 }
 
-fn internal(error: impl Display) -> DashboardActionError {
+pub(super) fn internal(error: impl Display) -> DashboardActionError {
     DashboardActionError::Internal(error.to_string())
 }

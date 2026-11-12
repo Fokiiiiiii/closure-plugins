@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod net;
+pub mod safe_fetch;
 pub mod translate;
 
 use twilight_model::channel::message::Embed;

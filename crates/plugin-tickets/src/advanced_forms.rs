@@ -1,4 +1,8 @@
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
+
+use crate::integrations::{self, DynamicOptions, Integration};
 
 use closure_core::action::{Action, MentionPolicy, ModalComponent, ModalOption};
 use closure_core::error::ModuleError;
@@ -51,7 +55,10 @@ pub(crate) enum FormQuestionKind {
         description: Option<String>,
         #[serde(default = "default_form_required")]
         required: bool,
+        #[serde(default)]
         options: Vec<FormOption>,
+        #[serde(default)]
+        dynamic_options: Option<DynamicOptions>,
         #[serde(default)]
         min_values: Option<u8>,
         #[serde(default)]
@@ -218,6 +225,7 @@ pub(crate) fn form_questions_schema() -> serde_json::Value {
                             "maxLength": 100,
                             "description": "config-tickets-question-description"
                         },
+                        "dynamic_options": integrations::dynamic_options_schema(),
                         "options": {
                             "type": "array",
                             "maxItems": 25,
@@ -268,6 +276,102 @@ pub(crate) fn form_questions_schema() -> serde_json::Value {
 
 pub(crate) fn valid_questions(questions: &[FormQuestion]) -> bool {
     questions.len() <= MAX_FORM_QUESTIONS && questions.iter().all(FormQuestion::is_valid)
+}
+
+pub(crate) async fn resolve_form_questions(
+    ctx: &EventContext,
+    questions: &[FormQuestion],
+    integrations: &[Integration],
+    guild_id: u64,
+) -> Result<Vec<FormQuestion>, UserError> {
+    resolve_form_questions_with_timeout(
+        ctx,
+        questions,
+        integrations,
+        guild_id,
+        Duration::from_secs(2),
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_form_questions_fresh(
+    ctx: &EventContext,
+    questions: &[FormQuestion],
+    integrations: &[Integration],
+    guild_id: u64,
+) -> Result<Vec<FormQuestion>, UserError> {
+    resolve_form_questions_with_timeout(
+        ctx,
+        questions,
+        integrations,
+        guild_id,
+        Duration::from_secs(5),
+        true,
+    )
+    .await
+}
+
+async fn resolve_form_questions_with_timeout(
+    ctx: &EventContext,
+    questions: &[FormQuestion],
+    integrations: &[Integration],
+    guild_id: u64,
+    timeout: Duration,
+    fresh: bool,
+) -> Result<Vec<FormQuestion>, UserError> {
+    if !valid_questions(questions) {
+        return Err(UserError::message("tickets-form-invalid"));
+    }
+    let mut resolved = questions.to_vec();
+    for question in &mut resolved {
+        if let FormQuestion::Structured(FormQuestionKind::StringSelect {
+            options,
+            dynamic_options: Some(source),
+            ..
+        }) = question
+        {
+            if !options.is_empty() {
+                return Err(UserError::message("tickets-form-invalid"));
+            }
+            let fetched = if fresh {
+                integrations::fetch_options_fresh_with_timeout(
+                    ctx,
+                    integrations,
+                    guild_id,
+                    source,
+                    timeout,
+                )
+                .await
+            } else {
+                integrations::fetch_options_with_timeout(
+                    ctx,
+                    integrations,
+                    guild_id,
+                    source,
+                    timeout,
+                )
+                .await
+            };
+            *options = fetched.map_err(|error| match error {
+                integrations::OptionsError::TooManyOptions => {
+                    UserError::message("tickets-form-options-too-many")
+                }
+                _ => UserError::message("tickets-form-options-unavailable"),
+            })?;
+        }
+    }
+    if !valid_questions(&resolved) {
+        return Err(UserError::message("tickets-form-invalid"));
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn form_modal_revision(base_revision: u64, questions: &[FormQuestion]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base_revision.hash(&mut hasher);
+    questions.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl FormQuestion {
@@ -330,17 +434,23 @@ impl FormQuestion {
                 description,
                 required,
                 options,
+                dynamic_options,
                 min_values,
                 max_values,
             }) => {
+                let dynamic = dynamic_options.is_some();
                 valid_label(label)
                     && valid_description(description.as_deref())
-                    && valid_options(options, 1, 25)
+                    && (if dynamic {
+                        options.is_empty() || valid_options(options, 1, 25)
+                    } else {
+                        valid_options(options, 1, 25)
+                    })
                     && valid_value_range(
                         *required,
                         *min_values,
                         *max_values,
-                        options.len(),
+                        if dynamic { 25 } else { options.len() },
                         false,
                         options,
                     )
@@ -458,6 +568,7 @@ impl FormQuestion {
                 options,
                 min_values,
                 max_values,
+                ..
             }) => {
                 let (min, max) =
                     value_range(*required, *min_values, *max_values, options.len(), false);

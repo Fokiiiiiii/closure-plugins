@@ -128,6 +128,90 @@ async fn release_data_operation(
 
 const HISTORY_SPAN_PREFIX: &str = "ticket-history-span:";
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichMessage {
+    pub(super) author_name: String,
+    pub(super) created_at: Option<String>,
+    pub(super) attachments: Vec<TranscriptRichAttachment>,
+    pub(super) embeds: Vec<TranscriptRichEmbed>,
+    pub(super) components: Vec<TranscriptRichComponent>,
+    pub(super) mentions: Vec<TranscriptRichMention>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichAttachment {
+    pub(super) url: String,
+    pub(super) filename: String,
+    pub(super) content_type: Option<String>,
+    pub(super) size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichEmbed {
+    pub(super) title: Option<String>,
+    pub(super) description: Option<String>,
+    pub(super) url: Option<String>,
+    pub(super) color: Option<u32>,
+    pub(super) fields: Vec<TranscriptRichEmbedField>,
+    pub(super) author: Option<TranscriptRichEmbedAuthor>,
+    pub(super) footer: Option<TranscriptRichEmbedFooter>,
+    pub(super) image_url: Option<String>,
+    pub(super) thumbnail_url: Option<String>,
+    pub(super) timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichEmbedField {
+    pub(super) name: String,
+    pub(super) value: String,
+    pub(super) inline: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichEmbedAuthor {
+    pub(super) name: String,
+    pub(super) url: Option<String>,
+    pub(super) icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichEmbedFooter {
+    pub(super) text: String,
+    pub(super) icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichComponent {
+    pub(super) kind: String,
+    pub(super) label: Option<String>,
+    pub(super) style: Option<String>,
+    pub(super) url: Option<String>,
+    pub(super) disabled: bool,
+    pub(super) placeholder: Option<String>,
+    pub(super) options: Vec<TranscriptRichComponentOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichComponentOption {
+    pub(super) label: String,
+    pub(super) description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct TranscriptRichMention {
+    pub(super) kind: String,
+    pub(super) id: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) enum TranscriptSpanPart {
     Message { message_id: u64, author_id: u64 },
@@ -140,6 +224,8 @@ pub(super) struct TranscriptSpan {
     pub(super) start: u32,
     pub(super) end: u32,
     pub(super) part: TranscriptSpanPart,
+    #[serde(default)]
+    pub(super) rich: Option<TranscriptRichMessage>,
 }
 
 #[derive(Debug)]
@@ -147,6 +233,7 @@ pub(super) struct TranscriptSpanRange {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) part: TranscriptSpanPart,
+    pub(super) rich: Option<TranscriptRichMessage>,
 }
 
 #[derive(Debug)]
@@ -206,6 +293,27 @@ async fn ticket_messages(
     Ok((messages, cut))
 }
 
+fn message_quote_for_post<'a>(
+    ticket: &'a Ticket,
+    posted_message_id: u64,
+    guild_id: u64,
+) -> Option<&'a message_ticket::MessageQuote> {
+    ticket.message_quote.as_ref().filter(|quote| {
+        ticket.message_quote_message_id == Some(posted_message_id) && quote.guild_id == guild_id
+    })
+}
+
+fn ticket_quote_for_user<'a>(
+    ticket: &'a Ticket,
+    user: UserId,
+    guild_id: u64,
+) -> Option<&'a message_ticket::MessageQuote> {
+    ticket
+        .message_quote
+        .as_ref()
+        .filter(|quote| quote.guild_id == guild_id && quote.author_id == user.get())
+}
+
 pub(super) async fn capture_transcript(
     ctx: &EventContext,
     channel: ChannelId,
@@ -232,6 +340,7 @@ pub(super) async fn capture_transcript(
         part: TranscriptSpanPart::Opener {
             user_id: ticket.opener,
         },
+        rich: None,
     });
     if cut {
         text.push_str(&ctx.t_in(
@@ -242,20 +351,50 @@ pub(super) async fn capture_transcript(
         text.push('\n');
     }
     for message in &messages {
-        let attached = message
-            .attachments
-            .iter()
-            .map(|file| file.url.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let quote = message_quote_for_post(ticket, message.id.get(), ctx.guild_id.get());
+        let (source_message_id, author_id, author_name, content, attached) =
+            if let Some(quote) = quote {
+                (
+                    quote.message_id,
+                    quote.author_id,
+                    quote.author_name.as_str(),
+                    quote.content.as_str(),
+                    quote
+                        .attachments
+                        .iter()
+                        .map(|file| file.url.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            } else {
+                (
+                    message.id.get(),
+                    message.author.id.get(),
+                    message.author.name.as_str(),
+                    message.content.as_str(),
+                    message
+                        .attachments
+                        .iter()
+                        .map(|file| file.url.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            };
         let start = text.len();
         let _ = write!(
             text,
             "[{}] {} ({}): {} {attached}",
-            made_at(message.id.get()),
-            message.author.name,
-            message.author.id,
-            message.content.replace('\n', " ")
+            made_at(source_message_id),
+            author_name.replace(['\n', '\r'], " "),
+            author_id,
+            content.replace(['\n', '\r'], " ")
+        );
+        let rich = transcript_rich_message(
+            message,
+            author_name,
+            source_message_id,
+            content,
+            quote.map(|quote| quote.attachments.as_slice()),
         );
         let end = text.len();
         text.push('\n');
@@ -263,9 +402,10 @@ pub(super) async fn capture_transcript(
             start,
             end,
             part: TranscriptSpanPart::Message {
-                message_id: message.id.get(),
-                author_id: message.author.id.get(),
+                message_id: source_message_id,
+                author_id,
             },
+            rich,
         });
     }
     Ok(TranscriptArchive {
@@ -274,6 +414,418 @@ pub(super) async fn capture_transcript(
         messages,
         spans,
     })
+}
+
+fn transcript_rich_message(
+    message: &twilight_model::channel::Message,
+    author_name: &str,
+    source_message_id: u64,
+    source_content: &str,
+    quoted_attachments: Option<&[message_ticket::MessageQuoteAttachment]>,
+) -> Option<TranscriptRichMessage> {
+    let raw = serde_json::to_value(message).ok()?;
+    let attachments = if let Some(quoted_attachments) = quoted_attachments {
+        quoted_attachments
+            .iter()
+            .map(|attachment| TranscriptRichAttachment {
+                url: attachment.url.clone(),
+                filename: attachment.filename.clone(),
+                content_type: None,
+                size: None,
+            })
+            .collect()
+    } else {
+        raw.get("attachments")
+            .and_then(serde_json::Value::as_array)
+            .map(|attachments| {
+                attachments
+                    .iter()
+                    .filter_map(transcript_rich_attachment)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let embeds = raw
+        .get("embeds")
+        .and_then(serde_json::Value::as_array)
+        .map(|embeds| embeds.iter().filter_map(transcript_rich_embed).collect())
+        .unwrap_or_default();
+    let components = raw
+        .get("components")
+        .map(transcript_rich_components)
+        .unwrap_or_default();
+    let mentions =
+        transcript_rich_mentions(&raw, source_content, &author_name, &embeds, &components);
+    if attachments.is_empty() && embeds.is_empty() && components.is_empty() && mentions.is_empty() {
+        return None;
+    }
+    Some(TranscriptRichMessage {
+        author_name: author_name.replace(['\n', '\r'], " "),
+        created_at: Some(made_at(source_message_id)),
+        attachments,
+        embeds,
+        components,
+        mentions,
+    })
+}
+
+fn transcript_rich_attachment(value: &serde_json::Value) -> Option<TranscriptRichAttachment> {
+    let object = value.as_object()?;
+    Some(TranscriptRichAttachment {
+        url: object.get("url")?.as_str()?.to_owned(),
+        filename: object.get("filename")?.as_str()?.to_owned(),
+        content_type: object
+            .get("content_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        size: object.get("size").and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn transcript_rich_embed(value: &serde_json::Value) -> Option<TranscriptRichEmbed> {
+    let object = value.as_object()?;
+    let fields = object
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(transcript_rich_embed_field)
+                .collect()
+        })
+        .unwrap_or_default();
+    let author = object
+        .get("author")
+        .and_then(serde_json::Value::as_object)
+        .map(|author| TranscriptRichEmbedAuthor {
+            name: author
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            url: author
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            icon_url: author
+                .get("icon_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        });
+    let footer = object
+        .get("footer")
+        .and_then(serde_json::Value::as_object)
+        .map(|footer| TranscriptRichEmbedFooter {
+            text: footer
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            icon_url: footer
+                .get("icon_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        });
+    Some(TranscriptRichEmbed {
+        title: object
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        description: object
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        url: object
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        color: object
+            .get("color")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|color| u32::try_from(color).ok()),
+        fields,
+        author,
+        footer,
+        image_url: object
+            .get("image")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|image| image.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        thumbnail_url: object
+            .get("thumbnail")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|thumbnail| thumbnail.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        timestamp: object
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn transcript_rich_embed_field(value: &serde_json::Value) -> Option<TranscriptRichEmbedField> {
+    let object = value.as_object()?;
+    Some(TranscriptRichEmbedField {
+        name: object.get("name")?.as_str()?.to_owned(),
+        value: object.get("value")?.as_str()?.to_owned(),
+        inline: object
+            .get("inline")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn transcript_rich_components(value: &serde_json::Value) -> Vec<TranscriptRichComponent> {
+    let mut components = Vec::new();
+    append_transcript_rich_components(value, &mut components);
+    components
+}
+
+fn append_transcript_rich_components(
+    value: &serde_json::Value,
+    components: &mut Vec<TranscriptRichComponent>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                append_transcript_rich_components(value, components);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let kind = object
+                .get("type")
+                .or_else(|| object.get("component_type"))
+                .map(transcript_component_kind)
+                .unwrap_or_default();
+            let options = object
+                .get("options")
+                .and_then(serde_json::Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| {
+                            let option = option.as_object()?;
+                            Some(TranscriptRichComponentOption {
+                                label: option.get("label")?.as_str()?.to_owned(),
+                                description: option
+                                    .get("description")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !kind.is_empty() && kind != "action_row" {
+                components.push(TranscriptRichComponent {
+                    kind,
+                    label: object
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    style: object.get("style").and_then(transcript_component_value),
+                    url: object
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    disabled: object
+                        .get("disabled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    placeholder: object
+                        .get("placeholder")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    options,
+                });
+            }
+            if let Some(children) = object.get("components") {
+                append_transcript_rich_components(children, components);
+            }
+            if let Some(accessory) = object.get("accessory") {
+                append_transcript_rich_components(accessory, components);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn transcript_component_kind(value: &serde_json::Value) -> String {
+    match transcript_component_value(value).as_deref() {
+        Some("1") => "action_row".to_owned(),
+        Some("2") => "button".to_owned(),
+        Some("3") => "string_select".to_owned(),
+        Some("4") => "text_input".to_owned(),
+        Some("5") => "user_select".to_owned(),
+        Some("6") => "role_select".to_owned(),
+        Some("7") => "mentionable_select".to_owned(),
+        Some("8") => "channel_select".to_owned(),
+        Some("9") => "section".to_owned(),
+        Some("10") => "text_display".to_owned(),
+        Some("11") => "thumbnail".to_owned(),
+        Some("12") => "media_gallery".to_owned(),
+        Some("13") => "file".to_owned(),
+        Some("14") => "separator".to_owned(),
+        Some("17") => "container".to_owned(),
+        Some(kind) => kind.to_owned(),
+        None => String::new(),
+    }
+}
+
+fn transcript_component_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+}
+
+fn transcript_rich_mentions(
+    message: &serde_json::Value,
+    content: &str,
+    author_name: &str,
+    embeds: &[TranscriptRichEmbed],
+    components: &[TranscriptRichComponent],
+) -> Vec<TranscriptRichMention> {
+    let mut mentions = BTreeSet::new();
+    for (key, kind) in [
+        ("mentions", "user"),
+        ("mention_roles", "role"),
+        ("mention_channels", "channel"),
+    ] {
+        if let Some(values) = message.get(key).and_then(serde_json::Value::as_array) {
+            for value in values {
+                let id = value
+                    .get("id")
+                    .and_then(transcript_id_value)
+                    .or_else(|| transcript_id_value(value));
+                if let Some(id) = id.filter(|id| *id != 0) {
+                    mentions.insert((kind.to_owned(), id));
+                }
+            }
+        }
+    }
+    collect_transcript_text_mentions(content, &mut mentions);
+    collect_transcript_text_mentions(author_name, &mut mentions);
+    for embed in embeds {
+        for text in [
+            embed.title.as_deref(),
+            embed.description.as_deref(),
+            embed.url.as_deref(),
+            embed.author.as_ref().map(|author| author.name.as_str()),
+            embed
+                .author
+                .as_ref()
+                .and_then(|author| author.url.as_deref()),
+            embed
+                .author
+                .as_ref()
+                .and_then(|author| author.icon_url.as_deref()),
+            embed.footer.as_ref().map(|footer| footer.text.as_str()),
+            embed
+                .footer
+                .as_ref()
+                .and_then(|footer| footer.icon_url.as_deref()),
+            embed.image_url.as_deref(),
+            embed.thumbnail_url.as_deref(),
+            embed.timestamp.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            collect_transcript_text_mentions(text, &mut mentions);
+        }
+        for field in &embed.fields {
+            collect_transcript_text_mentions(&field.name, &mut mentions);
+            collect_transcript_text_mentions(&field.value, &mut mentions);
+        }
+    }
+    for component in components {
+        for text in [
+            component.label.as_deref(),
+            component.style.as_deref(),
+            component.url.as_deref(),
+            component.placeholder.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            collect_transcript_text_mentions(text, &mut mentions);
+        }
+        for option in &component.options {
+            collect_transcript_text_mentions(&option.label, &mut mentions);
+            if let Some(description) = option.description.as_deref() {
+                collect_transcript_text_mentions(description, &mut mentions);
+            }
+        }
+    }
+    mentions
+        .into_iter()
+        .map(|(kind, id)| TranscriptRichMention { kind, id })
+        .collect()
+}
+
+fn transcript_id_value(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|id| id.parse().ok()))
+}
+
+fn collect_transcript_text_mentions(content: &str, mentions: &mut BTreeSet<(String, u64)>) {
+    let bytes = content.as_bytes();
+    let mut cursor = 0;
+    while cursor + 2 < bytes.len() {
+        if bytes[cursor] != b'<' {
+            cursor += 1;
+            continue;
+        }
+        let (kind, mut start) = match bytes[cursor + 1] {
+            b'@' => {
+                let mut start = cursor + 2;
+                let kind = match bytes.get(start) {
+                    Some(b'&') => {
+                        start += 1;
+                        "role"
+                    }
+                    Some(b'!') => {
+                        start += 1;
+                        "user"
+                    }
+                    _ => "user",
+                };
+                (kind, start)
+            }
+            b'#' => ("channel", cursor + 2),
+            _ => {
+                cursor += 1;
+                continue;
+            }
+        };
+        let mut end = start;
+        let mut id = 0_u64;
+        let mut valid = true;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            let byte = bytes[end];
+            id = match id
+                .checked_mul(10)
+                .and_then(|id| id.checked_add(u64::from(byte - b'0')))
+            {
+                Some(id) => id,
+                None => {
+                    valid = false;
+                    break;
+                }
+            };
+            end += 1;
+        }
+        if valid && end > start && bytes.get(end) == Some(&b'>') && id != 0 {
+            mentions.insert((kind.to_owned(), id));
+            cursor = end + 1;
+        } else {
+            cursor += 1;
+        }
+    }
 }
 
 pub(super) fn append_form_answers(
@@ -304,6 +856,7 @@ pub(super) fn append_form_answers(
         start,
         end,
         part: TranscriptSpanPart::FormAnswers { user_id: opener },
+        rich: None,
     });
 }
 
@@ -333,13 +886,25 @@ pub(super) async fn write_history_span_pages(
                 end: u32::try_from(text[*page_start..end].chars().count())
                     .map_err(|error| ModuleError::other(error.to_string()))?,
                 part: span.part.clone(),
+                rich: if start == span.start {
+                    span.rich.clone()
+                } else {
+                    None
+                },
             });
         }
         let serialized = serde_json::to_vec(&page_spans)
             .map_err(|error| ModuleError::other(error.to_string()))?;
         if serialized.len() > HISTORY_VALUE_BYTES {
-            remove_history_span_pages(ctx, channel.get(), attempt, page_count).await;
-            return Err(ModuleError::other("ticket transcript spans are too large"));
+            for span in &mut page_spans {
+                span.rich = None;
+            }
+            let spans_without_rich = serde_json::to_vec(&page_spans)
+                .map_err(|error| ModuleError::other(error.to_string()))?;
+            if spans_without_rich.len() > HISTORY_VALUE_BYTES {
+                remove_history_span_pages(ctx, channel.get(), attempt, page_count).await;
+                return Err(ModuleError::other("ticket transcript spans are too large"));
+            }
         }
         if let Err(error) = ctx
             .store()
@@ -430,6 +995,8 @@ struct ExportStats {
     closed_retained_messages: usize,
     private_note_pages_not_exported: usize,
     private_note_scan_incomplete: usize,
+    knowledge_suggestion_states_not_exported: usize,
+    suggestion_tickets_seen: BTreeSet<(u64, i64)>,
     note_channels_seen: BTreeSet<u64>,
     malformed_records: usize,
     own_messages: usize,
@@ -437,19 +1004,20 @@ struct ExportStats {
 
 impl ExportStats {
     fn complete(&self) -> bool {
-    self.legacy_histories == 0
-        && self.log_copies == 0
-        && self.staff_reasons_omitted == 0
-        && self.active_read_errors == 0
-        && self.active_truncated_tickets == 0
-        && self.truncated_histories == 0
-        && self.pending_histories == 0
-        && self.closed_retained_tickets == 0
-        && self.closed_retained_messages == 0
-        && self.private_note_pages_not_exported == 0
-        && self.private_note_scan_incomplete == 0
-        && self.malformed_records == 0
-}
+        self.legacy_histories == 0
+            && self.log_copies == 0
+            && self.staff_reasons_omitted == 0
+            && self.active_read_errors == 0
+            && self.active_truncated_tickets == 0
+            && self.truncated_histories == 0
+            && self.pending_histories == 0
+            && self.closed_retained_tickets == 0
+            && self.closed_retained_messages == 0
+            && self.private_note_pages_not_exported == 0
+            && self.private_note_scan_incomplete == 0
+            && self.knowledge_suggestion_states_not_exported == 0
+            && self.malformed_records == 0
+    }
 }
 
 struct ExportFiles {
@@ -658,7 +1226,9 @@ pub(super) async fn export_my_data(cx: CommandCx, _args: ExportMyData) -> Result
                 "unreadable_records": stats.malformed_records,
                 "own_messages_exported": stats.own_messages,
                     "private_note_pages_not_exported": stats.private_note_pages_not_exported,
-                "private_note_scan_incomplete": stats.private_note_scan_incomplete
+                "private_note_scan_incomplete": stats.private_note_scan_incomplete,
+                "knowledge_suggestion_states_not_exported":
+                    stats.knowledge_suggestion_states_not_exported
                 }),
             )
             .await
@@ -733,6 +1303,174 @@ async fn record_export_notes(
     Ok(())
 }
 
+async fn export_ticket_suggestion_state(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket_number: i64,
+    ticket_state: &str,
+    files: &mut ExportFiles,
+    stats: &mut ExportStats,
+) -> Result<(), ModuleError> {
+    if !stats
+        .suggestion_tickets_seen
+        .insert((channel.get(), ticket_number))
+    {
+        return Ok(());
+    }
+    files.renew(ctx).await?;
+    let key = format!("ticket-knowledge-suggestion:{}", channel.get());
+    let Some(entry) = ctx
+        .store()
+        .entry(&key)
+        .await
+        .map_err(|error| stored(&error))?
+    else {
+        return Ok(());
+    };
+    let Some(state) = entry.value.as_object() else {
+        stats.knowledge_suggestion_states_not_exported += 1;
+        return Ok(());
+    };
+    let (Some(guild_id), Some(channel_id), Some(stored_ticket_number)) = (
+        state.get("guild_id").and_then(serde_json::Value::as_u64),
+        state.get("channel_id").and_then(serde_json::Value::as_u64),
+        state
+            .get("ticket_number")
+            .and_then(serde_json::Value::as_i64),
+    ) else {
+        stats.knowledge_suggestion_states_not_exported += 1;
+        return Ok(());
+    };
+    if guild_id != ctx.guild_id.get()
+        || channel_id != channel.get()
+        || stored_ticket_number != ticket_number
+    {
+        return Ok(());
+    }
+    let (
+        Some(terms),
+        Some(candidates),
+        Some(expires_at),
+        Some(complete),
+        Some(notified),
+        Some(cancelled),
+    ) = (
+        state.get("terms").and_then(serde_json::Value::as_array),
+        state
+            .get("candidates")
+            .and_then(serde_json::Value::as_array),
+        state.get("expires_at").and_then(serde_json::Value::as_i64),
+        state.get("complete").and_then(serde_json::Value::as_bool),
+        state.get("notified").and_then(serde_json::Value::as_bool),
+        state.get("cancelled").and_then(serde_json::Value::as_bool),
+    )
+    else {
+        stats.knowledge_suggestion_states_not_exported += 1;
+        return Ok(());
+    };
+    let Some(terms) = terms
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<Vec<_>>>()
+    else {
+        stats.knowledge_suggestion_states_not_exported += 1;
+        return Ok(());
+    };
+    let mut candidate_rows = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Some(candidate) = candidate.as_object() else {
+            stats.knowledge_suggestion_states_not_exported += 1;
+            return Ok(());
+        };
+        let (Some(id), Some(score)) = (
+            candidate.get("id").and_then(serde_json::Value::as_str),
+            candidate.get("score").and_then(serde_json::Value::as_u64),
+        ) else {
+            stats.knowledge_suggestion_states_not_exported += 1;
+            return Ok(());
+        };
+        candidate_rows.push(serde_json::json!({ "id": id, "score": score }));
+    }
+    if terms.is_empty() && candidate_rows.is_empty() {
+        return Ok(());
+    }
+    files
+        .add(
+            ctx,
+            serde_json::json!({
+                "kind": "knowledge_suggestion_state",
+                "state": ticket_state,
+                "ticket_number": ticket_number,
+                "query_terms": terms,
+                "candidates": candidate_rows,
+                "expires_at": expires_at,
+                "complete": complete,
+                "notified": notified,
+                "cancelled": cancelled
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn cancel_owner_ticket_suggestions(
+    ctx: &EventContext,
+    channel: ChannelId,
+    ticket_number: i64,
+) -> Result<(), ModuleError> {
+    let key = format!("ticket-knowledge-suggestion:{}", channel.get());
+    for _ in 0..5 {
+        knowledge::cancel_ticket_suggestions(ctx, channel, ticket_number).await?;
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
+            return Ok(());
+        };
+        let Some(state) = entry.value.as_object() else {
+            return Err(ModuleError::other(
+                "ticket knowledge suggestion state is invalid",
+            ));
+        };
+        let (Some(guild_id), Some(channel_id), Some(stored_ticket_number)) = (
+            state.get("guild_id").and_then(serde_json::Value::as_u64),
+            state.get("channel_id").and_then(serde_json::Value::as_u64),
+            state
+                .get("ticket_number")
+                .and_then(serde_json::Value::as_i64),
+        ) else {
+            return Err(ModuleError::other(
+                "ticket knowledge suggestion state is invalid",
+            ));
+        };
+        if guild_id != ctx.guild_id.get()
+            || channel_id != channel.get()
+            || stored_ticket_number != ticket_number
+        {
+            return Ok(());
+        }
+        let terms_empty = state
+            .get("terms")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        let candidates_empty = state
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        let cancelled = state
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if terms_empty && candidates_empty && cancelled {
+            return Ok(());
+        }
+    }
+    Err(ModuleError::other(
+        "ticket knowledge suggestion terms could not be cleared",
+    ))
+}
 
 async fn record_erase_notes(
     ctx: &EventContext,
@@ -793,15 +1531,62 @@ async fn export_open_tickets(
             let closed_retained = ticket.closed;
             let owns_ticket = ticket.opener == user.get();
             let assigned_to_user = ticket.claimed_by == Some(user.get());
+            let ticket_state = if closed_retained {
+                "closed_retained"
+            } else {
+                "open"
+            };
+            if owns_ticket {
+                export_ticket_suggestion_state(
+                    ctx,
+                    ChannelId::new(channel),
+                    ticket.number,
+                    ticket_state,
+                    files,
+                    stats,
+                )
+                .await?;
+            }
             let (messages, truncated) = match ticket_messages(ctx, ChannelId::new(channel)).await {
                 Ok(messages) => messages,
                 Err(error) => {
                     tracing::warn!(?error, channel, "could not read a ticket for export");
                     stats.active_read_errors += 1;
-                    if closed_retained && (owns_ticket || assigned_to_user) {
+                    let quote = ticket_quote_for_user(&ticket, user, ctx.guild_id.get());
+                    let quote_owned = quote.is_some();
+                    if closed_retained && (owns_ticket || assigned_to_user || quote_owned) {
                         stats.closed_retained_tickets += 1;
                     }
-                    if owns_ticket || assigned_to_user {
+                    if let Some(quote) = quote {
+                        stats.own_messages += 1;
+                        if closed_retained {
+                            stats.closed_retained_messages += 1;
+                        }
+                        let state = if closed_retained {
+                            "closed_retained"
+                        } else {
+                            "open"
+                        };
+                        files
+                            .add(
+                                ctx,
+                                serde_json::json!({
+                                    "kind": "message",
+                                    "state": state,
+                                    "ticket_number": owns_ticket.then_some(ticket.number),
+                                    "created_at": made_at(quote.message_id),
+                                    "content": quote.content,
+                                    "attachments": quote.attachments.iter().map(|attachment| {
+                                        serde_json::json!({
+                                            "filename": attachment.filename,
+                                            "url": attachment.url
+                                        })
+                                    }).collect::<Vec<_>>()
+                                }),
+                            )
+                            .await?;
+                    }
+                    if owns_ticket || assigned_to_user || quote_owned {
                         record_export_notes(ctx, ChannelId::new(channel), stats).await?;
                     }
                     continue;
@@ -866,7 +1651,9 @@ async fn export_open_tickets(
             }
             let mut own_message_count = 0;
             for message in messages {
-                if message.author.id != user {
+                if message_quote_for_post(&ticket, message.id.get(), ctx.guild_id.get()).is_some()
+                    || message.author.id != user
+                {
                     continue;
                 }
                 own_message_count += 1;
@@ -884,6 +1671,31 @@ async fn export_open_tickets(
                             "created_at": made_at(message.id.get()),
                             "content": message.content,
                             "attachments": message.attachments.iter().map(|attachment| {
+                                serde_json::json!({
+                                    "filename": attachment.filename,
+                                    "url": attachment.url
+                                })
+                            }).collect::<Vec<_>>()
+                        }),
+                    )
+                    .await?;
+            }
+            if let Some(quote) = ticket_quote_for_user(&ticket, user, ctx.guild_id.get()) {
+                own_message_count += 1;
+                stats.own_messages += 1;
+                if closed_retained {
+                    stats.closed_retained_messages += 1;
+                }
+                files
+                    .add(
+                        ctx,
+                        serde_json::json!({
+                            "kind": "message",
+                            "state": state,
+                            "ticket_number": owns_ticket.then_some(ticket.number),
+                            "created_at": made_at(quote.message_id),
+                            "content": quote.content,
+                            "attachments": quote.attachments.iter().map(|attachment| {
                                 serde_json::json!({
                                     "filename": attachment.filename,
                                     "url": attachment.url
@@ -942,9 +1754,21 @@ async fn export_closed_histories(
             }
             if history.status != HistoryStatus::Closed {
                 stats.pending_histories += 1;
-                let related_by_role = (!history.opener_erased && history.opener == user.get())
+                let owns_ticket = !history.opener_erased && history.opener == user.get();
+                let related_by_role = owns_ticket
                     || history.claimed_by == Some(user.get())
                     || history.closer == Some(user.get());
+                if owns_ticket {
+                    export_ticket_suggestion_state(
+                        ctx,
+                        ChannelId::new(history.channel_id),
+                        history.number,
+                        "pending",
+                        files,
+                        stats,
+                    )
+                    .await?;
+                }
                 if related_by_role {
                     record_export_notes(ctx, ChannelId::new(history.channel_id), stats).await?;
                 }
@@ -961,6 +1785,15 @@ async fn export_closed_histories(
             let mut roles = Vec::new();
             let owns_ticket = !history.opener_erased && history.opener == user.get();
             if owns_ticket {
+                export_ticket_suggestion_state(
+                    ctx,
+                    ChannelId::new(history.channel_id),
+                    history.number,
+                    "closed",
+                    files,
+                    stats,
+                )
+                .await?;
                 roles.push("opener");
             }
             if history.claimed_by == Some(user.get()) {
@@ -1002,12 +1835,7 @@ async fn export_closed_histories(
             }
             if legacy {
                 if !roles.is_empty() {
-                    record_export_notes(
-                        ctx,
-                        ChannelId::new(history.channel_id),
-                        stats,
-                    )
-                    .await?;
+                    record_export_notes(ctx, ChannelId::new(history.channel_id), stats).await?;
                 }
                 continue;
             }
@@ -1023,13 +1851,12 @@ async fn export_closed_histories(
                     continue;
                 }
             };
-            let related = !roles.is_empty()
-                || !own.messages.is_empty()
-                || own.form_answers_text.is_some();
+            let related =
+                !roles.is_empty() || !own.messages.is_empty() || own.form_answers_text.is_some();
             if related {
                 record_export_notes(ctx, ChannelId::new(history.channel_id), stats).await?;
             }
-            for (message_id, content) in own.messages {
+            for (message_id, content, rich) in own.messages {
                 stats.own_messages += 1;
                 files
                     .add(
@@ -1039,7 +1866,8 @@ async fn export_closed_histories(
                             "state": "closed",
                             "ticket_number": owns_ticket.then_some(history.number),
                             "created_at": made_at(message_id),
-                            "content": content
+                            "content": content,
+                            "rich": rich
                         }),
                     )
                     .await?;
@@ -1071,7 +1899,7 @@ async fn export_closed_histories(
 }
 
 struct OwnHistoryContent {
-    messages: Vec<(u64, String)>,
+    messages: Vec<(u64, String, Vec<TranscriptRichMessage>)>,
     form_answers_text: Option<String>,
 }
 
@@ -1083,6 +1911,7 @@ async fn own_history_content(
     files: &ExportFiles,
 ) -> Result<OwnHistoryContent, ModuleError> {
     let mut messages = BTreeMap::<u64, String>::new();
+    let mut rich_messages = BTreeMap::<u64, Vec<TranscriptRichMessage>>::new();
     let mut form_answers_text = String::new();
     for page in 0..history.transcript_span_pages {
         files.renew(ctx).await?;
@@ -1133,6 +1962,9 @@ async fn own_history_content(
                         .entry(message_id)
                         .or_default()
                         .extend(chars[start..end].iter().copied());
+                    if let Some(rich) = span.rich {
+                        rich_messages.entry(message_id).or_default().push(rich);
+                    }
                 }
                 TranscriptSpanPart::FormAnswers { user_id } if owner && user_id == user.get() => {
                     form_answers_text.extend(chars[start..end].iter().copied());
@@ -1141,8 +1973,33 @@ async fn own_history_content(
             }
         }
     }
+    if owner {
+        files.renew(ctx).await?;
+        if let Some(answers) = teams_survey::exit_survey_answers_for_export(ctx, history, user)
+            .await
+            .map_err(|error| stored(&error))?
+        {
+            if !form_answers_text.is_empty() {
+                form_answers_text.push('\n');
+            }
+            form_answers_text.push_str(&ctx.t_in(
+                ctx.locale,
+                "tickets-exit-survey-export-title",
+                &Args::new(),
+            ));
+            for (question, answer) in answers {
+                form_answers_text.push_str(&format!("\n- {question}: {answer}"));
+            }
+        }
+    }
     Ok(OwnHistoryContent {
-        messages: messages.into_iter().collect(),
+        messages: messages
+            .into_iter()
+            .map(|(message_id, content)| {
+                let rich = rich_messages.remove(&message_id).unwrap_or_default();
+                (message_id, content, rich)
+            })
+            .collect(),
         form_answers_text: (!form_answers_text.is_empty()).then_some(form_answers_text),
     })
 }
@@ -1212,7 +2069,7 @@ pub(super) async fn erase_my_data(cx: CommandCx, args: EraseMyData) -> Result<()
     let mut stats = EraseStats::default();
 
     let result = async {
-        inspect_open_tickets(ctx, user, token, &mut stats).await?;
+        inspect_open_tickets(ctx, user, token, args.confirm, &mut stats).await?;
         erase_closed_histories(ctx, user, token, args.confirm, &mut stats).await
     }
     .await;
@@ -1259,7 +2116,10 @@ fn erase_args(stats: &EraseStats) -> Args {
         .with("legacy_related", stats.legacy_related.to_string())
         .with("pending", stats.pending_histories.to_string())
         .with("closed_retained", stats.closed_retained_tickets.to_string())
-        .with("closed_retained_messages", stats.closed_retained_messages.to_string())
+        .with(
+            "closed_retained_messages",
+            stats.closed_retained_messages.to_string(),
+        )
         .with("active_tickets", stats.active_owner_tickets.to_string())
         .with("active_assigned", stats.active_assigned_tickets.to_string())
         .with("active_messages", stats.active_user_messages.to_string())
@@ -1283,6 +2143,7 @@ async fn inspect_open_tickets(
     ctx: &EventContext,
     user: UserId,
     token: u64,
+    confirm: bool,
     stats: &mut EraseStats,
 ) -> Result<(), ModuleError> {
     let mut after = String::new();
@@ -1315,19 +2176,31 @@ async fn inspect_open_tickets(
             let owner = ticket.opener == user.get();
             let assigned = ticket.claimed_by == Some(user.get());
             let channel_id = ChannelId::new(channel);
+            if confirm && owner {
+                cancel_owner_ticket_suggestions(ctx, channel_id, ticket.number).await?;
+            }
             let (messages, truncated) = match ticket_messages(ctx, channel_id).await {
                 Ok(messages) => messages,
                 Err(error) => {
                     tracing::warn!(?error, channel, "could not inspect a ticket");
-                    if ticket.closed && (owner || assigned) {
+                    let quote_owned =
+                        ticket_quote_for_user(&ticket, user, ctx.guild_id.get()).is_some();
+                    if ticket.closed && (owner || assigned || quote_owned) {
                         stats.closed_retained_tickets += 1;
                     } else if owner {
                         stats.active_owner_tickets += 1;
                     } else if assigned {
                         stats.active_assigned_tickets += 1;
                     }
+                    if quote_owned {
+                        if ticket.closed {
+                            stats.closed_retained_messages += 1;
+                        } else {
+                            stats.active_user_messages += 1;
+                        }
+                    }
                     stats.active_read_errors += 1;
-                    if owner || assigned {
+                    if owner || assigned || quote_owned {
                         record_erase_notes(ctx, channel_id, stats).await?;
                     }
                     continue;
@@ -1342,10 +2215,19 @@ async fn inspect_open_tickets(
             if !ticket.closed && assigned {
                 stats.active_assigned_tickets += 1;
             }
-            let own_messages = messages
+            let own_message_count = messages
                 .iter()
-                .filter(|message| message.author.id == user)
+                .filter(|message| {
+                    message_quote_for_post(&ticket, message.id.get(), ctx.guild_id.get()).is_none()
+                        && message.author.id == user
+                })
                 .count();
+            let own_messages = own_message_count
+                + if ticket_quote_for_user(&ticket, user, ctx.guild_id.get()).is_some() {
+                    1
+                } else {
+                    0
+                };
             stats.active_user_messages += if ticket.closed { 0 } else { own_messages };
             stats.closed_retained_messages += if ticket.closed { own_messages } else { 0 };
             if ticket.closed && (owner || assigned || own_messages > 0) {
@@ -1438,7 +2320,6 @@ async fn erase_closed_histories(
 fn can_resume_anonymization(history: &TicketHistory, user: UserId) -> bool {
     history.status == HistoryStatus::Anonymizing && history.anonymizing_user == Some(user.get())
 }
-
 
 async fn renew_history_anonymizing_lease(
     ctx: &EventContext,
@@ -1548,8 +2429,7 @@ async fn erase_history(
             .map_err(|error| ModuleError::other(error.to_string()))?;
         let now = ctx.now();
         let resumed = can_resume_anonymization(&history, user)
-            && (history.operation_until <= now
-                || history.operation_token == Some(operation_token));
+            && (history.operation_until <= now || history.operation_token == Some(operation_token));
         let expired_reopening =
             history.status == HistoryStatus::Reopening && history.operation_until <= now;
         let owner = !history.opener_erased && history.opener == user.get();
@@ -1616,6 +2496,14 @@ async fn erase_history(
             Err(StorageError::Conflict) => continue,
             Err(error) => return Err(stored(&error)),
         }
+        if owner {
+            cancel_owner_ticket_suggestions(
+                ctx,
+                ChannelId::new(history.channel_id),
+                history.number,
+            )
+            .await?;
+        }
 
         let ticket_key = format!("ticket:{}", history.channel_id);
         let current_ticket: Option<Ticket> = ctx
@@ -1624,14 +2512,8 @@ async fn erase_history(
             .await
             .map_err(|error| stored(&error))?;
         if let Some(ticket) = current_ticket.filter(|ticket| !ticket.closed) {
-            let _ = release_history_anonymizing_lease(
-                ctx,
-                key,
-                user,
-                operation_token,
-                generation,
-            )
-            .await?;
+            let _ = release_history_anonymizing_lease(ctx, key, user, operation_token, generation)
+                .await?;
             return Ok(HistoryErase {
                 pending: true,
                 active_reopened: true,
@@ -1648,31 +2530,21 @@ async fn erase_history(
             });
         }
         let owner = !history.opener_erased && history.opener == user.get();
-        let transcript_bytes = redact_history_pages(
-            ctx,
-            &history,
-            user,
-            owner,
-            operation_token,
-            key,
-            generation,
-        )
-        .await?;
-        remove_user_spans(
-            ctx,
-            &history,
-            user,
-            owner,
-            operation_token,
-            key,
-            generation,
-        )
-        .await?;
+        if owner {
+            teams_survey::delete_exit_survey(ctx, &history)
+                .await
+                .map_err(|error| stored(&error))?;
+        }
+        let transcript_bytes =
+            redact_history_pages(ctx, &history, user, owner, operation_token, key, generation)
+                .await?;
+        remove_user_spans(ctx, &history, user, owner, operation_token, key, generation).await?;
 
         let mut finalized = false;
         for _ in 0..5 {
             renew_data_operation(ctx, user, operation_token).await?;
-            if !renew_history_anonymizing_lease(ctx, key, user, operation_token, generation).await? {
+            if !renew_history_anonymizing_lease(ctx, key, user, operation_token, generation).await?
+            {
                 return Ok(HistoryErase {
                     pending: true,
                     ..result
@@ -1847,16 +2719,12 @@ async fn redact_history_pages(
     let mut bytes = 0_u64;
     for page in 0..history.transcript_pages {
         renew_data_operation(ctx, user, operation_token).await?;
-        if !renew_history_anonymizing_lease(
-            ctx,
-            history_key,
-            user,
-            operation_token,
-            generation,
-        )
-        .await?
+        if !renew_history_anonymizing_lease(ctx, history_key, user, operation_token, generation)
+            .await?
         {
-            return Err(ModuleError::other("ticket history anonymization lease was lost"));
+            return Err(ModuleError::other(
+                "ticket history anonymization lease was lost",
+            ));
         }
         let page = usize::try_from(page).map_err(|error| ModuleError::other(error.to_string()))?;
         let content_key = history_content_key(history.channel_id, history.transcript_attempt, page);
@@ -1875,16 +2743,12 @@ async fn redact_history_pages(
             .ok_or_else(|| ModuleError::other("ticket transcript spans are missing"))?;
         let redacted = redact_page(&content, &spans, user, owner)?;
         if redacted != content {
-            if !renew_history_anonymizing_lease(
-                ctx,
-                history_key,
-                user,
-                operation_token,
-                generation,
-            )
-            .await?
+            if !renew_history_anonymizing_lease(ctx, history_key, user, operation_token, generation)
+                .await?
             {
-                return Err(ModuleError::other("ticket history anonymization lease was lost"));
+                return Err(ModuleError::other(
+                    "ticket history anonymization lease was lost",
+                ));
             }
             ctx.store()
                 .set_for(&content_key, &redacted, ttl)
@@ -1949,16 +2813,12 @@ async fn remove_user_spans(
     let ttl = history_ttl(history, ctx.now())?;
     for page in 0..history.transcript_span_pages {
         renew_data_operation(ctx, user, operation_token).await?;
-        if !renew_history_anonymizing_lease(
-            ctx,
-            history_key,
-            user,
-            operation_token,
-            generation,
-        )
-        .await?
+        if !renew_history_anonymizing_lease(ctx, history_key, user, operation_token, generation)
+            .await?
         {
-            return Err(ModuleError::other("ticket history anonymization lease was lost"));
+            return Err(ModuleError::other(
+                "ticket history anonymization lease was lost",
+            ));
         }
         let page = usize::try_from(page).map_err(|error| ModuleError::other(error.to_string()))?;
         let key = history_span_key(history.channel_id, history.transcript_attempt, page);
@@ -1968,22 +2828,30 @@ async fn remove_user_spans(
             .await
             .map_err(|error| stored(&error))?
             .ok_or_else(|| ModuleError::other("ticket transcript spans are missing"))?;
-        let kept: Vec<TranscriptSpan> = spans
-            .iter()
-            .filter(|span| !span_belongs_to_user(&span.part, user, owner))
-            .cloned()
-            .collect();
-        if kept.len() != spans.len() {
-            if !renew_history_anonymizing_lease(
-                ctx,
-                history_key,
-                user,
-                operation_token,
-                generation,
-            )
-            .await?
+        let mut kept = Vec::with_capacity(spans.len());
+        let mut changed = false;
+        for mut span in spans {
+            if span_belongs_to_user(&span.part, user, owner) {
+                changed = true;
+                continue;
+            }
+            if span
+                .rich
+                .as_ref()
+                .is_some_and(|rich| rich.mentions.iter().any(|mention| mention.id == user.get()))
             {
-                return Err(ModuleError::other("ticket history anonymization lease was lost"));
+                span.rich = None;
+                changed = true;
+            }
+            kept.push(span);
+        }
+        if changed {
+            if !renew_history_anonymizing_lease(ctx, history_key, user, operation_token, generation)
+                .await?
+            {
+                return Err(ModuleError::other(
+                    "ticket history anonymization lease was lost",
+                ));
             }
             ctx.store()
                 .set_for(&key, &kept, ttl)
@@ -2006,6 +2874,7 @@ mod tests {
             start: u32::try_from(start).expect("test span start fits"),
             end: u32::try_from(end).expect("test span end fits"),
             part,
+            rich: None,
         }
     }
 
@@ -2139,13 +3008,16 @@ mod tests {
             closer: None,
             reason: String::new(),
             panel: None,
+            survey_integrations: Vec::new(),
             labels: Vec::new(),
             rating: None,
             rating_prompt_attempted: false,
+            staff_access: None,
             staff_roles: Vec::new(),
             status,
             log_copy_sent: true,
             log_copy_channel: None,
+            log_copy_message: None,
             attempt: 1,
             transcript_attempt: 1,
             transcript_pages: 0,

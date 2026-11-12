@@ -89,7 +89,13 @@ async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
         pending_operation: None,
         panel_role_baselines: Vec::new(),
         participant_roles: Vec::new(),
+        panel_user_baselines: Vec::new(),
+        participant_users: Vec::new(),
         waiting_for_reply: false,
+        staff_access: None,
+        automation: crate::automation::State::default(),
+        message_quote: None,
+        message_quote_message_id: None,
     };
     harness
         .store()
@@ -118,7 +124,12 @@ fn pending_open_reservation(opener: u64, number: i64) -> crate::OpenReservation 
         panel: None,
         settings: crate::Config::default(),
         staff_roles: Vec::new(),
+        staff_access: None,
         form_answers: Vec::new(),
+        form_modal_revision: None,
+        message_quote: None,
+        channel_name: String::new(),
+        staff_opening: Some(false),
         generation: 1,
         until: 0,
         channel: None,
@@ -513,7 +524,13 @@ async fn stage_closing_recovery(harness: &Harness) -> TicketHistory {
         pending_operation: None,
         panel_role_baselines: Vec::new(),
         participant_roles: Vec::new(),
+        panel_user_baselines: Vec::new(),
+        participant_users: Vec::new(),
         waiting_for_reply: false,
+        staff_access: None,
+        automation: crate::automation::State::default(),
+        message_quote: None,
+        message_quote_message_id: None,
     };
     harness
         .store()
@@ -2526,7 +2543,12 @@ async fn managers_can_inspect_recheck_and_release_an_unconfirmed_opening() {
                 }),
                 settings: crate::Config::default(),
                 staff_roles: vec![PANEL_STAFF_ROLE],
+                staff_access: None,
                 form_answers: Vec::new(),
+                form_modal_revision: None,
+                message_quote: None,
+                channel_name: String::new(),
+                staff_opening: Some(false),
                 generation: 1,
                 until: 0,
                 channel: None,
@@ -2755,7 +2777,12 @@ fn a_recovered_ticket_keeps_its_effective_settings_roles_and_form_answers() {
         panel: Some(panel.clone()),
         settings: settings.clone(),
         staff_roles: vec![PANEL_STAFF_ROLE],
+        staff_access: None,
         form_answers: vec![("Invoice number".to_owned(), "A-17".to_owned())],
+        form_modal_revision: None,
+        message_quote: None,
+        channel_name: String::new(),
+        staff_opening: Some(false),
         generation: 1,
         until: 300,
         channel: None,
@@ -3725,6 +3752,7 @@ async fn note_history_has_no_small_per_ticket_count_limit() {
         let page = StaffNotePage {
             ticket_number: 3,
             panel: None,
+            staff_access: None,
             notes: (0..note_count)
                 .map(|index| StaffNote {
                     author: MODERATOR,
@@ -3795,6 +3823,7 @@ async fn mismatched_note_page_snapshots_never_authorize_a_mixed_archive() {
         timezone: None,
         questions: Vec::new(),
         max_open: 0,
+        ..NamedPanel::default()
     });
     harness.store().set(&second_key, &second).await.unwrap();
     harness
@@ -3832,6 +3861,7 @@ async fn a_closed_named_ticket_keeps_staff_access_when_an_older_page_is_missing(
         timezone: None,
         questions: Vec::new(),
         max_open: 0,
+        ..NamedPanel::default()
     });
     harness.store().set(&key, &ticket).await.unwrap();
 
@@ -4160,7 +4190,13 @@ fn saved_form_answers_are_counted_toward_the_ticket_storage_limit() {
         pending_operation: None,
         panel_role_baselines: Vec::new(),
         participant_roles: Vec::new(),
+        panel_user_baselines: Vec::new(),
+        participant_users: Vec::new(),
         waiting_for_reply: false,
+        staff_access: None,
+        automation: crate::automation::State::default(),
+        message_quote: None,
+        message_quote_message_id: None,
     };
     assert!(crate::ticket_storage_size(&ticket).unwrap() > crate::MAX_TICKET_BYTES);
 }
@@ -5390,7 +5426,13 @@ async fn ticket_labels_report_the_store_size_limit_without_partial_write() {
         pending_operation: None,
         panel_role_baselines: Vec::new(),
         participant_roles: Vec::new(),
+        panel_user_baselines: Vec::new(),
+        participant_users: Vec::new(),
         waiting_for_reply: false,
+        staff_access: None,
+        automation: crate::automation::State::default(),
+        message_quote: None,
+        message_quote_message_id: None,
     };
     let mut labels = Vec::new();
     for index in 0..MAX_VALUE_BYTES {
@@ -6022,6 +6064,7 @@ async fn saved_replies_use_the_ticket_panels_staff_access_and_safe_mentions() {
         button_style: None,
         timezone: None,
         questions: Vec::new(),
+        ..NamedPanel::default()
     });
     harness.store().set(&ticket_key, &ticket).await.unwrap();
     let default_ticket = Ticket {
@@ -6044,7 +6087,13 @@ async fn saved_replies_use_the_ticket_panels_staff_access_and_safe_mentions() {
         pending_operation: None,
         panel_role_baselines: Vec::new(),
         participant_roles: Vec::new(),
+        panel_user_baselines: Vec::new(),
+        participant_users: Vec::new(),
         waiting_for_reply: false,
+        staff_access: None,
+        automation: crate::automation::State::default(),
+        message_quote: None,
+        message_quote_message_id: None,
     };
     assert_ne!(
         reply_key(&ticket, "welcome"),

@@ -130,17 +130,45 @@ fn unstaffed_roles_can_view_private_threads(
     false
 }
 
-/// Refuses a private thread unless the text parent gives every configured staff role the access
-/// Discord actually calculates, and this opener can see and answer in the parent.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one check must prove the parent, staff, opener, and bot all can use the thread"
-)]
 pub(super) async fn ensure_thread_parent(
     ctx: &EventContext,
     parent_id: ChannelId,
     staff_roles: &[RoleId],
     opener: UserId,
+) -> Result<(), UserError> {
+    ensure_thread_parent_for_members(ctx, parent_id, staff_roles, opener, &[]).await
+}
+
+pub(super) async fn ensure_thread_parent_for_members(
+    ctx: &EventContext,
+    parent_id: ChannelId,
+    staff_roles: &[RoleId],
+    opener: UserId,
+    additional_members: &[UserId],
+) -> Result<(), UserError> {
+    ensure_thread_parent_with_access(
+        ctx,
+        parent_id,
+        staff_roles,
+        opener,
+        additional_members,
+        None,
+    )
+    .await
+}
+
+/// Validates named team members as well as the configured role staff in the parent channel.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one check must prove the parent, staff, opener, team users, and bot can use the thread"
+)]
+pub(super) async fn ensure_thread_parent_with_access(
+    ctx: &EventContext,
+    parent_id: ChannelId,
+    staff_roles: &[RoleId],
+    opener: UserId,
+    additional_members: &[UserId],
+    staff_access: Option<&teams_survey::StaffAccessSnapshot>,
 ) -> Result<(), UserError> {
     let channel = match ctx
         .api
@@ -189,6 +217,9 @@ pub(super) async fn ensure_thread_parent(
         .collect();
     let mut role_channel = (*channel).clone();
     role_channel.permission_overwrites = Some(role_overwrites.clone());
+    let team_role_overwrites = staff_access
+        .map(teams_survey::thread_role_overwrites)
+        .unwrap_or_default();
 
     for staff_role in staff_roles {
         let Some(role) = all_roles.iter().find(|role| role.id == *staff_role) else {
@@ -197,6 +228,28 @@ pub(super) async fn ensure_thread_parent(
         if role.permissions.contains(Permissions::ADMINISTRATOR) {
             continue;
         }
+        let (team_allow, team_deny, required) = if staff_access.is_some() {
+            let Some((_, allow, deny)) = team_role_overwrites
+                .iter()
+                .find(|(role, _, _)| role == staff_role)
+            else {
+                return Err(UserError::message("tickets-team-thread-permissions"));
+            };
+            let base = Permissions::VIEW_CHANNEL
+                .union(Permissions::READ_MESSAGE_HISTORY)
+                .union(Permissions::MANAGE_THREADS);
+            (
+                *allow,
+                *deny,
+                base.union(allow.intersection(Permissions::SEND_MESSAGES_IN_THREADS)),
+            )
+        } else {
+            (
+                Permissions::empty(),
+                Permissions::empty(),
+                THREAD_STAFF_PERMISSIONS,
+            )
+        };
         let effective = effective_permissions(
             ctx,
             &role_channel,
@@ -205,8 +258,17 @@ pub(super) async fn ensure_thread_parent(
             &all_roles,
             None,
         );
-        if !effective.contains(THREAD_STAFF_PERMISSIONS) {
-            return Err(UserError::message("tickets-thread-access-required"));
+        if !effective.contains(required) {
+            return Err(UserError::message(if staff_access.is_some() {
+                "tickets-team-thread-permissions"
+            } else {
+                "tickets-thread-access-required"
+            }));
+        }
+        if staff_access.is_some()
+            && (!effective.contains(team_allow) || effective.intersects(team_deny))
+        {
+            return Err(UserError::message("tickets-team-thread-permissions"));
         }
 
         // A different held role can deny inherited permissions; prove the staff role can override it.
@@ -229,8 +291,12 @@ pub(super) async fn ensure_thread_parent(
             .fold(Permissions::empty(), |denied, overwrite| {
                 denied | overwrite.deny
             });
-        if !(other_denials & THREAD_STAFF_PERMISSIONS & !own_allow).is_empty() {
-            return Err(UserError::message("tickets-thread-access-required"));
+        if !(other_denials & required & !own_allow).is_empty() {
+            return Err(UserError::message(if staff_access.is_some() {
+                "tickets-team-thread-permissions"
+            } else {
+                "tickets-thread-access-required"
+            }));
         }
     }
 
@@ -271,8 +337,15 @@ pub(super) async fn ensure_thread_parent(
                         }
                         _ => return Err(UserError::message("tickets-thread-access-unknown")),
                     };
-                    let member_is_staff =
-                        member.roles.iter().any(|role| staff_roles.contains(role));
+                    let member_is_staff = additional_members.contains(&member_id)
+                        || member.roles.iter().any(|role| staff_roles.contains(role));
+                    let member_is_admin = owner == Some(member_id)
+                        || member.roles.iter().any(|held| {
+                            all_roles.iter().any(|role| {
+                                role.id == *held
+                                    && role.permissions.contains(Permissions::ADMINISTRATOR)
+                            })
+                        });
                     let permissions = effective_permissions(
                         ctx,
                         &channel,
@@ -281,19 +354,40 @@ pub(super) async fn ensure_thread_parent(
                         &all_roles,
                         owner,
                     );
-                    if member_is_staff
-                        && overwrite.deny.intersects(THREAD_STAFF_PERMISSIONS)
-                        && !permissions.contains(THREAD_STAFF_PERMISSIONS)
-                    {
-                        return Err(UserError::message("tickets-thread-access-required"));
+                    if member_is_staff && !member_is_admin {
+                        let (team_allow, team_deny) = staff_access.map_or(
+                            (Permissions::empty(), Permissions::empty()),
+                            |snapshot| {
+                                teams_survey::thread_member_overwrite(
+                                    snapshot,
+                                    member_id.get(),
+                                    &member.roles,
+                                )
+                            },
+                        );
+                        let mut required = THREAD_MEMBER_PERMISSIONS;
+                        if staff_access.is_some() {
+                            required =
+                                Permissions::VIEW_CHANNEL.union(Permissions::READ_MESSAGE_HISTORY);
+                            if member.roles.iter().any(|role| staff_roles.contains(role)) {
+                                required = required.union(Permissions::MANAGE_THREADS);
+                            }
+                            required = required.union(
+                                team_allow.intersection(Permissions::SEND_MESSAGES_IN_THREADS),
+                            );
+                        }
+                        if !permissions.contains(required)
+                            || (staff_access.is_some()
+                                && (!permissions.contains(team_allow)
+                                    || permissions.intersects(team_deny)))
+                        {
+                            return Err(UserError::message(if staff_access.is_some() {
+                                "tickets-team-thread-permissions"
+                            } else {
+                                "tickets-thread-access-required"
+                            }));
+                        }
                     }
-                    let member_is_admin = owner == Some(member_id)
-                        || member.roles.iter().any(|held| {
-                            all_roles.iter().any(|role| {
-                                role.id == *held
-                                    && role.permissions.contains(Permissions::ADMINISTRATOR)
-                            })
-                        });
                     if !member_is_staff
                         && member_id != bot
                         && !member_is_admin
@@ -333,6 +427,57 @@ pub(super) async fn ensure_thread_parent(
         .contains(THREAD_MEMBER_PERMISSIONS)
     {
         return Err(UserError::message("tickets-thread-member-access"));
+    }
+    for additional in additional_members {
+        if *additional == opener || *additional == bot {
+            continue;
+        }
+        let member = match ctx
+            .api
+            .execute(Action::GetMember {
+                guild_id: ctx.guild_id,
+                user_id: *additional,
+            })
+            .await
+        {
+            Ok(Outcome::Member(member)) => member,
+            Ok(_) | Err(DiscordError::NotFound) => {
+                return Err(UserError::message("tickets-thread-member-access"));
+            }
+            Err(error) => {
+                tracing::warn!(?error, %additional, "could not verify a named ticket team member");
+                return Err(UserError::message("tickets-thread-access-unknown"));
+            }
+        };
+        let permissions =
+            effective_permissions(ctx, &channel, *additional, &member.roles, &all_roles, owner);
+        let (team_allow, team_deny) =
+            staff_access.map_or((Permissions::empty(), Permissions::empty()), |snapshot| {
+                teams_survey::thread_member_overwrite(snapshot, additional.get(), &member.roles)
+            });
+        let member_is_admin = owner == Some(*additional)
+            || member.roles.iter().any(|held| {
+                all_roles.iter().any(|role| {
+                    role.id == *held && role.permissions.contains(Permissions::ADMINISTRATOR)
+                })
+            });
+        let required = if staff_access.is_some() {
+            let base = Permissions::VIEW_CHANNEL.union(Permissions::READ_MESSAGE_HISTORY);
+            base.union(team_allow.intersection(Permissions::SEND_MESSAGES_IN_THREADS))
+        } else {
+            THREAD_MEMBER_PERMISSIONS
+        };
+        if !member_is_admin
+            && (!permissions.contains(required)
+                || (staff_access.is_some()
+                    && (!permissions.contains(team_allow) || permissions.intersects(team_deny))))
+        {
+            return Err(UserError::message(if staff_access.is_some() {
+                "tickets-team-thread-permissions"
+            } else {
+                "tickets-thread-member-access"
+            }));
+        }
     }
     let bot_member = match ctx
         .api
@@ -619,10 +764,32 @@ pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError
         .ok_or_else(|| UserError::message("tickets-thread-access-unknown"))?;
     let original: Config = cx.config()?;
     let config = original.for_ticket(&ticket);
-    let mut staff = config.staff();
+    let mut staff: Vec<RoleId> = ticket.staff_access.as_ref().map_or_else(
+        || {
+            ticket.staff_roles.as_ref().map_or_else(
+                || config.staff(),
+                |roles| roles.iter().copied().map(RoleId::new).collect(),
+            )
+        },
+        |snapshot| {
+            teams_survey::staff_roles(snapshot)
+                .into_iter()
+                .map(RoleId::new)
+                .collect()
+        },
+    );
     staff.sort_unstable();
     staff.dedup();
-    ensure_thread_parent(ctx, parent_id, &staff, UserId::new(ticket.opener)).await?;
+    let staff_users = super::team_staff_users(ticket.staff_access.as_ref());
+    ensure_thread_parent_with_access(
+        ctx,
+        parent_id,
+        &staff,
+        UserId::new(ticket.opener),
+        &staff_users,
+        ticket.staff_access.as_ref(),
+    )
+    .await?;
 
     let opener = ticket.opener;
     let panel_id = ticket.panel.as_ref().map(|panel| panel.id.as_str());
@@ -647,9 +814,20 @@ pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError
         Err(error) => return Err(failed(&error)),
         _ => None,
     };
-    let opener_is_staff = member
+    let legacy_staff_roles = ticket
+        .staff_roles
         .as_ref()
-        .is_some_and(|member| member.roles.iter().any(|role| staff.contains(role)));
+        .cloned()
+        .unwrap_or_else(|| staff.iter().map(|role| role.get()).collect());
+    let opener_is_staff = member.as_ref().is_some_and(|member| {
+        teams_survey::may_access(
+            ticket.staff_access.as_ref(),
+            &legacy_staff_roles,
+            opener,
+            &member.roles,
+            false,
+        )
+    });
     let opener_is_owner = ctx
         .api
         .guild_owner()
@@ -850,6 +1028,9 @@ pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError
                 if let Err(error) = set_open_score(ctx, opener, open_count).await {
                     tracing::warn!(?error, opener, "could not refresh the reopened ticket count");
                 }
+                if let Err(error) = super::automation::start(ctx, channel).await {
+                    tracing::warn!(?error, %channel, "ticket automation timers could not be restarted");
+                }
                 Ok(ReopenResult::Reopened)
             }
             Err(StorageError::Conflict) => {
@@ -881,6 +1062,9 @@ pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError
         .map_err(|error| failed(&error))?;
     match result.map_err(|error| failed(&error))? {
         ReopenResult::Reopened => {
+            if let Err(error) = super::add_team_users_to_thread(ctx, channel, &ticket).await {
+                tracing::warn!(?error, %channel, "ticket team members could not be restored to the thread");
+            }
             if let Some(request) = &ticket.close_request {
                 cancel_close_request_timeout(ctx, channel, request).await;
             }

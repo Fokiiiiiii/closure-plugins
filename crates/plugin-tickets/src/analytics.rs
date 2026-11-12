@@ -471,7 +471,13 @@ fn job_result(job: &AnalyticsJob, cursor: &str, revision: i64) -> DashboardActio
                 "missing": job.totals.rating_missing,
                 "score_sum": job.totals.rating_score_sum,
                 "average": rating_average,
-                "distribution": job.totals.rating_distribution
+                "distribution": {
+                    "1": job.totals.rating_distribution[0],
+                    "2": job.totals.rating_distribution[1],
+                    "3": job.totals.rating_distribution[2],
+                    "4": job.totals.rating_distribution[3],
+                    "5": job.totals.rating_distribution[4]
+                }
             },
             "open_count": job.totals.open_count,
             "records_scanned": job.totals.records_scanned,
