@@ -7525,18 +7525,12 @@ async fn prepare_history(
             store_history_record(ctx, &key, &history).await?;
             return Ok(history);
         }
-        Err(error) => {
-            reopen(ctx, closing).await;
-            return Err(stored(&error));
-        }
+        Err(error) => return Err(stored(&error)),
     };
     let log_copy_text = archive.text.clone();
     let answers = match advanced_forms::load_ticket_form_answers(ctx, closing.ticket).await {
         Ok(answers) => answers,
-        Err(error) => {
-            reopen(ctx, closing).await;
-            return Err(stored(&error));
-        }
+        Err(error) => return Err(stored(&error)),
     };
     data::append_form_answers(ctx, &mut archive, &answers, closing.ticket.opener);
     let transcript_messages = archive.messages.len();
@@ -7553,10 +7547,7 @@ async fn prepare_history(
     .await
     {
         Ok(history) => history,
-        Err(error) => {
-            reopen(ctx, closing).await;
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     if let Some(log) = closing.config.log() {
         let note = ctx.t_in(
@@ -7591,16 +7582,10 @@ async fn prepare_history(
         history.log_copy_message = match posted {
             Ok(Outcome::Message(message)) => Some(message.id.get()),
             Ok(_) => None,
-            Err(error) => {
-                reopen(ctx, closing).await;
-                return Err(stored(&error));
-            }
+            Err(error) => return Err(stored(&error)),
         };
         history.log_copy_sent = true;
-        if let Err(error) = store_history_record(ctx, &key, &history).await {
-            reopen(ctx, closing).await;
-            return Err(error);
-        }
+        store_history_record(ctx, &key, &history).await?;
     }
     if let Some(old) = previous
         .as_ref()
@@ -7856,7 +7841,9 @@ async fn finish_with_guard(
                 reason,
                 attempt: ticket.close_generation,
             };
-            reopen(ctx, &closing).await;
+            if closer.is_some() {
+                reopen(ctx, &closing).await;
+            }
             return Err(error);
         }
     };
@@ -7873,7 +7860,9 @@ async fn finish_with_guard(
     let previous = match ctx.store().get::<TicketHistory>(&key).await {
         Ok(history) => history,
         Err(error) => {
-            reopen(ctx, &closing).await;
+            if closer.is_some() {
+                reopen(ctx, &closing).await;
+            }
             return Err(stored(&error));
         }
     };
@@ -7885,7 +7874,9 @@ async fn finish_with_guard(
     let history = match prepare_history(ctx, &closing, previous).await {
         Ok(history) => history,
         Err(error) => {
-            reopen(ctx, &closing).await;
+            if closer.is_some() {
+                reopen(ctx, &closing).await;
+            }
             return Err(error);
         }
     };
@@ -10976,6 +10967,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .modal(FORM, submit_form)
             .component("close", close_button)
             .component("rate", rate_button)
+            .direct_message_component("rate", rate_button)
             .component("close-request-approve", approve_close_request)
             .component("close-request-reject", reject_close_request)
             .component("claim", claim)
@@ -10990,6 +10982,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .component("reply-retry-uncertain", retry_uncertain_reply)
             .component(message_ticket::PANEL_SELECT, message_ticket::select_panel)
             .component("survey-open", teams_survey::open_exit_survey_button)
+            .direct_message_component("survey-open", teams_survey::open_exit_survey_button)
             .component("survey-view", teams_survey::view_exit_survey)
             .modal("survey-submit", teams_survey::submit_exit_survey)
             .message_command(
