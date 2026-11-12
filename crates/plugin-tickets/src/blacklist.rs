@@ -77,7 +77,7 @@ pub(super) struct State {
 
 #[derive(Debug, Clone)]
 pub(super) struct Snapshot {
-    /// The store revision used for dashboard ETag and `If-Match`.
+    /// The store revision used for dashboard `ETag` and `If-Match`.
     pub(super) revision: Option<i64>,
     pub(super) state: State,
 }
