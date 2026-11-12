@@ -5278,7 +5278,7 @@ fn legacy_staff_snapshot_falls_back_but_explicit_empty_does_not() {
     assert!(crate::history_staff_roles(&explicit, &config).is_empty());
 }
 
-// shortcut: keep this 105-line regression case intact; split if it grows past 110 lines.
+// Keep this panel ACL regression case intact; split only if it grows further.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn panel_staff_manage_labels_with_display_names_only_for_their_panel() {
@@ -5352,27 +5352,56 @@ async fn panel_staff_manage_labels_with_display_names_only_for_their_panel() {
         "{listed:?}"
     );
 
+    let denied_add = harness
+        .invoke(label_invocation(
+            "label-add",
+            Some("other-panel"),
+            OTHER,
+            &[OTHER_PANEL_STAFF_ROLE],
+        ))
+        .await
+        .unwrap();
+    assert!(denied_add.last().unwrap().ephemeral, "{denied_add:?}");
     assert!(
-        harness
-            .invoke(label_invocation(
-                "label-add",
-                Some("other-panel"),
-                OTHER,
-                &[OTHER_PANEL_STAFF_ROLE],
-            ))
-            .await
-            .is_err()
+        denied_add
+            .last()
+            .unwrap()
+            .content
+            .contains("Only the staff can do that"),
+        "{denied_add:?}"
+    );
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket.labels, vec!["Urgent 日本語".to_owned()]);
+    let denied_list = harness
+        .invoke(label_invocation(
+            "label-list",
+            None,
+            OTHER,
+            &[OTHER_PANEL_STAFF_ROLE],
+        ))
+        .await
+        .unwrap();
+    assert!(denied_list.last().unwrap().ephemeral, "{denied_list:?}");
+    assert!(
+        denied_list
+            .last()
+            .unwrap()
+            .content
+            .contains("Only the staff can do that"),
+        "{denied_list:?}"
     );
     assert!(
-        harness
-            .invoke(label_invocation(
-                "label-list",
-                None,
-                OTHER,
-                &[OTHER_PANEL_STAFF_ROLE],
-            ))
-            .await
-            .is_err()
+        !denied_list
+            .last()
+            .unwrap()
+            .content
+            .contains("Urgent 日本語"),
+        "{denied_list:?}"
     );
 
     let removed = harness
@@ -6214,7 +6243,7 @@ async fn saved_replies_use_the_ticket_panels_staff_access_and_safe_mentions() {
     assert!(search.last().unwrap().ephemeral, "{search:?}");
     assert_eq!(
         search.last().unwrap().custom_ids(),
-        ["tickets:reply-select:*"]
+        ["tickets:reply-select:*:"]
     );
     assert!(!search.last().unwrap().content.contains(body));
 
@@ -6238,7 +6267,7 @@ async fn saved_replies_use_the_ticket_panels_staff_access_and_safe_mentions() {
 
     let denied_pick = harness
         .click(
-            Click::new("tickets:reply-select:*")
+            Click::new("tickets:reply-select:*:")
                 .values(["welcome"])
                 .roles([OTHER_PANEL_STAFF_ROLE])
                 .user(OTHER),
@@ -6257,7 +6286,7 @@ async fn saved_replies_use_the_ticket_panels_staff_access_and_safe_mentions() {
 
     harness
         .click(
-            Click::new("tickets:reply-select:*")
+            Click::new("tickets:reply-select:*:")
                 .values(["welcome"])
                 .roles([PANEL_STAFF_ROLE])
                 .user(OTHER),
@@ -6305,7 +6334,7 @@ async fn long_saved_replies_are_split_and_never_ping_mentions() {
         .unwrap();
     harness
         .click(
-            Click::new("tickets:reply-select:*")
+            Click::new("tickets:reply-select:*:")
                 .values(["long"])
                 .roles([STAFF_ROLE])
                 .user(OTHER),
@@ -6485,11 +6514,11 @@ async fn saved_reply_search_reaches_entries_after_the_first_storage_page() {
         .unwrap();
     assert_eq!(
         results.last().unwrap().custom_ids(),
-        ["tickets:reply-select:*"]
+        ["tickets:reply-select:*:"]
     );
     harness
         .click(
-            Click::new("tickets:reply-select:*")
+            Click::new("tickets:reply-select:*:")
                 .values(["entry-1004"])
                 .roles([STAFF_ROLE])
                 .user(OTHER),
@@ -6529,7 +6558,7 @@ async fn retrying_a_partial_reply_skips_confirmed_parts_and_flags_the_uncertain_
     );
     let stopped = harness
         .click(
-            Click::new("tickets:reply-select:*")
+            Click::new("tickets:reply-select:*:")
                 .values(["long"])
                 .roles([STAFF_ROLE])
                 .user(OTHER),
@@ -6625,7 +6654,7 @@ async fn selecting_a_saved_reply_again_creates_a_new_send_attempt() {
         .unwrap();
     harness
         .click(
-            Click::new("tickets:reply-select:*")
+            Click::new("tickets:reply-select:*:")
                 .values(["greeting"])
                 .roles([STAFF_ROLE])
                 .user(OTHER),
@@ -6668,7 +6697,7 @@ async fn selecting_a_saved_reply_again_creates_a_new_send_attempt() {
         .unwrap();
     harness
         .click(
-            Click::new("tickets:reply-select:*")
+            Click::new("tickets:reply-select:*:")
                 .values(["greeting"])
                 .roles([STAFF_ROLE])
                 .user(OTHER),

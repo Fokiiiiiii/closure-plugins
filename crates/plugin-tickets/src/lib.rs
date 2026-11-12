@@ -9762,11 +9762,26 @@ async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError>
     } else {
         String::new()
     };
-    let content = if notice.is_empty() {
+    let mut content = if notice.is_empty() {
         text
     } else {
         format!("{notice}\n{text}")
     };
+    if let Some(rating) = history
+        .rating
+        .as_ref()
+        .filter(|rating| rating.created > 0 && (1..=5).contains(&rating.score))
+    {
+        content.push_str("\n\n");
+        content.push_str(
+            &cx.t(
+                "tickets-history-rating",
+                &Args::new()
+                    .with("score", i64::from(rating.score))
+                    .with("rated", format!("<t:{}:f>", rating.created)),
+            ),
+        );
+    }
     cx.reply_private_t(
         "tickets-history-page",
         &Args::new()
