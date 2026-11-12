@@ -9,7 +9,7 @@ use closure_core::storage::{Expect, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Config, HistoryStatus, Ticket, TicketHistory, history_staff_roles, teams_survey};
+use super::{Config, HistoryStatus, TicketHistory, history_staff_roles, teams_survey};
 
 const HISTORY_PREFIX: &str = "ticket-history:";
 const TICKET_PREFIX: &str = "ticket:";

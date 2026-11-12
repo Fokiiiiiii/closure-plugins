@@ -326,7 +326,13 @@ async fn validate_panel(
         ctx.guild_id.get(),
     )?;
     let mut staff_roles = staff_access.as_ref().map_or_else(
-        || base_roles.iter().map(twilight_model::id::Id::get).collect(),
+        || {
+            base_roles
+                .iter()
+                .copied()
+                .map(twilight_model::id::Id::get)
+                .collect()
+        },
         super::teams_survey::staff_roles,
     );
     staff_roles.sort_unstable();

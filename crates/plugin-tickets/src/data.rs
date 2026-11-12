@@ -1,8 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+
+use closure_core::action::MessageCursor;
 
 use super::*;
 
 const DATA_SCAN_BATCH: usize = 50;
+const TRANSCRIPT_PAGE_SIZE: u16 = 100;
+const TRANSCRIPT_PAGES: usize = 50;
 const EXPORT_PART_BYTES: usize = 1024 * 1024;
 const EXPORT_FILES_PER_DM: usize = 8;
 
@@ -270,11 +275,14 @@ async fn ticket_messages(
     let mut cursor = None;
     let mut cut = false;
     for page_number in 0..TRANSCRIPT_PAGES {
-        let page = ctx.api.get_messages(channel, cursor, 100).await?;
+        let page = ctx
+            .api
+            .get_messages(channel, cursor, TRANSCRIPT_PAGE_SIZE)
+            .await?;
         let Some(oldest) = page.last().map(|message| message.id) else {
             break;
         };
-        let full = page.len() == 100;
+        let full = page.len() == usize::from(TRANSCRIPT_PAGE_SIZE);
         messages.extend(page);
         if !full {
             break;
@@ -291,6 +299,10 @@ async fn ticket_messages(
     }
     messages.reverse();
     Ok((messages, cut))
+}
+
+pub(super) fn transcript_is_incomplete(message_count: usize, has_older_messages: bool) -> bool {
+    message_count >= usize::from(TRANSCRIPT_PAGE_SIZE) * TRANSCRIPT_PAGES && has_older_messages
 }
 
 fn message_quote_for_post(
@@ -2010,9 +2022,9 @@ async fn own_history_content(
             ));
             for (question, answer) in answers {
                 form_answers_text.push_str("\n- ");
-                form_answers_text.push_str(question);
+                form_answers_text.push_str(question.as_str());
                 form_answers_text.push_str(": ");
-                form_answers_text.push_str(answer);
+                form_answers_text.push_str(answer.as_str());
             }
         }
     }

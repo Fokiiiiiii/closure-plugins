@@ -1081,7 +1081,7 @@ mod tests {
             generation: String::new(),
             url: "https://api.example.com/options".to_owned(),
             auth: AuthKind::None,
-            method: RequestMethod::default(),
+            method: super::RequestMethod::default(),
             headers: Vec::new(),
             secrets: Vec::new(),
             response_mappings: Vec::new(),

@@ -1,11 +1,10 @@
 use super::{
     Action, Args, ChannelId, ChannelType, CommandCx, Config, DAY, DiscordError, EventContext,
-    Expect, InteractionRef, ModuleError, Outcome, Permissions, Reason, RoleId, StorageError,
-    ThreadPatch, Ticket, UserError, UserId, acquire_open_lock, all_tickets,
-    cancel_close_request_timeout, closing_key, failed, left_close_key, list_user_reservations,
-    open_counts, owns_open_lock, read_open_state, release_open_lock,
-    remove_missing_closing_tickets, set_open_score, stored, teams_survey, ticket_key, ticket_ttl,
-    watch,
+    Expect, ModuleError, Outcome, Permissions, Reason, RoleId, StorageError, ThreadPatch, Ticket,
+    UserError, UserId, acquire_open_lock, all_tickets, cancel_close_request_timeout, closing_key,
+    failed, left_close_key, list_user_reservations, open_counts, owns_open_lock, read_open_state,
+    release_open_lock, remove_missing_closing_tickets, set_open_score, stored, teams_survey,
+    ticket_key, ticket_ttl, watch,
 };
 use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
 use twilight_util::permission_calculator::PermissionCalculator;

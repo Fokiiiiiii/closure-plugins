@@ -54,15 +54,17 @@ const CLOSE_REQUESTS: &str = "close-requests";
 const CLOSING: &str = "closing";
 const FORM: &str = "form";
 const MAX_TICKET_CUSTOM_ID_BYTES: usize = 100;
+#[cfg(test)]
+const MAX_FORM_QUESTION_CHARS: usize = advanced_forms::MAX_FORM_QUESTION_CHARS;
 const MAX_TICKET_BYTES: usize = 32 * 1024;
 const HISTORY_PREFIX: &str = "ticket-history:";
 const HISTORY_LINK_PREFIX: &str = "ticket-history-link:";
 const HISTORY_CONTENT_PREFIX: &str = "ticket-history-content:";
 const HISTORY_INDEX_PREFIX: &str = "ticket-history-index:";
 const HISTORY_ID_PREFIX: &str = "ticket-history-id:";
-const HISTORY_TTL: Duration = Duration::from_days(365);
+const HISTORY_TTL: Duration = Duration::from_hours(24 * 365);
 const HISTORY_SEARCH_SESSION_PREFIX: &str = "ticket-history-search-session:";
-const HISTORY_SEARCH_TTL: Duration = Duration::from_minutes(15);
+const HISTORY_SEARCH_TTL: Duration = Duration::from_mins(15);
 const HISTORY_SEARCH_BATCH: usize = 25;
 const HISTORY_SEARCH_PAGE_BUDGET: usize = 32;
 const HISTORY_SEARCH_NORMALIZED_CHARS: usize = 300;
@@ -10919,6 +10921,9 @@ mod automation;
 mod blacklist;
 mod dashboard;
 mod data;
+
+#[cfg(test)]
+pub(crate) use data::transcript_is_incomplete;
 mod form_library;
 mod hours;
 mod integrations;
