@@ -302,6 +302,7 @@ tickets-not-a-ticket = This is not an open ticket.
 tickets-not-yours = Only the member who opened this ticket, or the staff, can close it.
 tickets-closing = Closing the ticket.
 tickets-close-request-message = { $staff } asks to close this ticket. Reason: { $reason }
+tickets-close-request-deadline = Reply within { $minutes } min.
 tickets-close-request-processing = Approval received. Checking the request.
 tickets-close-request-no-reason = No reason was provided.
 tickets-close-request-approve-button = Approve
@@ -341,6 +342,7 @@ tickets-history-page-invalid = Choose a page between 1 and { $pages }.
 tickets-history-incomplete = Only the newest { $count } messages could be retrieved; older messages are not included.
 tickets-history-rating = Staff rating: { $score}/5 · { $rated }
 tickets-history-page = Ticket #{ $number } history, page { $page } of { $pages }:
+    { $content }
 tickets-history-dashboard-link = Open your ticket history in the Dashboard: { $url }
 tickets-history-command-fallback = View your ticket history with /ticket history { $number }
 tickets-transcript-head = Ticket #{ $number } of { $opener }

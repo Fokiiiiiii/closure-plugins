@@ -302,6 +302,7 @@ tickets-not-a-ticket = ここは開いているチケットではありません
 tickets-not-yours = チケットを閉じられるのは、開いたメンバーかスタッフだけです。
 tickets-closing = チケットを閉じます。
 tickets-close-request-message = { $staff } からチケットを閉じる依頼が届きました。理由: { $reason }
+tickets-close-request-deadline = あと{ $minutes }分以内に返信してください。
 tickets-close-request-processing = 承認を受け付けました。依頼を確認しています。
 tickets-close-request-no-reason = 理由は指定されていません。
 tickets-close-request-approve-button = 承認
@@ -341,6 +342,7 @@ tickets-history-page-invalid = 1 から { $pages } の範囲でページ番号�
 tickets-history-incomplete = Discordから取得したのは新しい { $count } 件までです。それより古いメッセージは含まれません。
 tickets-history-rating = スタッフ評価: { $score}/5 · { $rated }
 tickets-history-page = チケット #{ $number } の履歴（{ $page } / { $pages }ページ）:
+    { $content }
 tickets-history-dashboard-link = ダッシュボードでチケット履歴を確認: { $url }
 tickets-history-command-fallback = /ticket history { $number } でチケット履歴を確認できます
 tickets-transcript-head = { $opener } のチケット #{ $number }
