@@ -806,7 +806,7 @@ async fn closing_saves_the_transcript_then_deletes_the_channel_and_gives_the_pla
         Invocation::new("ticket")
             .subcommand("close")
             .user(user)
-            .channel(ChannelId::new(channel_id))
+            .channel(channel_id)
     };
 
     let refused = harness.invoke(close(OTHER)).await.unwrap();
