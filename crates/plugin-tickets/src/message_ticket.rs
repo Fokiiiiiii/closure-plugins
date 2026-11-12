@@ -268,7 +268,7 @@ pub(super) async fn select_panel(cx: ComponentCx) -> Result<(), UserError> {
             .reply_private_t("tickets-panel-select-invalid", &Args::new())
             .await;
     };
-    super::open_panel(cx, panel_id, Some(source)).await
+    Box::pin(super::open_panel(cx, panel_id, Some(source))).await
 }
 
 fn values_source_ids(

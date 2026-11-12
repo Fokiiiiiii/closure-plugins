@@ -154,6 +154,7 @@ fn default_form_required() -> bool {
     true
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn form_questions_schema() -> serde_json::Value {
     json!({
         "type": "array",
@@ -393,6 +394,7 @@ impl FormQuestion {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn is_valid(&self) -> bool {
         match self {
             Self::Legacy(label) => valid_label(label),
@@ -513,6 +515,7 @@ impl FormQuestion {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn component(
         &self,
         module: &closure_core::module::ModuleId,
@@ -672,6 +675,7 @@ impl FormQuestion {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn answer(
         &self,
         value: Option<&ModalValue>,
@@ -887,6 +891,7 @@ fn max_selected_label_chars(options: &[FormOption], max: u8) -> usize {
         .saturating_add(usize::from(max.saturating_sub(1)) * 2)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn text_component(
     custom_id: String,
     label: String,
@@ -1234,10 +1239,9 @@ pub(crate) async fn delete_ticket_form_answers(
             .store()
             .delete(&ticket_form_answer_key(ticket.number, index))
             .await
+            && first_error.is_none()
         {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+            first_error = Some(error);
         }
     }
     first_error.map_or(Ok(()), Err)

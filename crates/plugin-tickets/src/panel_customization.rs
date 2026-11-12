@@ -98,6 +98,7 @@ impl Default for PanelCustomization {
 }
 
 impl PanelCustomization {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn valid(&self) -> bool {
         fn text(value: Option<&str>, max: usize, allow_empty: bool) -> bool {
             value.is_none_or(|value| {
@@ -400,6 +401,7 @@ impl PanelCustomization {
         serde_json::from_value(value).map(Some)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn schema_properties() -> Value {
         json!({
             "title": {

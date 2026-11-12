@@ -370,7 +370,7 @@ async fn validate_panel(
                 .as_ref()
                 .map_or_else(|| panel_roles(settings), panel_roles)
                 .into_iter()
-                .map(|role| role.get())
+                .map(twilight_model::id::Id::get)
                 .collect()
         });
         old_roles.sort_unstable();

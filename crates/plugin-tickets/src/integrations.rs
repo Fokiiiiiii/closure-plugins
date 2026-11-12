@@ -584,7 +584,7 @@ pub(crate) async fn resolve_welcome_placeholders(
                 for mapping in &integration.response_mappings {
                     let mapped = value_at_path(&payload, &mapping.path)
                         .and_then(scalar_text)
-                        .and_then(sanitize_mapped_text)
+                        .and_then(|value| sanitize_mapped_text(&value))
                         .unwrap_or_else(|| "N/A".to_owned());
                     values.insert(mapping.name.clone(), mapped);
                 }
@@ -714,7 +714,7 @@ fn scalar_text(value: &Value) -> Option<String> {
     }
 }
 
-fn sanitize_mapped_text(value: String) -> Option<String> {
+fn sanitize_mapped_text(value: &str) -> Option<String> {
     if value.chars().count() > MAX_PLACEHOLDER_VALUE_CHARS || value.chars().any(char::is_control) {
         return None;
     }
@@ -896,7 +896,7 @@ fn valid_url_template(url: &str) -> bool {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.contains('%') && valid_template_tokens(url, |token| is_context_token(token))
+    !authority.contains('%') && valid_template_tokens(url, is_context_token)
 }
 
 fn valid_template(template: &str, integration: &Integration) -> bool {

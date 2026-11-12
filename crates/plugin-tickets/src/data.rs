@@ -3,6 +3,8 @@ use std::fmt::Write as _;
 
 use closure_core::action::MessageCursor;
 
+// This submodule shares the parent ticket module's private model and helpers.
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 const DATA_SCAN_BATCH: usize = 50;

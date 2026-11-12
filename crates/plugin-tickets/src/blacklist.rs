@@ -77,7 +77,7 @@ pub(super) struct State {
 
 #[derive(Debug, Clone)]
 pub(super) struct Snapshot {
-    /// The store revision used for dashboard ETag and If-Match.
+    /// The store revision used for dashboard ETag and `If-Match`.
     pub(super) revision: Option<i64>,
     pub(super) state: State,
 }
@@ -170,6 +170,8 @@ pub(super) async fn dashboard_state(
     }
     state(ctx, panel).await
 }
+
+#[allow(clippy::too_many_arguments)]
 
 pub(super) async fn dashboard_change(
     ctx: &EventContext,
@@ -320,7 +322,7 @@ pub(super) async fn change(
                     changed: true,
                 });
             }
-            Err(StorageError::Conflict) if guard == RevisionGuard::Any => continue,
+            Err(StorageError::Conflict) if guard == RevisionGuard::Any => {}
             Err(StorageError::Conflict) => {
                 return Err(UserError::message("tickets-blacklist-conflict"));
             }

@@ -1,6 +1,11 @@
 //! Per-ticket waiting and automatic-close timers.
 
-use super::*;
+use super::{
+    Args, CLOSING_WAIT, ChannelId, Closed, Config, Event, EventContext, Flow, Hasher,
+    InteractionRef, ModuleError, RoleId, StorageError, Ticket, UserId,
+    finish_if_automation_generation, id_of, made_at, refresh_ticket_form_answer_ttl, stored,
+    ticket_key, ticket_ttl,
+};
 use closure_core::action::{Action, ChannelPatch, Outcome, Reason};
 use closure_core::error::DiscordError;
 use closure_core::permission::{Actor, PermissionKey};
@@ -931,13 +936,13 @@ async fn auto_close(
         return Ok(());
     }
     let reason = ctx.t_in(ctx.locale, reason_key, &Args::new());
-    if let Closed::BusyUntil(until) = finish_if_automation_generation(
+    if let Closed::BusyUntil(until) = Box::pin(finish_if_automation_generation(
         ctx,
         channel,
         ticket.close_generation,
         expected_generation,
         &reason,
-    )
+    ))
     .await?
     {
         schedule(ctx, channel, ticket, kind, since, until).await?;

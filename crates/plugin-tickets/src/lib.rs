@@ -4570,7 +4570,12 @@ fn ticket_config_revision(config: &Config, panel: Option<&NamedPanel>) -> u64 {
 
 async fn open(cx: ComponentCx) -> Result<(), UserError> {
     let panel_id = cx.data();
-    open_panel(cx, (!panel_id.is_empty()).then_some(panel_id), None).await
+    Box::pin(open_panel(
+        cx,
+        (!panel_id.is_empty()).then_some(panel_id),
+        None,
+    ))
+    .await
 }
 
 async fn open_select(cx: ComponentCx) -> Result<(), UserError> {
@@ -4579,7 +4584,7 @@ async fn open_select(cx: ComponentCx) -> Result<(), UserError> {
         return say(&cx, "tickets-panel-select-invalid", &Args::new()).await;
     }
     let panel_id = values[0].clone();
-    open_panel(cx, Some(panel_id), None).await
+    Box::pin(open_panel(cx, Some(panel_id), None)).await
 }
 
 fn panel_name_needs_nickname(panel: &NamedPanel) -> bool {
@@ -8100,13 +8105,13 @@ async fn approve_request(
     let reason = request
         .reason
         .unwrap_or_else(|| cx.t("tickets-close-request-approved-reason", &Args::new()));
-    let closed = match finish(
+    let closed = match Box::pin(finish(
         cx.ctx(),
         channel,
         Some(cx.user().id),
         &reason,
         Some(request_id),
-    )
+    ))
     .await
     {
         Ok(closed) => closed,
@@ -8146,7 +8151,7 @@ async fn expire_close_request(
     cx.reply_private_t("tickets-close-request-processing", &Args::new())
         .await?;
     let reason = cx.t("tickets-close-request-timeout-reason", &Args::new());
-    let closed = match finish(cx.ctx(), channel, None, &reason, Some(request_id)).await {
+    let closed = match Box::pin(finish(cx.ctx(), channel, None, &reason, Some(request_id))).await {
         Ok(closed) => closed,
         Err(error) => {
             tracing::warn!(?error, channel = %channel, "could not close an expired request");
