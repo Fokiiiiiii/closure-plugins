@@ -3430,11 +3430,9 @@ async fn say<I: InteractionRef + 'static>(
 }
 
 fn button(ctx: &EventContext, route: &str, style: ButtonStyle, label: &str) -> Component {
-    ui::button(
-        style,
-        ctx.t_in(ctx.locale, label, &Args::new()),
-        CustomId::new(route).encode(&ctx.module),
-    )
+    let custom_id = CustomId::new(route).encode(&ctx.module);
+    let custom_id = custom_id.strip_suffix(':').unwrap_or(&custom_id).to_owned();
+    ui::button(style, ctx.t_in(ctx.locale, label, &Args::new()), custom_id)
 }
 
 fn close_request_button(
