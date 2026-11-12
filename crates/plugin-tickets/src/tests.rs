@@ -868,28 +868,55 @@ async fn the_staff_close_and_claim_and_a_claim_is_taken_once() {
 async fn a_channel_that_could_not_be_deleted_is_still_a_ticket_and_closes_when_tried_again() {
     let harness = harness();
     harness.click(press("open", MEMBER)).await.unwrap();
-    seed_ticket(&harness, HERE, MEMBER).await;
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    assert_eq!(tickets.len(), 1);
+    let ticket_key = tickets[0].0.clone();
+    let ticket: Ticket = harness.store().get(&ticket_key).await.unwrap().unwrap();
+    let channel_id = ticket_key
+        .strip_prefix("ticket:")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let close = || {
+        Invocation::new("ticket")
+            .subcommand("close")
+            .user(MEMBER)
+            .channel(channel_id)
+    };
+
+    // The close response, transcript read, and log post precede DeleteChannel.
     harness
         .api()
-        .fail_nth(3, closure_core::error::DiscordError::Fatal("down".into()));
-    let first = harness.click(press("close", MEMBER)).await;
-    let key = format!("ticket:{HERE}");
-    let kept: Option<Ticket> = harness.store().get(&key).await.unwrap();
+        .fail_nth(4, closure_core::error::DiscordError::Fatal("down".into()));
+    let first = harness.invoke(close()).await;
+    assert!(
+        matches!(&first, Err(error) if format!("{error:?}").contains("down")),
+        "{first:?}"
+    );
+    let kept: Option<Ticket> = harness.store().get(&ticket_key).await.unwrap();
     assert!(
         kept.is_some(),
         "the ticket is not forgotten before its channel is gone: {first:?}"
     );
-    let archive_key = history_key(3, Id::new(HERE));
+    assert!(deleted(&harness).is_empty());
+    let archive_key = history_key(ticket.number, Id::new(channel_id));
     let history: TicketHistory = harness.store().get(&archive_key).await.unwrap().unwrap();
     assert_eq!(history.status, HistoryStatus::Closing);
     harness.advance(Duration::from_secs(400));
     let recovery = harness.run_due_jobs().await;
     assert_eq!(recovery.len(), 1);
     assert!(recovery[0].is_ok(), "{recovery:?}");
-    assert!(deleted(&harness).contains(&HERE));
+    assert!(deleted(&harness).contains(&channel_id));
     let history: TicketHistory = harness.store().get(&archive_key).await.unwrap().unwrap();
     assert_eq!(history.status, HistoryStatus::Closed);
-    assert!(harness.store().get::<Ticket>(&key).await.unwrap().is_none());
+    assert!(
+        harness
+            .store()
+            .get::<Ticket>(&ticket_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -3531,15 +3558,19 @@ async fn updating_a_panel_keeps_its_text_and_a_failed_update_can_be_retried() {
         panel_invocation(None, Some("99"))
             .option("channel", CommandOptionValue::Channel(ChannelId::new(HERE)))
     };
+    // The update reads the existing message, then sends one PostMessage update.
     harness
         .api()
         .fail_nth(2, closure_core::error::DiscordError::Fatal("down".into()));
-    let failed = harness.invoke(invoke()).await.unwrap();
+    let failed = harness.invoke(invoke()).await;
+    let Err(error) = failed else {
+        panic!("the injected panel update unexpectedly succeeded");
+    };
+    assert!(format!("{error:?}").contains("down"), "{error:?}");
     assert!(
-        failed.last().unwrap().content.contains("did not work"),
-        "{failed:?}"
+        posted_panels(&harness).is_empty(),
+        "the failed update is not recorded as a successful message change"
     );
-    assert!(!failed.last().unwrap().content.contains("was updated"));
 
     let updated = harness.invoke(invoke()).await.unwrap();
     assert!(
@@ -3547,7 +3578,7 @@ async fn updating_a_panel_keeps_its_text_and_a_failed_update_can_be_retried() {
         "{updated:?}"
     );
     let posts = posted_panels(&harness);
-    assert_eq!(posts.len(), 2);
+    assert_eq!(posts.len(), 1);
     let (channel, message_id, content, components) = posts.last().unwrap();
     assert_eq!(*channel, ChannelId::new(HERE));
     assert_eq!(*message_id, Some(MessageId::new(99)));
@@ -4556,10 +4587,10 @@ async fn answers_are_saved_and_reposted_when_the_ticket_welcome_fails() {
     }));
 
     harness.click(panel_press("", MEMBER)).await.unwrap();
-    // CreateChannel and channel verification precede the welcome PostMessage.
+    // Defer, CreateChannel, and channel verification precede the welcome PostMessage.
     harness
         .api()
-        .fail_nth(3, closure_core::error::DiscordError::Fatal("down".into()));
+        .fail_nth(4, closure_core::error::DiscordError::Fatal("down".into()));
     harness
         .submit(
             Submit::new(form_submit_id("", MEMBER, &default_form_config(&questions)))
@@ -4644,7 +4675,40 @@ async fn form_submission_after_hours_close_does_not_create_a_ticket() {
             .contains("Tickets are not available at this time.")
     );
     assert!(created(&harness).is_empty());
-    assert_eq!(harness.store().score(crate::OPEN, MEMBER).await.unwrap(), 0);
+    let reservation_prefix = format!("open-reservation:{MEMBER}:");
+    let reservation_keys: Vec<String> = harness
+        .store()
+        .list(&reservation_prefix, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    let reservations = open_reservations(&harness, MEMBER).await;
+    let reservation_state: Vec<_> = reservations
+        .iter()
+        .map(|reservation| {
+            (
+                reservation.number,
+                reservation.generation,
+                reservation.api_started,
+                reservation.channel.is_some(),
+                reservation.attempts,
+                reservation.released_at.is_some(),
+            )
+        })
+        .collect();
+    let open_state: Option<crate::OpenState> = harness
+        .store()
+        .get(&crate::open_state_key(MEMBER))
+        .await
+        .unwrap();
+    let open_lease_until = open_state.and_then(|state| state.lease.map(|lease| lease.until));
+    let open_score = harness.store().score(crate::OPEN, MEMBER).await.unwrap();
+    assert_eq!(
+        open_score, 0,
+        "after-hours reservation cleanup: keys={reservation_keys:?}, reservations={reservation_state:?}, score={open_score}, lease_until={open_lease_until:?}"
+    );
     assert_eq!(
         harness.store().score(crate::NUMBER, 0_u64).await.unwrap(),
         0
@@ -5657,7 +5721,11 @@ async fn concurrent_label_changes_are_preserved_and_closing_blocks_changes() {
         .unwrap();
     assert!(
         blocked.last().is_some_and(|reply| {
-            reply.ephemeral && reply.content.to_lowercase().contains("closing")
+            reply.ephemeral
+                && reply
+                    .content
+                    .to_lowercase()
+                    .contains("this is not an open ticket")
         }),
         "{blocked:?}"
     );
