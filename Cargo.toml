@@ -40,8 +40,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
-twilight-model = "0.17"
-twilight-util = { version = "0.17", features = ["builder", "permission-calculator"] }
+twilight-model = "0.18"
+twilight-util = { version = "0.18", features = ["builder", "permission-calculator"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

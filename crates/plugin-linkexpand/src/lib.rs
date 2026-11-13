@@ -867,6 +867,10 @@ async fn send_embeds(
                     proxy_url: None,
                     height: None,
                     width: None,
+                    content_type: None,
+                    placeholder: None,
+                    placeholder_version: None,
+                    flags: None,
                 });
             }
         }
