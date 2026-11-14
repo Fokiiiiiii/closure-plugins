@@ -5659,7 +5659,7 @@ async fn ticket_labels_report_the_store_size_limit_without_partial_write() {
             .last()
             .unwrap()
             .content
-            .contains("cannot store any more labels"),
+            .contains("cannot hold another label"),
         "{response:?}"
     );
     let ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
@@ -6982,7 +6982,7 @@ async fn a_failed_rating_dm_keeps_the_guild_command_fallback() {
     }));
     seed_ticket(&harness, HERE, MEMBER).await;
     harness.api().fail_nth(
-        4,
+        5,
         closure_core::error::DiscordError::Forbidden("DMs are disabled".into()),
     );
 
@@ -7067,7 +7067,7 @@ async fn a_staff_closer_is_told_to_relay_the_rating_command_when_dm_is_unconfirm
     }));
     seed_ticket(&harness, HERE, MEMBER).await;
     harness.api().fail_nth(
-        4,
+        5,
         closure_core::error::DiscordError::Forbidden("DMs are disabled".into()),
     );
 

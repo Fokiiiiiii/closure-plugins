@@ -403,6 +403,15 @@ struct AuditQuery {
     page_size: Option<usize>,
 }
 
+fn event_timestamp_from_key(event_key: &str) -> Option<i64> {
+    let reverse = event_key
+        .strip_prefix(EVENT_PREFIX)?
+        .get(..20)?
+        .parse::<u64>()
+        .ok()?;
+    i64::try_from(u64::MAX - reverse).ok()
+}
+
 pub(crate) async fn record_event(
     ctx: &EventContext,
     actor_id: u64,
@@ -455,17 +464,36 @@ pub(crate) async fn record_event(
                 .ok_or(DashboardActionError::Unavailable)?;
             let existing_key: String = serde_json::from_value(marker.value)
                 .map_err(|_| DashboardActionError::Unavailable)?;
-            if !existing_key.starts_with(EVENT_PREFIX)
-                || ctx
-                    .store()
-                    .entry(&existing_key)
-                    .await
-                    .map_err(|_| DashboardActionError::Unavailable)?
-                    .is_none()
-            {
+            if !existing_key.starts_with(EVENT_PREFIX) {
                 return Err(DashboardActionError::Unavailable);
             }
-            return Ok(());
+            if ctx
+                .store()
+                .entry(&existing_key)
+                .await
+                .map_err(|_| DashboardActionError::Unavailable)?
+                .is_some()
+            {
+                return Ok(());
+            }
+            // The marker survived an interrupted first write; rebuild the event under the key it reserved.
+            let timestamp =
+                event_timestamp_from_key(&existing_key).ok_or(DashboardActionError::Unavailable)?;
+            let entry = AuditEntry {
+                timestamp,
+                actor_id,
+                action,
+                resource: action.resource(),
+                outcome,
+            };
+            return match ctx
+                .store()
+                .replace(&existing_key, &entry, Expect::Missing, Some(RETENTION))
+                .await
+            {
+                Ok(_) | Err(StorageError::Conflict) => Ok(()),
+                Err(_) => Err(DashboardActionError::Unavailable),
+            };
         }
         Err(_) => return Err(DashboardActionError::Unavailable),
     }
@@ -765,4 +793,18 @@ pub(crate) async fn query(
         }),
         revision: 0,
     })
+}
+
+#[cfg(test)]
+mod event_key_tests {
+    use super::{EVENT_PREFIX, event_timestamp_from_key};
+
+    #[test]
+    fn event_timestamp_round_trips_through_the_key() {
+        let timestamp: i64 = 1_700_000_000;
+        let reverse = u64::MAX - timestamp.cast_unsigned();
+        let key = format!("{EVENT_PREFIX}{reverse:020}:0000000000000001:01:abc");
+        assert_eq!(event_timestamp_from_key(&key), Some(timestamp));
+        assert_eq!(event_timestamp_from_key("tickets:other:key"), None);
+    }
 }

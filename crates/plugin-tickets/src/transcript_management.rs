@@ -741,7 +741,8 @@ async fn schedule_backfill(ctx: &EventContext) -> Result<(), ModuleError> {
         .job(LABEL_BACKFILL_JOB, &())
         .map_err(|error| ModuleError::other(error.to_string()))?
         .key(LABEL_BACKFILL_KEY)
-        .if_absent()
+        // A continuation requested while this job is still running must survive its completion.
+        .unless_waiting()
         .after(BACKFILL_DELAY)
         .await
         .map_err(|error| ModuleError::other(error.to_string()))

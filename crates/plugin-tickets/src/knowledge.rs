@@ -1852,7 +1852,32 @@ fn valid_custom_embed(embed: Option<&Value>) -> bool {
     };
     embed.is_object()
         && serde_json::to_string(embed).is_ok_and(|serialized| serialized.chars().count() <= 6000)
-        && parse_custom_embed(embed).is_some()
+        && parse_custom_embed(embed).is_some_and(|parsed| custom_embed_within_limits(&parsed))
+}
+
+// Discord rejects the whole message when any of these limits is exceeded.
+fn custom_embed_within_limits(embed: &Embed) -> bool {
+    embed
+        .title
+        .as_deref()
+        .is_none_or(|title| title.chars().count() <= 256)
+        && embed
+            .description
+            .as_deref()
+            .is_none_or(|description| description.chars().count() <= 4096)
+        && embed
+            .author
+            .as_ref()
+            .is_none_or(|author| author.name.chars().count() <= 256)
+        && embed
+            .footer
+            .as_ref()
+            .is_none_or(|footer| footer.text.chars().count() <= 2048)
+        && embed.fields.len() <= 25
+        && embed.fields.iter().all(|field| {
+            (1..=256).contains(&field.name.chars().count())
+                && (1..=1024).contains(&field.value.chars().count())
+        })
 }
 
 fn parse_custom_embed(value: &Value) -> Option<Embed> {
@@ -2577,5 +2602,25 @@ mod tests {
             created_by_idempotency_key: None,
             last_update_idempotency_key: None,
         }));
+    }
+}
+
+#[cfg(test)]
+mod custom_embed_tests {
+    use super::valid_custom_embed;
+
+    #[test]
+    fn custom_embed_rejects_fields_longer_than_discord_limits() {
+        let long_title = "t".repeat(257);
+        let title_over = serde_json::json!({ "title": long_title });
+        assert!(!valid_custom_embed(Some(&title_over)));
+
+        let title_at_limit = serde_json::json!({ "title": "t".repeat(256) });
+        assert!(valid_custom_embed(Some(&title_at_limit)));
+
+        let field_value_over = serde_json::json!({
+            "fields": [{ "name": "Note", "value": "v".repeat(1025) }]
+        });
+        assert!(!valid_custom_embed(Some(&field_value_over)));
     }
 }

@@ -642,9 +642,15 @@ pub(crate) async fn dashboard_secret_state(
     Ok(json!({ "integrations": states }))
 }
 
+// A configured auth scheme implicitly owns the "token" secret; it is never declared in `secrets`.
+pub(crate) fn has_secret(integration: &Integration, name: &str) -> bool {
+    integration.secrets.iter().any(|secret| secret == name)
+        || (name == "token" && integration.auth != AuthKind::None)
+}
+
 fn integration_secret_names(integration: &Integration) -> Vec<String> {
     let mut names = integration.secrets.clone();
-    if integration.auth != AuthKind::None {
+    if has_secret(integration, "token") {
         names.push("token".to_owned());
     }
     names.sort();
@@ -1126,5 +1132,36 @@ mod tests {
                 source,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod implicit_secret_tests {
+    use super::{Integration, has_secret};
+
+    fn integration(auth: &str, secrets: &str) -> Integration {
+        serde_json::from_str(&format!(
+            r#"{{"id":"catalog","url":"https://example.com/items","auth":"{auth}","secrets":{secrets}}}"#
+        ))
+        .expect("test integration")
+    }
+
+    #[test]
+    fn declared_secret_is_known() {
+        assert!(has_secret(
+            &integration("none", r#"["api_key"]"#),
+            "api_key"
+        ));
+    }
+
+    #[test]
+    fn token_is_known_when_auth_is_configured_without_being_declared() {
+        assert!(has_secret(&integration("bearer", "[]"), "token"));
+        assert!(has_secret(&integration("api_key", "[]"), "token"));
+    }
+
+    #[test]
+    fn token_is_unknown_without_auth() {
+        assert!(!has_secret(&integration("none", "[]"), "token"));
     }
 }

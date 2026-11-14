@@ -387,14 +387,58 @@ pub(super) fn may_access(
             },
             |snapshot| {
                 snapshot.teams.iter().any(|team| {
-                    (team.users.contains(&actor_id)
-                        || actor_roles
-                            .iter()
-                            .any(|role| team.roles.contains(&role.get())))
+                    is_team_member(team, actor_id, actor_roles)
                         && current_team_includes(current_teams, team, actor_id, actor_roles)
                 })
             },
         )
+}
+
+pub(super) fn may_send(
+    snapshot: Option<&StaffAccessSnapshot>,
+    current_teams: &[StaffTeam],
+    legacy_roles: &[u64],
+    actor_id: u64,
+    actor_roles: &[RoleId],
+    can_manage: bool,
+) -> bool {
+    can_manage
+        || snapshot.map_or_else(
+            || {
+                may_access(
+                    None,
+                    current_teams,
+                    legacy_roles,
+                    actor_id,
+                    actor_roles,
+                    false,
+                )
+            },
+            |snapshot| {
+                snapshot.teams.iter().any(|team| {
+                    is_team_member(team, actor_id, actor_roles)
+                        && current_team_includes(current_teams, team, actor_id, actor_roles)
+                        && current_send_permission(current_teams, team)
+                })
+            },
+        )
+}
+
+fn is_team_member(team: &StaffTeamSnapshot, actor_id: u64, actor_roles: &[RoleId]) -> bool {
+    team.users.contains(&actor_id)
+        || actor_roles
+            .iter()
+            .any(|role| team.roles.contains(&role.get()))
+}
+
+// The team's current send_messages setting is what Discord enforces on the ticket channel.
+fn current_send_permission(current_teams: &[StaffTeam], team: &StaffTeamSnapshot) -> bool {
+    if team.id == DEFAULT_TEAM_ID {
+        return team.permissions.send_messages;
+    }
+    current_teams
+        .iter()
+        .any(|current| current.id == team.id && current.permissions.send_messages)
 }
 
 // A deleted team or a member removed from its current config loses access to old tickets.
@@ -1235,4 +1279,68 @@ pub(super) async fn exit_survey_answers_for_export(
         .get::<Vec<(String, String)>>(&survey_response_key(request))
         .await?
         .filter(|answers| !answers.is_empty()))
+}
+
+#[cfg(test)]
+mod send_permission_tests {
+    use super::*;
+
+    const ACTOR: u64 = 42;
+
+    fn current(id: &str, send: bool) -> StaffTeam {
+        StaffTeam {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            roles: Vec::new(),
+            users: vec![ACTOR.to_string()],
+            permissions: TeamPermissions {
+                send_messages: send,
+                ..TeamPermissions::default()
+            },
+        }
+    }
+
+    fn snapshot(id: &str, send: bool) -> StaffAccessSnapshot {
+        StaffAccessSnapshot {
+            teams: vec![StaffTeamSnapshot {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                roles: Vec::new(),
+                users: vec![ACTOR],
+                permissions: TeamPermissions {
+                    send_messages: send,
+                    ..TeamPermissions::default()
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn view_only_team_member_cannot_send_but_can_access() {
+        let teams = [current("view", false)];
+        let snap = snapshot("view", false);
+        assert!(may_access(Some(&snap), &teams, &[], ACTOR, &[], false));
+        assert!(!may_send(Some(&snap), &teams, &[], ACTOR, &[], false));
+    }
+
+    #[test]
+    fn team_member_with_send_permission_can_send() {
+        let teams = [current("support", true)];
+        let snap = snapshot("support", true);
+        assert!(may_send(Some(&snap), &teams, &[], ACTOR, &[], false));
+    }
+
+    #[test]
+    fn manager_can_send_without_team_permission() {
+        let teams = [current("view", false)];
+        let snap = snapshot("view", false);
+        assert!(may_send(Some(&snap), &teams, &[], 7, &[], true));
+    }
+
+    #[test]
+    fn send_permission_follows_current_team_config() {
+        let teams = [current("support", false)];
+        let snap = snapshot("support", true);
+        assert!(!may_send(Some(&snap), &teams, &[], ACTOR, &[], false));
+    }
 }

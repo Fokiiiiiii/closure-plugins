@@ -354,18 +354,27 @@ async fn resolve_form_questions_with_timeout(
                 )
                 .await
             };
-            *options = fetched.map_err(|error| match error {
+            let fetched = fetched.map_err(|error| match error {
                 integrations::OptionsError::TooManyOptions => {
                     UserError::message("tickets-form-options-too-many")
                 }
                 _ => UserError::message("tickets-form-options-unavailable"),
             })?;
+            *options = checked_fetched_options(fetched)?;
         }
     }
     if !valid_questions(&resolved) {
         return Err(UserError::message("tickets-form-invalid"));
     }
     Ok(resolved)
+}
+
+// An empty fetch cannot satisfy a required select, so it is reported as unavailable.
+fn checked_fetched_options(options: Vec<FormOption>) -> Result<Vec<FormOption>, UserError> {
+    if options.is_empty() {
+        return Err(UserError::message("tickets-form-options-unavailable"));
+    }
+    Ok(options)
 }
 
 pub(crate) fn form_modal_revision(base_revision: u64, questions: &[FormQuestion]) -> u64 {
@@ -437,7 +446,11 @@ impl FormQuestion {
                         *required,
                         *min_values,
                         *max_values,
-                        if dynamic { 25 } else { options.len() },
+                        if dynamic && options.is_empty() {
+                            25
+                        } else {
+                            options.len()
+                        },
                         false,
                         options,
                     )
@@ -1211,6 +1224,10 @@ pub(crate) async fn refresh_ticket_form_answer_ttl(
     ctx: &EventContext,
     ticket: &crate::Ticket,
 ) -> Result<(), StorageError> {
+    // Inline answers live in the ticket record; copying them to per-index keys would orphan those keys.
+    if ticket.form_answer_count == 0 {
+        return Ok(());
+    }
     let answers = load_ticket_form_answers(ctx, ticket).await?;
     for (index, answer) in answers.iter().enumerate() {
         ctx.store()
@@ -1361,4 +1378,73 @@ pub(crate) async fn send_form_answers(
             .map_err(|error| crate::failed(&error))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod dynamic_option_tests {
+    use super::*;
+    use crate::integrations::DynamicOptions;
+
+    fn option(value: &str) -> FormOption {
+        FormOption {
+            label: format!("Option {value}"),
+            value: value.to_owned(),
+            description: None,
+        }
+    }
+
+    fn dynamic_select(min_values: u8, max_values: u8, options: Vec<FormOption>) -> FormQuestion {
+        FormQuestion::Structured(FormQuestionKind::StringSelect {
+            label: "Pick".to_owned(),
+            description: None,
+            required: true,
+            options,
+            dynamic_options: Some(DynamicOptions {
+                integration: "catalog".to_owned(),
+                items_pointer: "/items".to_owned(),
+                label_pointer: "/name".to_owned(),
+                value_pointer: "/id".to_owned(),
+                description_pointer: None,
+            }),
+            min_values: Some(min_values),
+            max_values: Some(max_values),
+        })
+    }
+
+    #[test]
+    fn resolved_dynamic_select_checks_range_against_fetched_count() {
+        let question = dynamic_select(3, 3, vec![option("1"), option("2")]);
+        assert!(!valid_questions(&[question]));
+    }
+
+    #[test]
+    fn unresolved_dynamic_select_accepts_range_within_source_limit() {
+        let question = dynamic_select(3, 3, Vec::new());
+        assert!(valid_questions(&[question]));
+    }
+
+    #[test]
+    fn fetched_options_must_not_be_empty() {
+        assert!(checked_fetched_options(Vec::new()).is_err());
+        assert_eq!(
+            checked_fetched_options(vec![option("1")])
+                .map(|v| v.len())
+                .ok(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn select_without_options_or_source_is_rejected() {
+        let question = FormQuestion::Structured(FormQuestionKind::StringSelect {
+            label: "Pick".to_owned(),
+            description: None,
+            required: true,
+            options: Vec::new(),
+            dynamic_options: None,
+            min_values: None,
+            max_values: None,
+        });
+        assert!(!valid_questions(&[question]));
+    }
 }

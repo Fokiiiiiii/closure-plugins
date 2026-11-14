@@ -57,6 +57,8 @@ const MAX_TICKET_CUSTOM_ID_BYTES: usize = 100;
 #[cfg(test)]
 const MAX_FORM_QUESTION_CHARS: usize = advanced_forms::MAX_FORM_QUESTION_CHARS;
 const MAX_TICKET_BYTES: usize = 32 * 1024;
+// Room for the closing state that the close flow writes onto an existing ticket.
+const CLOSING_STATE_RESERVE_BYTES: usize = 64;
 const HISTORY_PREFIX: &str = "ticket-history:";
 const HISTORY_LINK_PREFIX: &str = "ticket-history-link:";
 const HISTORY_CONTENT_PREFIX: &str = "ticket-history-content:";
@@ -1454,6 +1456,11 @@ async fn set_open_score(ctx: &EventContext, user: u64, count: u64) -> Result<(),
     Ok(())
 }
 
+// A busy or leased reservation still needs its recovery job, even when the counter was reconciled.
+fn open_recovery_is_finished(counter_reconciled: bool, reservation_present: bool) -> bool {
+    counter_reconciled && !reservation_present
+}
+
 async fn reconcile_open_counter(ctx: &EventContext, user: u64) -> Result<bool, ModuleError> {
     let Some(token) = acquire_open_lock(ctx, user).await? else {
         return Ok(false);
@@ -1578,6 +1585,27 @@ fn reservation_channel_name(reservation: &OpenReservation) -> String {
     }
 }
 
+fn thread_channel_name(channel_name: &str, number: i64, token: i64) -> String {
+    if channel_name.trim().is_empty() {
+        format!("ticket-{number:04}-r{token}")
+    } else {
+        channel_name.to_owned()
+    }
+}
+
+// The stored name is what create_thread received, so verification must compare against it.
+fn thread_name_matches(channel_name: &str, number: i64, token: i64, found: Option<&str>) -> bool {
+    found == Some(thread_channel_name(channel_name, number, token).as_str())
+}
+
+fn closing_job_is_stale(ticket: &Ticket, job: &ClosingJob) -> bool {
+    ticket.close_generation != job.attempt
+}
+
+fn within_ticket_budget(size: usize) -> bool {
+    size.saturating_add(CLOSING_STATE_RESERVE_BYTES) <= MAX_TICKET_BYTES
+}
+
 fn has_open_reservation_marker(topic: Option<&str>, token: i64) -> bool {
     let marker = format!("ticket-reservation:{token}");
     topic.is_some_and(|topic| topic.split_whitespace().any(|part| part == marker))
@@ -1644,11 +1672,12 @@ async fn verify_open_channel(
                 found.id == channel
                     && found.kind == ChannelType::PrivateThread
                     && found.parent_id == Some(parent)
-                    && found.name.as_deref()
-                        == Some(
-                            format!("ticket-{:04}-r{}", reservation.number, reservation.token)
-                                .as_str(),
-                        )
+                    && thread_name_matches(
+                        &reservation.channel_name,
+                        reservation.number,
+                        reservation.token,
+                        found.name.as_deref(),
+                    )
             } else {
                 matches_open_channel(found.id, channel, found.topic.as_deref(), reservation.token)
             };
@@ -2524,7 +2553,12 @@ async fn open_recovery_job(cx: JobCx) -> Result<(), ModuleError> {
             ctx.now() + OPEN_RECOVERY_SECONDS,
         )
         .await?;
-        if reconcile_open_counter(ctx, job.opener).await? {
+        let reservation_present = read_open_reservation(ctx, job.opener, job.number)
+            .await?
+            .1
+            .is_some();
+        let counter_reconciled = reconcile_open_counter(ctx, job.opener).await?;
+        if open_recovery_is_finished(counter_reconciled, reservation_present) {
             cancel_open_recovery(ctx, job.opener, job.number).await;
         }
         return Ok(());
@@ -2591,6 +2625,9 @@ async fn open_recovery_job(cx: JobCx) -> Result<(), ModuleError> {
         match verify_open_channel(ctx, &reservation, channel).await? {
             OpenChannelStatus::Verified => {
                 if save_open_ticket(ctx, job.opener, &reservation, channel).await? {
+                    if let Err(error) = automation::start(ctx, channel).await {
+                        tracing::warn!(?error, %channel, "recovered ticket automation timers could not be started");
+                    }
                     let ticket = ticket_from_reservation(&reservation, job.opener);
                     announce_ticket(ctx, channel, &ticket).await;
                 }
@@ -3565,7 +3602,8 @@ async fn send_rating_prompt(
 
 #[allow(clippy::too_many_lines)]
 async fn send_history_link_dm(ctx: &EventContext, history: &TicketHistory) -> bool {
-    if history.status != HistoryStatus::Closed || history.opener_erased {
+    // The caller may pass the Closing snapshot taken before mark_history_closed; the stored record is checked below.
+    if history.opener_erased {
         return false;
     }
     let channel = ChannelId::new(history.channel_id);
@@ -6126,6 +6164,10 @@ async fn closing_job(cx: JobCx) -> Result<(), ModuleError> {
         attempt: job.attempt,
     };
     if history.status == HistoryStatus::Closed {
+        // A reopened ticket keeps the channel id; its newer generation must not be closed by this stale job.
+        if closing_job_is_stale(&ticket, &job) {
+            return Ok(());
+        }
         return complete_history_close(ctx, &closing, &history, true)
             .await
             .map(drop);
@@ -8950,11 +8992,19 @@ async fn change_label(cx: CommandCx, value: String, add: bool) -> Result<(), Use
                     .reply_private_t("tickets-label-exists", &Args::new())
                     .await;
             }
+            ticket.labels.push(label.clone());
+            ticket.labels.sort_by_cached_key(|value| label_key(value));
+            let size = serde_json::to_vec(&ticket)
+                .map_err(|error| failed(&error))?
+                .len();
+            if !within_ticket_budget(size) {
+                return cx
+                    .reply_private_t("tickets-label-limit", &Args::new())
+                    .await;
+            }
             transcript_management::register_label(ctx, &label)
                 .await
                 .map_err(|error| failed(&error))?;
-            ticket.labels.push(label.clone());
-            ticket.labels.sort_by_cached_key(|value| label_key(value));
         } else {
             let count = ticket.labels.len();
             ticket
@@ -11088,6 +11138,244 @@ mod transcript_management;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod thread_name_verification_tests {
+    use super::{thread_channel_name, thread_name_matches};
+
+    #[test]
+    fn verifies_thread_under_every_stored_naming_scheme() {
+        for stored in [
+            "ticket-0001-alice-r77",
+            "ticket-0001-123456789012345678-r77",
+            "ticket-0001-staff-help-r77",
+            "ticket-0001-r77",
+        ] {
+            assert!(thread_name_matches(stored, 1, 77, Some(stored)), "{stored}");
+        }
+    }
+
+    #[test]
+    fn rejects_thread_whose_name_is_not_the_stored_name() {
+        assert!(!thread_name_matches(
+            "ticket-0001-alice-r77",
+            1,
+            77,
+            Some("ticket-0001-r77")
+        ));
+        assert!(!thread_name_matches("ticket-0001-alice-r77", 1, 77, None));
+    }
+
+    #[test]
+    fn falls_back_to_fixed_format_when_no_name_was_stored() {
+        assert_eq!(thread_channel_name(" ", 1, 77), "ticket-0001-r77");
+        assert!(thread_name_matches("", 1, 77, Some("ticket-0001-r77")));
+    }
+}
+
+#[cfg(test)]
+mod close_flow_regression_tests {
+    use closure_core::action::Action;
+    use closure_core::event::GuildId;
+    use closure_sdk::CommandOptionValue;
+    use closure_sdk::Level;
+    use closure_sdk::testing::{Harness, Invocation};
+    use serde_json::json;
+    use twilight_model::id::Id;
+
+    use super::*;
+
+    const STAFF_ROLE: u64 = 30;
+    const MODERATOR: u64 = 200;
+    const LOG: u64 = 6;
+    const MEMBER: u64 = 7;
+    const HERE: u64 = 5;
+
+    fn harness() -> Harness {
+        let harness = Harness::new(builder().unwrap()).unwrap();
+        let guild: GuildId = Id::new(1);
+        let channels: Vec<twilight_model::channel::Channel> = [HERE, LOG]
+            .into_iter()
+            .map(|channel| {
+                serde_json::from_value(json!({
+                    "id": channel.to_string(),
+                    "type": 0,
+                    "guild_id": guild.get().to_string(),
+                    "name": format!("ticket-test-{channel}"),
+                    "topic": null,
+                    "parent_id": null,
+                    "permission_overwrites": []
+                }))
+                .unwrap()
+            })
+            .collect();
+        harness.api().set_channels(guild, channels);
+        harness.set_config(json!({
+            "staff_roles": [STAFF_ROLE.to_string()],
+            "log_channel": LOG.to_string(),
+            "max_open": 1
+        }));
+        harness.permissions(|permissions| {
+            permissions
+                .role_levels
+                .insert(Id::new(MODERATOR), Level::MODERATOR);
+        });
+        harness
+    }
+
+    async fn seed_ticket(harness: &Harness, labels: Vec<String>) {
+        let ticket = Ticket {
+            number: 3,
+            opener: MEMBER,
+            claimed_by: None,
+            created: 0,
+            closing: None,
+            close_generation: 0,
+            close_request: None,
+            panel: None,
+            staff_roles: None,
+            form_answers: Vec::new(),
+            labels,
+            settings: None,
+            form_answer_count: 0,
+            thread: false,
+            thread_parent: None,
+            closed: false,
+            pending_operation: None,
+            panel_role_baselines: Vec::new(),
+            participant_roles: Vec::new(),
+            panel_user_baselines: Vec::new(),
+            participant_users: Vec::new(),
+            waiting_for_reply: false,
+            staff_access: None,
+            automation: crate::automation::State::default(),
+            message_quote: None,
+            message_quote_message_id: None,
+        };
+        harness
+            .store()
+            .set(&format!("ticket:{HERE}"), &ticket)
+            .await
+            .unwrap();
+    }
+
+    async fn closed_history(harness: &Harness) -> TicketHistory {
+        let key = harness
+            .store()
+            .get::<String>(&history_id_key(ChannelId::new(HERE)))
+            .await
+            .unwrap()
+            .unwrap();
+        harness.store().get(&key).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn history_link_dm_is_sent_after_a_normal_close() {
+        let harness = harness();
+        seed_ticket(&harness, Vec::new()).await;
+
+        harness
+            .invoke(Invocation::new("ticket").subcommand("close").user(MEMBER))
+            .await
+            .unwrap();
+
+        let link_sent = harness.actions().into_iter().any(|action| {
+            matches!(
+                &action,
+                Action::SendDirectMessage { content: Some(text), .. }
+                    if text.contains("/ticket history 3")
+            )
+        });
+        assert!(link_sent, "the owner history link DM was not sent");
+    }
+
+    async fn labels_len(harness: &Harness) -> usize {
+        let ticket: Ticket = harness
+            .store()
+            .get(&format!("ticket:{HERE}"))
+            .await
+            .unwrap()
+            .unwrap();
+        ticket.labels.len()
+    }
+
+    async fn add_label(harness: &Harness, label: String) -> bool {
+        let before = labels_len(harness).await;
+        let _ = harness
+            .invoke(
+                Invocation::new("ticket")
+                    .subcommand("label add")
+                    .option("label", CommandOptionValue::String(label))
+                    .roles([MODERATOR])
+                    .user(MODERATOR),
+            )
+            .await;
+        labels_len(harness).await > before
+    }
+
+    #[tokio::test]
+    async fn a_ticket_filled_to_the_label_budget_can_still_start_closing() {
+        let harness = harness();
+        seed_ticket(&harness, Vec::new()).await;
+        // Descending label widths fill the ticket to within a few bytes of the limit.
+        let mut index = 0_usize;
+        for width in (1..=60).rev() {
+            while add_label(&harness, format!("{index:04}-{}", "x".repeat(width))).await {
+                index += 1;
+            }
+        }
+        assert!(labels_len(&harness).await > 20);
+
+        harness
+            .invoke(Invocation::new("ticket").subcommand("close").user(MEMBER))
+            .await
+            .unwrap();
+
+        assert_eq!(closed_history(&harness).await.number, 3);
+    }
+
+    #[test]
+    fn label_budget_keeps_room_for_closing_state() {
+        let limit = MAX_TICKET_BYTES - CLOSING_STATE_RESERVE_BYTES;
+        assert!(within_ticket_budget(limit));
+        assert!(!within_ticket_budget(limit + 1));
+    }
+
+    #[tokio::test]
+    async fn closing_job_from_before_a_reopen_is_stale() {
+        let harness = harness();
+        // A reopened ticket starts at generation 0, so the older job's attempt no longer matches.
+        seed_ticket(&harness, Vec::new()).await;
+        let ticket: Ticket = harness
+            .store()
+            .get(&format!("ticket:{HERE}"))
+            .await
+            .unwrap()
+            .unwrap();
+        let job = ClosingJob {
+            channel: HERE,
+            number: 3,
+            attempt: 1,
+        };
+        assert!(closing_job_is_stale(&ticket, &job));
+    }
+}
+
+#[cfg(test)]
+mod open_recovery_regression_tests {
+    use super::open_recovery_is_finished;
+
+    #[test]
+    fn busy_reservation_keeps_its_recovery_job_after_counter_reconcile() {
+        assert!(!open_recovery_is_finished(true, true));
+    }
+
+    #[test]
+    fn recovery_is_cancelled_only_when_reservation_is_gone() {
+        assert!(open_recovery_is_finished(true, false));
+        assert!(!open_recovery_is_finished(false, false));
+    }
+}
 
 #[cfg(test)]
 mod replies_visibility_tests {

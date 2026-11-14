@@ -623,3 +623,44 @@ fn sanitize_channel_name(value: &str, suffix: Option<&str>) -> String {
     }
     format!("{shortened}{suffix}")
 }
+
+#[cfg(test)]
+mod access_rule_order_tests {
+    use super::{AccessAction, AccessRule, PanelCustomization};
+
+    const EVERYONE: u64 = 1;
+    const STAFF_ROLE: u64 = 5;
+
+    fn rule(role: u64, action: AccessAction) -> AccessRule {
+        AccessRule {
+            role_id: role.to_string(),
+            action,
+        }
+    }
+
+    fn panel(access_rules: Vec<AccessRule>) -> PanelCustomization {
+        PanelCustomization {
+            access_rules,
+            ..PanelCustomization::default()
+        }
+    }
+
+    #[test]
+    fn documented_order_allows_listed_role_and_denies_everyone_else() {
+        let panel = panel(vec![
+            rule(STAFF_ROLE, AccessAction::Allow),
+            rule(EVERYONE, AccessAction::Deny),
+        ]);
+        assert!(panel.allows(&[STAFF_ROLE], EVERYONE));
+        assert!(!panel.allows(&[], EVERYONE));
+    }
+
+    #[test]
+    fn everyone_deny_first_shadows_later_allow() {
+        let panel = panel(vec![
+            rule(EVERYONE, AccessAction::Deny),
+            rule(STAFF_ROLE, AccessAction::Allow),
+        ]);
+        assert!(!panel.allows(&[STAFF_ROLE], EVERYONE));
+    }
+}

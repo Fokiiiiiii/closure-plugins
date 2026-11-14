@@ -1180,13 +1180,8 @@ fn valid_embed(embed: Option<&TagEmbed>) -> bool {
             .iter()
             .all(|field| valid_text(&field.name, 256) && valid_text(&field.value, 1_024))
         && total_text_chars <= MAX_EMBED_CHARS
-        && (embed.title.is_some()
-            || embed.description.is_some()
-            || embed.author_name.is_some()
-            || embed.footer_text.is_some()
-            || embed.thumbnail_url.is_some()
-            || embed.image_url.is_some()
-            || !embed.fields.is_empty())
+        // The renderer builds the embed before adding author, footer and images, so those alone cannot render.
+        && (embed.title.is_some() || embed.description.is_some() || !embed.fields.is_empty())
         && serde_json::to_vec(embed).is_ok_and(|value| value.len() <= MAX_EMBED_CHARS)
 }
 
@@ -1288,5 +1283,70 @@ mod tests {
             last_update_idempotency_key: None,
         };
         assert!(valid_record(&tag));
+    }
+}
+
+#[cfg(test)]
+mod embed_render_tests {
+    use super::{TagEmbed, TagEmbedField, tag_embed, valid_embed};
+
+    fn accepted_embeds() -> Vec<TagEmbed> {
+        vec![
+            TagEmbed {
+                title: Some("Policy".to_owned()),
+                ..TagEmbed::default()
+            },
+            TagEmbed {
+                description: Some("Body".to_owned()),
+                ..TagEmbed::default()
+            },
+            TagEmbed {
+                fields: vec![TagEmbedField {
+                    name: "Name".to_owned(),
+                    value: "Value".to_owned(),
+                    inline: false,
+                }],
+                ..TagEmbed::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn every_embed_the_validator_accepts_renders() {
+        let candidates = [
+            TagEmbed {
+                author_name: Some("Author".to_owned()),
+                image_url: Some("https://example.com/image.png".to_owned()),
+                ..TagEmbed::default()
+            },
+            TagEmbed {
+                footer_text: Some("Footer".to_owned()),
+                thumbnail_url: Some("https://example.com/thumb.png".to_owned()),
+                ..TagEmbed::default()
+            },
+        ];
+        for embed in candidates {
+            assert!(
+                !valid_embed(Some(&embed)),
+                "validator must reject {embed:?}"
+            );
+        }
+        for embed in accepted_embeds() {
+            assert!(valid_embed(Some(&embed)));
+            assert!(
+                tag_embed(&embed, 0).is_ok(),
+                "renderer must accept {embed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_acceptance_implies_render_success() {
+        let author_and_image = TagEmbed {
+            author_name: Some("Author".to_owned()),
+            image_url: Some("https://example.com/image.png".to_owned()),
+            ..TagEmbed::default()
+        };
+        assert!(!valid_embed(Some(&author_and_image)) || tag_embed(&author_and_image, 0).is_ok());
     }
 }

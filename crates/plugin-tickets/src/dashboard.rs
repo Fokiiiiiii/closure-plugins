@@ -1098,7 +1098,10 @@ async fn ticket_action(
         if !may_close(&ticket, actor.user, staff) {
             return Err(DashboardActionError::Forbidden);
         }
-    } else if !staff {
+    } else if !staff
+        || (request.action == "ticket.reply"
+            && !ticket_can_send(&ticket, &access, actor, can_manage))
+    {
         return Err(DashboardActionError::Forbidden);
     }
     if request.action != "ticket.close" && !ticket.is_open() {
@@ -2036,6 +2039,17 @@ fn ticket_staff(ticket: &Ticket, config: &Config, actor: &Actor, can_manage: boo
     )
 }
 
+fn ticket_can_send(ticket: &Ticket, config: &Config, actor: &Actor, can_manage: bool) -> bool {
+    teams_survey::may_send(
+        ticket.staff_access.as_ref(),
+        &config.staff_teams,
+        &history_staff_roles(ticket, config),
+        actor.user.get(),
+        &actor.roles,
+        can_manage,
+    )
+}
+
 fn panel_visible(
     ctx: &EventContext,
     config: &Config,
@@ -2231,7 +2245,7 @@ fn configured_integration<'a>(
         return Err(DashboardActionError::Conflict);
     }
     if !valid_integration_secret_name(secret_name)
-        || !integration.secrets.iter().any(|name| name == secret_name)
+        || !integrations::has_secret(integration, secret_name)
     {
         return Err(DashboardActionError::Invalid(
             "invalid integration secret name".into(),
