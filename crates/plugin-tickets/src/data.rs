@@ -1538,9 +1538,7 @@ async fn export_open_tickets(
     let mut after = String::new();
     loop {
         files.renew(ctx).await?;
-        let entries = ctx
-            .store()
-            .list_after("ticket:", &after, DATA_SCAN_BATCH)
+        let entries = scan_page(ctx, "ticket:", &after)
             .await
             .map_err(|error| stored(&error))?;
         let entries_len = entries.len();
@@ -1764,9 +1762,7 @@ async fn export_closed_histories(
     let mut after = String::new();
     loop {
         files.renew(ctx).await?;
-        let entries = ctx
-            .store()
-            .list_after(HISTORY_PREFIX, &after, DATA_SCAN_BATCH)
+        let entries = scan_page(ctx, HISTORY_PREFIX, &after)
             .await
             .map_err(|error| stored(&error))?;
         let entries_len = entries.len();
@@ -2178,6 +2174,19 @@ fn erase_args(stats: &EraseStats) -> Args {
         .with("pointers", stats.pointers_removed.to_string())
 }
 
+/// `list_after` rejects an empty cursor, so the first page of a scan is a plain `list`.
+async fn scan_page(
+    ctx: &EventContext,
+    prefix: &str,
+    after: &str,
+) -> Result<Vec<(String, Entry)>, StorageError> {
+    if after.is_empty() {
+        ctx.store().list(prefix, DATA_SCAN_BATCH).await
+    } else {
+        ctx.store().list_after(prefix, after, DATA_SCAN_BATCH).await
+    }
+}
+
 async fn inspect_open_tickets(
     ctx: &EventContext,
     user: UserId,
@@ -2188,9 +2197,7 @@ async fn inspect_open_tickets(
     let mut after = String::new();
     loop {
         renew_data_operation(ctx, user, token).await?;
-        let entries = ctx
-            .store()
-            .list_after("ticket:", &after, DATA_SCAN_BATCH)
+        let entries = scan_page(ctx, "ticket:", &after)
             .await
             .map_err(|error| stored(&error))?;
         let entries_len = entries.len();
@@ -2289,16 +2296,14 @@ async fn erase_closed_histories(
     let mut after = String::new();
     loop {
         renew_data_operation(ctx, user, token).await?;
-        let entries = ctx
-            .store()
-            .list_after(HISTORY_PREFIX, &after, DATA_SCAN_BATCH)
+        let entries = scan_page(ctx, HISTORY_PREFIX, &after)
             .await
             .map_err(|error| stored(&error))?;
         let entries_len = entries.len();
         for (key, _) in &entries {
             after = key.clone();
             renew_data_operation(ctx, user, token).await?;
-            match erase_history(ctx, key, user, token, confirm).await {
+            match erase_history(ctx, key, user, token, !confirm).await {
                 Ok(result) => {
                     if result.matched
                         && let Some(channel) = result.channel_id
@@ -3084,5 +3089,129 @@ mod tests {
             &sample_history(HistoryStatus::Closed, 3, None),
             UserId::new(7)
         ));
+    }
+}
+
+#[cfg(test)]
+mod erase_confirm_tests {
+    use closure_core::event::GuildId;
+    use closure_sdk::CommandOptionValue;
+    use closure_sdk::testing::{Harness, Invocation};
+    use serde_json::json;
+    use twilight_model::id::Id;
+
+    use super::*;
+
+    const STAFF_ROLE: u64 = 30;
+    const LOG: u64 = 6;
+    const HERE: u64 = 5;
+    const MEMBER: u64 = 7;
+
+    fn harness() -> Harness {
+        let harness = Harness::new(crate::builder().unwrap()).unwrap();
+        let guild: GuildId = Id::new(1);
+        let channels: Vec<twilight_model::channel::Channel> = [HERE, LOG]
+            .into_iter()
+            .map(|channel| {
+                serde_json::from_value(json!({
+                    "id": channel.to_string(),
+                    "type": 0,
+                    "guild_id": guild.get().to_string(),
+                    "name": format!("ticket-test-{channel}"),
+                    "topic": null,
+                    "parent_id": null,
+                    "permission_overwrites": []
+                }))
+                .unwrap()
+            })
+            .collect();
+        harness.api().set_channels(guild, channels);
+        harness.set_config(json!({
+            "staff_roles": [STAFF_ROLE.to_string()],
+            "log_channel": LOG.to_string(),
+            "max_open": 1
+        }));
+        harness
+    }
+
+    fn erase_invocation(confirm: bool) -> Invocation {
+        Invocation::new("ticket")
+            .subcommand("data erase")
+            .option("confirm", CommandOptionValue::Boolean(confirm))
+            .user(MEMBER)
+    }
+
+    async fn stored_history(harness: &Harness) -> TicketHistory {
+        let key = history_key(3, ChannelId::new(HERE));
+        harness.store().get(&key).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn erase_preview_leaves_the_closed_history_and_confirm_anonymizes_it() {
+        let harness = harness();
+        let ticket = Ticket {
+            number: 3,
+            opener: MEMBER,
+            claimed_by: None,
+            created: 0,
+            closing: None,
+            close_generation: 0,
+            close_request: None,
+            panel: None,
+            staff_roles: None,
+            form_answers: Vec::new(),
+            form_answer_count: 0,
+            labels: Vec::new(),
+            settings: None,
+            thread: false,
+            thread_parent: None,
+            closed: false,
+            pending_operation: None,
+            panel_role_baselines: Vec::new(),
+            participant_roles: Vec::new(),
+            panel_user_baselines: Vec::new(),
+            participant_users: Vec::new(),
+            waiting_for_reply: false,
+            staff_access: None,
+            automation: crate::automation::State::default(),
+            message_quote: None,
+            message_quote_message_id: None,
+        };
+        harness
+            .store()
+            .set(&format!("ticket:{HERE}"), &ticket)
+            .await
+            .unwrap();
+        harness
+            .invoke(Invocation::new("ticket").subcommand("close").user(MEMBER))
+            .await
+            .unwrap();
+        let closed = stored_history(&harness).await;
+        assert_eq!(closed.opener, MEMBER);
+        assert!(!closed.opener_erased);
+        assert_eq!(
+            closed.transcript_span_pages, closed.transcript_pages,
+            "fixture must not be a legacy history"
+        );
+        assert_eq!(closed.status, HistoryStatus::Closed);
+
+        harness.invoke(erase_invocation(false)).await.unwrap();
+        let preview = stored_history(&harness).await;
+        assert_eq!(preview.opener, MEMBER, "a preview must not anonymize");
+        assert!(!preview.opener_erased, "a preview must not anonymize");
+
+        // The test clock does not age the released lease, so the preview's lease is cleared here.
+        harness
+            .store()
+            .delete(&format!("ticket-data-operation:{MEMBER}"))
+            .await
+            .unwrap();
+        harness.invoke(erase_invocation(true)).await.unwrap();
+        let erased = stored_history(&harness).await;
+        assert!(
+            erased.opener_erased,
+            "confirm must anonymize the owner's history"
+        );
+        assert_eq!(erased.opener, 0);
     }
 }

@@ -1050,6 +1050,7 @@ async fn completed_ticket_action(
         .ok_or(DashboardActionError::NotFound)?;
     let staff = teams_survey::may_access(
         history.staff_access.as_ref(),
+        &config.staff_teams,
         &history.staff_roles,
         actor.user.get(),
         &actor.roles,
@@ -1081,7 +1082,7 @@ async fn ticket_action(
     let Some(entry) = ctx.store().entry(&key).await.map_err(internal)? else {
         if request.action == "ticket.close"
             && let Some(result) =
-                replay_closed_ticket(ctx, actor, request, channel, can_manage).await?
+                replay_closed_ticket(ctx, actor, config, request, channel, can_manage).await?
         {
             return Ok(result);
         }
@@ -1753,6 +1754,7 @@ async fn change_label(
 async fn replay_closed_ticket(
     ctx: &EventContext,
     actor: &Actor,
+    config: &Config,
     request: &DashboardActionRequest,
     channel: ChannelId,
     can_manage: bool,
@@ -1791,6 +1793,7 @@ async fn replay_closed_ticket(
     };
     let staff = teams_survey::may_access(
         history.staff_access.as_ref(),
+        &config.staff_teams,
         &history.staff_roles,
         actor.user.get(),
         &actor.roles,
@@ -2025,6 +2028,7 @@ fn tickets_manage(ctx: &EventContext, actor: &Actor) -> Result<bool, DashboardAc
 fn ticket_staff(ticket: &Ticket, config: &Config, actor: &Actor, can_manage: bool) -> bool {
     teams_survey::may_access(
         ticket.staff_access.as_ref(),
+        &config.staff_teams,
         &history_staff_roles(ticket, config),
         actor.user.get(),
         &actor.roles,
@@ -2059,6 +2063,7 @@ fn panel_visible(
     .map_err(user_error)?;
     Ok(teams_survey::may_access(
         snapshot.as_ref(),
+        &config.staff_teams,
         &legacy_roles,
         actor.user.get(),
         &actor.roles,

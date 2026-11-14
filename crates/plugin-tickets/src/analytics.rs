@@ -298,6 +298,7 @@ async fn scan_open_tickets(
         let roles = history_staff_roles(&ticket, &access);
         if !teams_survey::may_access(
             ticket.staff_access.as_ref(),
+            &config.staff_teams,
             &roles,
             actor.user.get(),
             &actor.roles,
@@ -401,6 +402,7 @@ fn history_visible(
     };
     teams_survey::may_access(
         history.staff_access.as_ref(),
+        &config.staff_teams,
         &roles,
         actor.user.get(),
         &actor.roles,

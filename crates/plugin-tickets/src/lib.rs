@@ -918,6 +918,7 @@ struct HistorySearchAccess<'a> {
     actor_id: u64,
     roles: &'a [RoleId],
     can_manage: bool,
+    staff_teams: &'a [teams_survey::StaffTeam],
 }
 
 enum HistoryTextSearch {
@@ -4481,6 +4482,7 @@ async fn is_staff_with_snapshot<I: InteractionRef + 'static>(
         .collect::<Vec<_>>();
     teams_survey::may_access(
         staff_access,
+        &config.staff_teams,
         &legacy_roles,
         cx.user().id.get(),
         &actor.roles,
@@ -4507,6 +4509,7 @@ async fn is_ticket_staff<I: InteractionRef + 'static>(
     let actor = cx.actor().await;
     teams_survey::may_access(
         ticket.staff_access.as_ref(),
+        &config.staff_teams,
         &history_staff_roles(ticket, config),
         cx.user().id.get(),
         &actor.roles,
@@ -6688,7 +6691,13 @@ async fn search_history_record(
     access: &HistorySearchAccess<'_>,
     page_budget: &mut usize,
 ) -> Result<HistoryRecordSearch, ModuleError> {
-    if !may_view_history(access.actor_id, access.roles, access.can_manage, &history) {
+    if !may_view_history(
+        access.actor_id,
+        access.roles,
+        access.can_manage,
+        &history,
+        access.staff_teams,
+    ) {
         return Ok(HistoryRecordSearch::Inaccessible);
     }
     if history.status != HistoryStatus::Closed {
@@ -7095,9 +7104,11 @@ fn may_view_history(
     roles: &[RoleId],
     can_manage: bool,
     history: &TicketHistory,
+    staff_teams: &[teams_survey::StaffTeam],
 ) -> bool {
     teams_survey::may_access(
         history.staff_access.as_ref(),
+        staff_teams,
         &history.staff_roles,
         actor_id,
         roles,
@@ -8777,6 +8788,7 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
         };
         let is_ticket_staff = teams_survey::may_access(
             initial_ticket.staff_access.as_ref(),
+            &config.staff_teams,
             &staff_roles,
             user.get(),
             &member.roles,
@@ -9135,7 +9147,6 @@ enum NoteSave {
 
 #[derive(Debug)]
 struct NoteAccess {
-    panel: Option<NamedPanel>,
     ticket_number: i64,
 }
 
@@ -9192,7 +9203,11 @@ async fn save_note(
             if page.notes.is_empty() || page.notes.len() > NOTES_PER_PAGE {
                 return Err(UserError::message("tickets-failed"));
             }
-            if page.notes.len() < NOTES_PER_PAGE {
+            // A page's own access snapshot is its only authority, so a moved ticket starts a new page.
+            if page.notes.len() < NOTES_PER_PAGE
+                && page.panel == ticket.panel
+                && page.staff_access == ticket.staff_access
+            {
                 page.notes.push(note.clone());
                 (
                     last_key.clone(),
@@ -9258,6 +9273,15 @@ async fn note_access(
             tracing::warn!(?error, channel = %channel, "could not read a ticket");
             UserError::message("tickets-failed")
         })?;
+    if let Some(ticket) = live_ticket.as_ref() {
+        // An open ticket's current access gates the request; each page is then checked by its own access.
+        if !is_ticket_staff(cx, ticket, &config.for_ticket(ticket)).await {
+            return Err(UserError::message("tickets-staff-only"));
+        }
+        return Ok(NoteAccess {
+            ticket_number: ticket.number,
+        });
+    }
     let first_page = ctx
         .store()
         .list(&note_pages_prefix(channel), 1)
@@ -9273,38 +9297,16 @@ async fn note_access(
         tracing::warn!(?error, channel = %channel, "could not read a ticket note page");
         UserError::message("tickets-failed")
     })?;
-    let access_config = live_ticket.as_ref().map_or_else(
-        || {
-            page.panel
-                .as_ref()
-                .map_or_else(|| config.clone(), |panel| config.with_panel(panel))
-        },
-        |ticket| config.for_ticket(ticket),
-    );
-    let may_access = if let Some(ticket) = live_ticket.as_ref() {
-        is_ticket_staff(cx, ticket, &access_config).await
-    } else {
-        is_staff_with_snapshot(cx, &access_config, page.staff_access.as_ref()).await
-    };
-    if !may_access {
-        return Err(UserError::message("tickets-staff-only"));
-    }
-    if live_ticket.as_ref().is_some_and(|ticket| {
-        ticket.panel.as_ref() != page.panel.as_ref()
-            || ticket.staff_access != page.staff_access
-            || ticket.number != page.ticket_number
-    }) {
-        return Err(UserError::message("tickets-failed"));
-    }
     Ok(NoteAccess {
-        panel: page.panel,
         ticket_number: page.ticket_number,
     })
 }
 
 async fn read_note_pages(
+    cx: &CommandCx,
     ctx: &EventContext,
     channel: ChannelId,
+    config: &Config,
     access: &NoteAccess,
 ) -> Result<Vec<StaffNotePage>, UserError> {
     let pages = ctx
@@ -9315,14 +9317,16 @@ async fn read_note_pages(
             tracing::warn!(?error, channel = %channel, "could not list ticket notes");
             UserError::message("tickets-failed")
         })?;
+    if pages.is_empty() {
+        return Err(UserError::message("tickets-notes-empty"));
+    }
     let mut note_pages = Vec::with_capacity(pages.len());
     for (_, entry) in &pages {
         let page: StaffNotePage = serde_json::from_value(entry.value.clone()).map_err(|error| {
             tracing::warn!(?error, channel = %channel, "could not read a ticket note page");
             UserError::message("tickets-failed")
         })?;
-        if page.panel != access.panel
-            || page.ticket_number != access.ticket_number
+        if page.ticket_number != access.ticket_number
             || page.notes.is_empty()
             || page.notes.len() > NOTES_PER_PAGE
             || page
@@ -9332,10 +9336,16 @@ async fn read_note_pages(
         {
             return Err(UserError::message("tickets-failed"));
         }
-        note_pages.push(page);
+        let page_config = page
+            .panel
+            .as_ref()
+            .map_or_else(|| config.clone(), |panel| config.with_panel(panel));
+        if is_staff_with_snapshot(cx, &page_config, page.staff_access.as_ref()).await {
+            note_pages.push(page);
+        }
     }
     if note_pages.is_empty() {
-        return Err(UserError::message("tickets-notes-empty"));
+        return Err(UserError::message("tickets-staff-only"));
     }
     Ok(note_pages)
 }
@@ -9397,7 +9407,7 @@ async fn list_notes(cx: CommandCx, args: NotesArgs) -> Result<(), UserError> {
     let Some(page_index) = page_index else {
         return Err(UserError::message("tickets-notes-page-not-found"));
     };
-    let pages = read_note_pages(ctx, channel, &access).await?;
+    let pages = read_note_pages(&cx, ctx, channel, &config, &access).await?;
     let Some(page) = pages.get(page_index) else {
         return Err(UserError::message("tickets-notes-page-not-found"));
     };
@@ -9422,7 +9432,7 @@ async fn list_notes(cx: CommandCx, args: NotesArgs) -> Result<(), UserError> {
         content.push('\n');
         content.push_str(&note.text);
     }
-    cx.reply_private(content).await
+    cx.reply_secret(content).await
 }
 
 async fn search_history(cx: CommandCx, args: SearchHistory) -> Result<(), UserError> {
@@ -9442,10 +9452,12 @@ async fn search_history(cx: CommandCx, args: SearchHistory) -> Result<(), UserEr
     )
     .map_err(|error| failed(&error))?;
     let roles = cx.actor().await.roles;
+    let staff_config: Config = cx.config()?;
     let access = HistorySearchAccess {
         actor_id: cx.user().id.get(),
         roles: &roles,
         can_manage: cx.require("tickets.manage").await.is_ok(),
+        staff_teams: &staff_config.staff_teams,
     };
     let mut hits = search_history_batch(ctx, &mut state, &access)
         .await
@@ -9557,10 +9569,12 @@ async fn search_history_next(cx: ComponentCx) -> Result<(), UserError> {
     }
     let original = state.clone();
     let roles = cx.actor().await.roles;
+    let staff_config: Config = cx.config()?;
     let access = HistorySearchAccess {
         actor_id: cx.user().id.get(),
         roles: &roles,
         can_manage: cx.require("tickets.manage").await.is_ok(),
+        staff_teams: &staff_config.staff_teams,
     };
     let mut next = state;
     let hits = match search_history_batch(ctx, &mut next, &access).await {
@@ -9621,6 +9635,7 @@ async fn search_history_next(cx: ComponentCx) -> Result<(), UserError> {
 
 #[allow(clippy::too_many_lines)]
 async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError> {
+    let config: Config = cx.config()?;
     if args.number <= 0 {
         return cx
             .reply_private_t("tickets-history-not-found", &Args::new())
@@ -9680,7 +9695,9 @@ async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError>
     let opener_may_view = history.opener == actor_id && !history.opener_erased;
     let roles = cx.actor().await.roles;
     let can_manage = cx.require("tickets.manage").await.is_ok();
-    if !opener_may_view && !may_view_history(actor_id, &roles, can_manage, &history) {
+    if !opener_may_view
+        && !may_view_history(actor_id, &roles, can_manage, &history, &config.staff_teams)
+    {
         return cx
             .reply_private_t("tickets-history-not-found", &Args::new())
             .await;
@@ -9773,15 +9790,15 @@ async fn view_history(cx: CommandCx, args: ViewHistory) -> Result<(), UserError>
             ),
         );
     }
-    cx.reply_private_t(
+    let page_text = cx.t(
         "tickets-history-page",
         &Args::new()
             .with("number", history.number)
             .with("page", page)
             .with("pages", total_pages)
             .with("content", content),
-    )
-    .await
+    );
+    cx.reply_secret(page_text).await
 }
 
 fn reply_prefix(ticket: &Ticket) -> String {
@@ -11071,3 +11088,145 @@ mod transcript_management;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod replies_visibility_tests {
+    use closure_core::event::GuildId;
+    use closure_sdk::CommandOptionValue;
+    use closure_sdk::testing::{Harness, Invocation};
+    use serde_json::json;
+    use twilight_model::id::Id;
+
+    use super::*;
+
+    const STAFF_ROLE: u64 = 30;
+    const HERE: u64 = 5;
+    const LOG: u64 = 6;
+    const MEMBER: u64 = 7;
+    const STAFF: u64 = 401;
+
+    fn harness(replies: &str) -> Harness {
+        let harness = Harness::new(builder().unwrap()).unwrap();
+        let guild: GuildId = Id::new(1);
+        let channels: Vec<twilight_model::channel::Channel> = [HERE, LOG]
+            .into_iter()
+            .map(|channel| {
+                serde_json::from_value(json!({
+                    "id": channel.to_string(),
+                    "type": 0,
+                    "guild_id": guild.get().to_string(),
+                    "name": format!("ticket-test-{channel}"),
+                    "topic": null,
+                    "parent_id": null,
+                    "permission_overwrites": []
+                }))
+                .unwrap()
+            })
+            .collect();
+        harness.api().set_channels(guild, channels);
+        harness.api().set_member(guild, staff_member());
+        harness.set_config(json!({
+            "staff_roles": [STAFF_ROLE.to_string()],
+            "log_channel": LOG.to_string(),
+            "max_open": 1,
+            "replies": replies
+        }));
+        harness
+    }
+
+    fn staff_member() -> twilight_model::guild::Member {
+        serde_json::from_value(json!({
+            "deaf": false,
+            "mute": false,
+            "flags": 0,
+            "roles": [STAFF_ROLE.to_string()],
+            "user": {
+                "id": STAFF.to_string(),
+                "username": "staff",
+                "discriminator": "0",
+                "avatar": null,
+                "bot": false
+            }
+        }))
+        .unwrap()
+    }
+
+    async fn seed_ticket(harness: &Harness, channel: u64, opener: u64) {
+        let ticket = Ticket {
+            number: 3,
+            opener,
+            claimed_by: None,
+            created: 0,
+            closing: None,
+            close_generation: 0,
+            close_request: None,
+            panel: None,
+            staff_roles: None,
+            form_answers: Vec::new(),
+            labels: Vec::new(),
+            settings: None,
+            form_answer_count: 0,
+            thread: false,
+            thread_parent: None,
+            closed: false,
+            pending_operation: None,
+            panel_role_baselines: Vec::new(),
+            participant_roles: Vec::new(),
+            panel_user_baselines: Vec::new(),
+            participant_users: Vec::new(),
+            waiting_for_reply: false,
+            staff_access: None,
+            automation: crate::automation::State::default(),
+            message_quote: None,
+            message_quote_message_id: None,
+        };
+        harness
+            .store()
+            .set(&format!("ticket:{channel}"), &ticket)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn staff_notes_are_shown_only_ephemerally_when_replies_are_public() {
+        let harness = harness("public");
+        seed_ticket(&harness, HERE, MEMBER).await;
+        let saved = harness
+            .invoke(
+                Invocation::new("ticket")
+                    .subcommand("note")
+                    .option(
+                        "text",
+                        CommandOptionValue::String("internal remark".to_owned()),
+                    )
+                    .roles([STAFF_ROLE])
+                    .user(STAFF),
+            )
+            .await
+            .unwrap();
+        assert!(
+            saved.last().unwrap().content.contains("Staff note saved"),
+            "{saved:?}"
+        );
+
+        let shown = harness
+            .invoke(
+                Invocation::new("ticket")
+                    .subcommand("notes")
+                    .option("ticket", CommandOptionValue::String(HERE.to_string()))
+                    .roles([STAFF_ROLE])
+                    .user(STAFF),
+            )
+            .await
+            .unwrap();
+        let carrying_note: Vec<_> = shown
+            .iter()
+            .filter(|reply| reply.content.contains("internal remark"))
+            .collect();
+        assert!(!carrying_note.is_empty(), "{shown:?}");
+        assert!(
+            carrying_note.iter().all(|reply| reply.ephemeral),
+            "{shown:?}"
+        );
+    }
+}

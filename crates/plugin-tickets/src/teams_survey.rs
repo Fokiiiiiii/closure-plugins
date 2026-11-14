@@ -372,6 +372,7 @@ pub(super) fn staff_roles(snapshot: &StaffAccessSnapshot) -> Vec<u64> {
 
 pub(super) fn may_access(
     snapshot: Option<&StaffAccessSnapshot>,
+    current_teams: &[StaffTeam],
     legacy_roles: &[u64],
     actor_id: u64,
     actor_roles: &[RoleId],
@@ -386,13 +387,38 @@ pub(super) fn may_access(
             },
             |snapshot| {
                 snapshot.teams.iter().any(|team| {
-                    team.users.contains(&actor_id)
+                    (team.users.contains(&actor_id)
                         || actor_roles
                             .iter()
-                            .any(|role| team.roles.contains(&role.get()))
+                            .any(|role| team.roles.contains(&role.get())))
+                        && current_team_includes(current_teams, team, actor_id, actor_roles)
                 })
             },
         )
+}
+
+// A deleted team or a member removed from its current config loses access to old tickets.
+// shortcut: the default team has no staff_teams entry, so only its snapshot is checked; upgrade when the panel's current staff roles reach this function.
+fn current_team_includes(
+    current_teams: &[StaffTeam],
+    team: &StaffTeamSnapshot,
+    actor_id: u64,
+    actor_roles: &[RoleId],
+) -> bool {
+    if team.id == DEFAULT_TEAM_ID {
+        return true;
+    }
+    current_teams.iter().any(|current| {
+        current.id == team.id
+            && (current
+                .users
+                .iter()
+                .any(|user| user.parse::<u64>().ok() == Some(actor_id))
+                || current.roles.iter().any(|role| {
+                    role.parse::<u64>()
+                        .is_ok_and(|role| actor_roles.iter().any(|actor| actor.get() == role))
+                }))
+    })
 }
 
 pub(super) fn role_overwrites(
@@ -1086,9 +1112,11 @@ pub(super) async fn view_exit_survey(cx: ComponentCx) -> Result<(), UserError> {
     };
     let roles = cx.actor().await.roles;
     let can_manage = cx.require("tickets.manage").await.is_ok();
+    let config: Config = cx.config()?;
     if !survey_history_matches_closed(&history, request)
         || !may_access(
             history.staff_access.as_ref(),
+            &config.staff_teams,
             &history.staff_roles,
             cx.user().id.get(),
             &roles,

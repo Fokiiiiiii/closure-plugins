@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
 
-use super::{HistoryStatus, Ticket, TicketHistory, history_id_key, history_ttl, may_view_history};
+use super::{
+    Config, HistoryStatus, Ticket, TicketHistory, history_id_key, history_ttl, may_view_history,
+};
 
 const LABEL_CATALOG_KEY: &str = "ticket-label-catalog:v1";
 const LABEL_DEFINITION_PREFIX: &str = "ticket-label-definition:";
@@ -96,7 +98,14 @@ pub(super) async fn state(
     if history.status != HistoryStatus::Closed {
         return Err(DashboardActionError::NotFound);
     }
-    if !may_view_history(actor.user.get(), &actor.roles, can_manage, &history) {
+    let config: Config = ctx.parse_config().map_err(super::dashboard::internal)?;
+    if !may_view_history(
+        actor.user.get(),
+        &actor.roles,
+        can_manage,
+        &history,
+        &config.staff_teams,
+    ) {
         return Err(DashboardActionError::Forbidden);
     }
     Ok((history_projection(&history, channel_id, false), revision))
@@ -116,7 +125,14 @@ pub(super) async fn update(
     if history.status != HistoryStatus::Closed {
         return Err(DashboardActionError::NotFound);
     }
-    if !may_view_history(actor.user.get(), &actor.roles, can_manage, &history) {
+    let config: Config = ctx.parse_config().map_err(super::dashboard::internal)?;
+    if !may_view_history(
+        actor.user.get(),
+        &actor.roles,
+        can_manage,
+        &history,
+        &config.staff_teams,
+    ) {
         return Err(DashboardActionError::Forbidden);
     }
     if revision != expected_revision {

@@ -815,6 +815,7 @@ pub(super) async fn reopen_ticket(cx: CommandCx, (): ()) -> Result<(), UserError
     let opener_is_staff = member.as_ref().is_some_and(|member| {
         teams_survey::may_access(
             ticket.staff_access.as_ref(),
+            &original.staff_teams,
             &legacy_staff_roles,
             opener,
             &member.roles,

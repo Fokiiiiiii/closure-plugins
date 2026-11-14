@@ -14,6 +14,7 @@ use twilight_model::guild::Permissions;
 use twilight_model::id::Id;
 use twilight_model::id::marker::ChannelMarker;
 
+use crate::teams_survey::{StaffAccessSnapshot, StaffTeamSnapshot, TeamPermissions};
 use crate::{
     CLOSE_REQUEST_TIMEOUT, CLOSING, CloseRequestExpiry, CloseRequestTimeout, ClosingJob, Config,
     HISTORY_PAGE_BYTES, HISTORY_SEARCH_PAGE_BUDGET, HISTORY_VALUE_BYTES, HistorySearchState,
@@ -3929,7 +3930,7 @@ async fn note_history_has_no_small_per_ticket_count_limit() {
 }
 
 #[tokio::test]
-async fn mismatched_note_page_snapshots_never_authorize_a_mixed_archive() {
+async fn mismatched_note_page_is_authorized_only_by_its_own_access() {
     let harness = harness();
     seed_ticket(&harness, HERE, MEMBER).await;
     for number in 1..=9 {
@@ -3967,14 +3968,22 @@ async fn mismatched_note_page_snapshots_never_authorize_a_mixed_archive() {
         .await
         .unwrap();
 
-    let replies = harness
+    let first = harness
         .invoke(notes_invocation(HERE, Some(1), MODERATOR, &[STAFF_ROLE]))
         .await
         .unwrap();
-    assert!(replies.last().unwrap().ephemeral, "{replies:?}");
-    assert!(replies.last().unwrap().content.contains("did not work"));
-    assert!(!replies.last().unwrap().content.contains("note 1"));
-    assert!(!replies.last().unwrap().content.contains("note 9"));
+    let content = &first.last().unwrap().content;
+    assert!(content.contains("note 1"), "{first:?}");
+    assert!(!content.contains("note 9"), "{first:?}");
+
+    let second = harness
+        .invoke(notes_invocation(HERE, Some(2), MODERATOR, &[STAFF_ROLE]))
+        .await
+        .unwrap();
+    assert!(
+        second.last().unwrap().content.contains("not available"),
+        "{second:?}"
+    );
 }
 
 #[tokio::test]
@@ -7081,4 +7090,164 @@ async fn a_staff_closer_is_told_to_relay_the_rating_command_when_dm_is_unconfirm
     );
     assert_eq!(deleted(&harness), [HERE]);
     assert!(closed_history(&harness, HERE).await.rating_prompt_attempted);
+}
+
+const A_STAFF: u64 = 401;
+const B_STAFF: u64 = 402;
+
+fn team_snapshot(team: &str, users: &[u64]) -> StaffAccessSnapshot {
+    StaffAccessSnapshot {
+        teams: vec![StaffTeamSnapshot {
+            id: team.to_owned(),
+            name: team.to_owned(),
+            roles: Vec::new(),
+            users: users.to_vec(),
+            permissions: TeamPermissions::default(),
+        }],
+    }
+}
+
+fn team_config(teams: &[(&str, &[u64])]) -> serde_json::Value {
+    let staff_teams: Vec<serde_json::Value> = teams
+        .iter()
+        .map(|(id, users)| {
+            json!({
+                "id": id,
+                "name": id,
+                "users": users.iter().map(u64::to_string).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "max_open": 1,
+        "staff_teams": staff_teams
+    })
+}
+
+async fn set_staff_access(harness: &Harness, channel: u64, staff_access: StaffAccessSnapshot) {
+    let key = format!("ticket:{channel}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.staff_access = Some(staff_access);
+    harness.store().set(&key, &ticket).await.unwrap();
+}
+
+#[tokio::test]
+async fn notes_written_after_a_team_transfer_stay_behind_their_own_access() {
+    let harness = harness();
+    harness.set_config(team_config(&[("a", &[A_STAFF]), ("b", &[B_STAFF])]));
+    seed_ticket(&harness, HERE, MEMBER).await;
+    set_staff_access(&harness, HERE, team_snapshot("a", &[A_STAFF])).await;
+    let saved = harness
+        .invoke(note_invocation("before transfer", A_STAFF, &[]))
+        .await
+        .unwrap();
+    assert!(
+        saved.last().unwrap().content.contains("Staff note saved"),
+        "{saved:?}"
+    );
+
+    set_staff_access(&harness, HERE, team_snapshot("b", &[B_STAFF])).await;
+    let saved = harness
+        .invoke(note_invocation("after transfer", B_STAFF, &[]))
+        .await
+        .unwrap();
+    assert!(
+        saved.last().unwrap().content.contains("Staff note saved"),
+        "{saved:?}"
+    );
+
+    let open_for_b = harness
+        .invoke(notes_invocation(HERE, None, B_STAFF, &[]))
+        .await
+        .unwrap();
+    let content = &open_for_b.last().unwrap().content;
+    assert!(content.contains("after transfer"), "{open_for_b:?}");
+    assert!(!content.contains("before transfer"), "{open_for_b:?}");
+
+    harness
+        .store()
+        .delete(&format!("ticket:{HERE}"))
+        .await
+        .unwrap();
+    let closed_for_b = harness
+        .invoke(notes_invocation(HERE, None, B_STAFF, &[]))
+        .await
+        .unwrap();
+    let content = &closed_for_b.last().unwrap().content;
+    assert!(content.contains("after transfer"), "{closed_for_b:?}");
+    assert!(!content.contains("before transfer"), "{closed_for_b:?}");
+    assert!(content.contains("page 1 of 1"), "{closed_for_b:?}");
+
+    let closed_for_a = harness
+        .invoke(notes_invocation(HERE, None, A_STAFF, &[]))
+        .await
+        .unwrap();
+    let content = &closed_for_a.last().unwrap().content;
+    assert!(content.contains("before transfer"), "{closed_for_a:?}");
+    assert!(!content.contains("after transfer"), "{closed_for_a:?}");
+    assert!(content.contains("page 1 of 1"), "{closed_for_a:?}");
+}
+
+#[tokio::test]
+async fn removing_a_user_from_the_current_team_denies_their_old_ticket_access() {
+    let harness = harness();
+    harness.set_config(team_config(&[("a", &[A_STAFF, B_STAFF])]));
+    seed_ticket(&harness, HERE, MEMBER).await;
+    set_staff_access(&harness, HERE, team_snapshot("a", &[A_STAFF, B_STAFF])).await;
+    harness
+        .invoke(note_invocation("kept", A_STAFF, &[]))
+        .await
+        .unwrap();
+
+    let allowed = harness
+        .invoke(notes_invocation(HERE, None, B_STAFF, &[]))
+        .await
+        .unwrap();
+    assert!(
+        allowed.last().unwrap().content.contains("kept"),
+        "{allowed:?}"
+    );
+
+    harness.set_config(team_config(&[("a", &[A_STAFF])]));
+    let denied = harness
+        .invoke(notes_invocation(HERE, None, B_STAFF, &[]))
+        .await
+        .unwrap();
+    assert!(
+        denied.last().unwrap().content.contains("Only the staff"),
+        "{denied:?}"
+    );
+
+    let still_allowed = harness
+        .invoke(notes_invocation(HERE, None, A_STAFF, &[]))
+        .await
+        .unwrap();
+    assert!(
+        still_allowed.last().unwrap().content.contains("kept"),
+        "{still_allowed:?}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_team_denies_its_old_ticket_access() {
+    let harness = harness();
+    harness.set_config(team_config(&[("a", &[A_STAFF])]));
+    seed_ticket(&harness, HERE, MEMBER).await;
+    set_staff_access(&harness, HERE, team_snapshot("a", &[A_STAFF])).await;
+    harness
+        .invoke(note_invocation("kept", A_STAFF, &[]))
+        .await
+        .unwrap();
+
+    harness.set_config(team_config(&[]));
+    let denied = harness
+        .invoke(notes_invocation(HERE, None, A_STAFF, &[]))
+        .await
+        .unwrap();
+    assert!(
+        denied.last().unwrap().content.contains("Only the staff"),
+        "{denied:?}"
+    );
 }
