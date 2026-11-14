@@ -109,7 +109,7 @@ dependencies = [
 [[package]]
 name = "closure-core"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#4cc2c988fb8e57c3f341f199120694309c5edce0"
+source = "git+https://github.com/Fokiiiiiii/closure#42c077d932ad3a697aa9b4bf5ca3d3a9503805de"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -128,7 +128,7 @@ dependencies = [
 [[package]]
 name = "closure-i18n"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#4cc2c988fb8e57c3f341f199120694309c5edce0"
+source = "git+https://github.com/Fokiiiiiii/closure#42c077d932ad3a697aa9b4bf5ca3d3a9503805de"
 dependencies = [
  "closure-core",
  "fluent-bundle",
@@ -155,7 +155,7 @@ dependencies = [
 [[package]]
 name = "closure-sdk"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#4cc2c988fb8e57c3f341f199120694309c5edce0"
+source = "git+https://github.com/Fokiiiiiii/closure#42c077d932ad3a697aa9b4bf5ca3d3a9503805de"
 dependencies = [
  "async-trait",
  "closure-core",
@@ -173,7 +173,7 @@ dependencies = [
 [[package]]
 name = "closure-sdk-macros"
 version = "0.1.0"
-source = "git+https://github.com/Fokiiiiiii/closure#4cc2c988fb8e57c3f341f199120694309c5edce0"
+source = "git+https://github.com/Fokiiiiiii/closure#42c077d932ad3a697aa9b4bf5ca3d3a9503805de"
 dependencies = [
  "proc-macro2",
  "quote",
