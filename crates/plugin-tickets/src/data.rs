@@ -34,6 +34,64 @@ fn data_operation_key(user: UserId) -> String {
     format!("{DATA_OPERATION_PREFIX}{}", user.get())
 }
 
+const MAX_TICKET_FETCHES_PER_RUN: usize = 10;
+const DATA_SCAN_CURSOR_PREFIX: &str = "ticket-data-cursor:";
+const DATA_SCAN_CURSOR_TTL: std::time::Duration = std::time::Duration::from_mins(60);
+
+/// How an open-ticket scan stopped: at the per-run fetch cap, or at the end of the tickets.
+enum ScanEnd {
+    Finished,
+    Capped { after: String },
+}
+
+fn data_scan_cursor_key(kind: &str, user: UserId) -> String {
+    format!("{DATA_SCAN_CURSOR_PREFIX}{kind}:{}", user.get())
+}
+
+async fn load_scan_cursor(
+    ctx: &EventContext,
+    kind: &str,
+    user: UserId,
+) -> Result<String, ModuleError> {
+    let cursor: Option<String> = ctx
+        .store()
+        .get(&data_scan_cursor_key(kind, user))
+        .await
+        .map_err(|error| stored(&error))?;
+    Ok(cursor
+        .filter(|key| key.starts_with("ticket:"))
+        .unwrap_or_default())
+}
+
+async fn save_scan_cursor(
+    ctx: &EventContext,
+    kind: &str,
+    user: UserId,
+    after: &str,
+) -> Result<(), ModuleError> {
+    ctx.store()
+        .set_for(
+            &data_scan_cursor_key(kind, user),
+            &after,
+            DATA_SCAN_CURSOR_TTL,
+        )
+        .await
+        .map_err(|error| stored(&error))?;
+    Ok(())
+}
+
+async fn clear_scan_cursor(
+    ctx: &EventContext,
+    kind: &str,
+    user: UserId,
+) -> Result<(), ModuleError> {
+    ctx.store()
+        .delete(&data_scan_cursor_key(kind, user))
+        .await
+        .map_err(|error| stored(&error))?;
+    Ok(())
+}
+
 async fn acquire_data_operation(
     ctx: &EventContext,
     user: UserId,
@@ -1191,6 +1249,7 @@ impl ExportFiles {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn export_my_data(cx: CommandCx, _args: ExportMyData) -> Result<(), UserError> {
     cx.defer(true).await?;
     let user = cx.user().id;
@@ -1220,36 +1279,49 @@ pub(super) async fn export_my_data(cx: CommandCx, _args: ExportMyData) -> Result
     let mut stats = ExportStats::default();
     let mut files = ExportFiles::new(user, ctx.guild_id, token);
 
-    let result = async {
-        export_open_tickets(ctx, user, &mut files, &mut stats).await?;
-        export_closed_histories(ctx, user, &mut files, &mut stats).await?;
+    let result: Result<bool, ModuleError> = async {
+        let start_after = load_scan_cursor(ctx, "export", user).await?;
+        let scan_complete =
+            match export_open_tickets(ctx, user, &mut files, &mut stats, start_after).await? {
+                ScanEnd::Finished => {
+                    clear_scan_cursor(ctx, "export", user).await?;
+                    export_closed_histories(ctx, user, &mut files, &mut stats).await?;
+                    true
+                }
+                ScanEnd::Capped { after } => {
+                    save_scan_cursor(ctx, "export", user, &after).await?;
+                    false
+                }
+            };
         files
             .finish(
                 ctx,
                 serde_json::json!({
-                "kind": "manifest",
-                "schema_version": 1,
-                "guild_id": ctx.guild_id.get(),
-                "user_id": user.get(),
-                "complete": stats.complete(),
-                "legacy_histories_not_exported": stats.legacy_histories,
-                "staff_log_copies_not_exported": stats.log_copies,
-                "staff_authored_close_reasons_omitted": stats.staff_reasons_omitted,
-                "active_ticket_read_errors": stats.active_read_errors,
-                "active_ticket_transcripts_truncated": stats.active_truncated_tickets,
-                "closed_ticket_transcripts_truncated": stats.truncated_histories,
-                "unfinished_histories": stats.pending_histories,
-                "closed_retained_tickets_not_erased": stats.closed_retained_tickets,
-                "closed_retained_messages_not_erased": stats.closed_retained_messages,
-                "unreadable_records": stats.malformed_records,
-                "own_messages_exported": stats.own_messages,
+                    "kind": "manifest",
+                    "schema_version": 1,
+                    "guild_id": ctx.guild_id.get(),
+                    "user_id": user.get(),
+                    "complete": scan_complete && stats.complete(),
+                    "open_ticket_scan_complete": scan_complete,
+                    "legacy_histories_not_exported": stats.legacy_histories,
+                    "staff_log_copies_not_exported": stats.log_copies,
+                    "staff_authored_close_reasons_omitted": stats.staff_reasons_omitted,
+                    "active_ticket_read_errors": stats.active_read_errors,
+                    "active_ticket_transcripts_truncated": stats.active_truncated_tickets,
+                    "closed_ticket_transcripts_truncated": stats.truncated_histories,
+                    "unfinished_histories": stats.pending_histories,
+                    "closed_retained_tickets_not_erased": stats.closed_retained_tickets,
+                    "closed_retained_messages_not_erased": stats.closed_retained_messages,
+                    "unreadable_records": stats.malformed_records,
+                    "own_messages_exported": stats.own_messages,
                     "private_note_pages_not_exported": stats.private_note_pages_not_exported,
-                "private_note_scan_incomplete": stats.private_note_scan_incomplete,
-                "knowledge_suggestion_states_not_exported":
-                    stats.knowledge_suggestion_states_not_exported
+                    "private_note_scan_incomplete": stats.private_note_scan_incomplete,
+                    "knowledge_suggestion_states_not_exported":
+                        stats.knowledge_suggestion_states_not_exported
                 }),
             )
-            .await
+            .await?;
+        Ok(scan_complete)
     }
     .await;
     if let Err(error) = release_data_operation(ctx, user, token).await {
@@ -1260,21 +1332,32 @@ pub(super) async fn export_my_data(cx: CommandCx, _args: ExportMyData) -> Result
         );
     }
 
-    if let Err(error) = result {
-        tracing::warn!(
-            ?error,
-            sent_parts = files.sent_parts,
-            "ticket data export was incomplete"
-        );
-        let key = if files.sent_parts == 0 {
-            "tickets-data-export-failed"
-        } else {
-            "tickets-data-export-partial"
-        };
+    let scan_complete = match result {
+        Ok(scan_complete) => scan_complete,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                sent_parts = files.sent_parts,
+                "ticket data export was incomplete"
+            );
+            let key = if files.sent_parts == 0 {
+                "tickets-data-export-failed"
+            } else {
+                "tickets-data-export-partial"
+            };
+            return cx
+                .reply_private_t(
+                    key,
+                    &Args::new().with("parts", files.sent_parts.to_string()),
+                )
+                .await;
+        }
+    };
+    if !scan_complete {
         return cx
             .reply_private_t(
-                key,
-                &Args::new().with("parts", files.sent_parts.to_string()),
+                "tickets-data-export-partial-scan",
+                &Args::new().with("parts", files.part.to_string()),
             )
             .await;
     }
@@ -1534,8 +1617,10 @@ async fn export_open_tickets(
     user: UserId,
     files: &mut ExportFiles,
     stats: &mut ExportStats,
-) -> Result<(), ModuleError> {
-    let mut after = String::new();
+    start_after: String,
+) -> Result<ScanEnd, ModuleError> {
+    let mut after = start_after;
+    let mut fetches = 0;
     loop {
         files.renew(ctx).await?;
         let entries = scan_page(ctx, "ticket:", &after)
@@ -1543,6 +1628,9 @@ async fn export_open_tickets(
             .map_err(|error| stored(&error))?;
         let entries_len = entries.len();
         for (key, entry) in entries {
+            if fetches == MAX_TICKET_FETCHES_PER_RUN {
+                return Ok(ScanEnd::Capped { after });
+            }
             after = key.clone();
             files.renew(ctx).await?;
             let Some(channel) = key
@@ -1579,6 +1667,7 @@ async fn export_open_tickets(
                 )
                 .await?;
             }
+            fetches += 1;
             let (messages, truncated) = match ticket_messages(ctx, ChannelId::new(channel)).await {
                 Ok(messages) => messages,
                 Err(error) => {
@@ -1749,7 +1838,7 @@ async fn export_open_tickets(
             break;
         }
     }
-    Ok(())
+    Ok(ScanEnd::Finished)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2102,10 +2191,29 @@ pub(super) async fn erase_my_data(cx: CommandCx, args: EraseMyData) -> Result<()
         }
     }
     let mut stats = EraseStats::default();
+    // Preview and confirm keep separate cursors so that a preview never resumes a real run.
+    let cursor_kind = if args.confirm {
+        "erase"
+    } else {
+        "erase-preview"
+    };
 
-    let result = async {
-        inspect_open_tickets(ctx, user, token, args.confirm, &mut stats).await?;
-        erase_closed_histories(ctx, user, token, args.confirm, &mut stats).await
+    let result: Result<bool, ModuleError> = async {
+        let start_after = load_scan_cursor(ctx, cursor_kind, user).await?;
+        // A resumed run already anonymized the closed histories on its first run.
+        if start_after.is_empty() {
+            erase_closed_histories(ctx, user, token, args.confirm, &mut stats).await?;
+        }
+        match inspect_open_tickets(ctx, user, token, args.confirm, &mut stats, start_after).await? {
+            ScanEnd::Finished => {
+                clear_scan_cursor(ctx, cursor_kind, user).await?;
+                Ok(true)
+            }
+            ScanEnd::Capped { after } => {
+                save_scan_cursor(ctx, cursor_kind, user, &after).await?;
+                Ok(false)
+            }
+        }
     }
     .await;
     if let Err(error) = release_data_operation(ctx, user, token).await {
@@ -2116,14 +2224,22 @@ pub(super) async fn erase_my_data(cx: CommandCx, args: EraseMyData) -> Result<()
         );
     }
 
-    if let Err(error) = result {
-        tracing::warn!(
-            ?error,
-            changed = stats.anonymized_histories,
-            "ticket data anonymization was incomplete"
-        );
+    let scan_complete = match result {
+        Ok(scan_complete) => scan_complete,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                changed = stats.anonymized_histories,
+                "ticket data anonymization was incomplete"
+            );
+            return cx
+                .reply_private_t("tickets-data-erase-partial", &erase_args(&stats))
+                .await;
+        }
+    };
+    if !scan_complete {
         return cx
-            .reply_private_t("tickets-data-erase-partial", &erase_args(&stats))
+            .reply_private_t("tickets-data-erase-partial-scan", &erase_args(&stats))
             .await;
     }
 
@@ -2193,8 +2309,10 @@ async fn inspect_open_tickets(
     token: u64,
     confirm: bool,
     stats: &mut EraseStats,
-) -> Result<(), ModuleError> {
-    let mut after = String::new();
+    start_after: String,
+) -> Result<ScanEnd, ModuleError> {
+    let mut after = start_after;
+    let mut fetches = 0;
     loop {
         renew_data_operation(ctx, user, token).await?;
         let entries = scan_page(ctx, "ticket:", &after)
@@ -2202,6 +2320,9 @@ async fn inspect_open_tickets(
             .map_err(|error| stored(&error))?;
         let entries_len = entries.len();
         for (key, entry) in entries {
+            if fetches == MAX_TICKET_FETCHES_PER_RUN {
+                return Ok(ScanEnd::Capped { after });
+            }
             after = key.clone();
             renew_data_operation(ctx, user, token).await?;
             let Some(channel) = key
@@ -2225,6 +2346,7 @@ async fn inspect_open_tickets(
             if confirm && owner {
                 cancel_owner_ticket_suggestions(ctx, channel_id, ticket.number).await?;
             }
+            fetches += 1;
             let (messages, truncated) = match ticket_messages(ctx, channel_id).await {
                 Ok(messages) => messages,
                 Err(error) => {
@@ -2283,7 +2405,7 @@ async fn inspect_open_tickets(
             break;
         }
     }
-    Ok(())
+    Ok(ScanEnd::Finished)
 }
 
 async fn erase_closed_histories(
@@ -3213,5 +3335,236 @@ mod erase_confirm_tests {
             "confirm must anonymize the owner's history"
         );
         assert_eq!(erased.opener, 0);
+    }
+}
+
+#[cfg(test)]
+mod scan_cap_tests {
+    use closure_core::event::GuildId;
+    use closure_sdk::CommandOptionValue;
+    use closure_sdk::testing::{Harness, Invocation};
+    use serde_json::json;
+    use twilight_model::id::Id;
+
+    use super::*;
+
+    const STAFF_ROLE: u64 = 30;
+    const LOG: u64 = 6;
+    const HERE: u64 = 5;
+    const MEMBER: u64 = 7;
+    const OTHER: u64 = 9;
+    const OPEN_CHANNEL_BASE: u64 = 1000;
+    const OPEN_TICKET_COUNT: u64 = MAX_TICKET_FETCHES_PER_RUN as u64 + 1;
+    const RESUME_MARKER: &str = "run this command again";
+
+    fn harness() -> Harness {
+        let harness = Harness::new(crate::builder().unwrap()).unwrap();
+        let guild: GuildId = Id::new(1);
+        let channels: Vec<twilight_model::channel::Channel> = [HERE, LOG]
+            .into_iter()
+            .chain(OPEN_CHANNEL_BASE..OPEN_CHANNEL_BASE + OPEN_TICKET_COUNT)
+            .map(|channel| {
+                serde_json::from_value(json!({
+                    "id": channel.to_string(),
+                    "type": 0,
+                    "guild_id": guild.get().to_string(),
+                    "name": format!("ticket-test-{channel}"),
+                    "topic": null,
+                    "parent_id": null,
+                    "permission_overwrites": []
+                }))
+                .unwrap()
+            })
+            .collect();
+        harness.api().set_channels(guild, channels);
+        harness.set_config(json!({
+            "staff_roles": [STAFF_ROLE.to_string()],
+            "log_channel": LOG.to_string(),
+            "max_open": 1
+        }));
+        harness
+    }
+
+    fn ticket(number: i64, opener: u64, closed: bool) -> Ticket {
+        Ticket {
+            number,
+            opener,
+            claimed_by: None,
+            created: 0,
+            closing: None,
+            close_generation: 0,
+            close_request: None,
+            panel: None,
+            staff_roles: None,
+            form_answers: Vec::new(),
+            form_answer_count: 0,
+            labels: Vec::new(),
+            settings: None,
+            thread: false,
+            thread_parent: None,
+            closed,
+            pending_operation: None,
+            panel_role_baselines: Vec::new(),
+            participant_roles: Vec::new(),
+            panel_user_baselines: Vec::new(),
+            participant_users: Vec::new(),
+            waiting_for_reply: false,
+            staff_access: None,
+            automation: crate::automation::State::default(),
+            message_quote: None,
+            message_quote_message_id: None,
+        }
+    }
+
+    async fn close_member_ticket(harness: &Harness) {
+        harness
+            .store()
+            .set(&format!("ticket:{HERE}"), &ticket(3, MEMBER, false))
+            .await
+            .unwrap();
+        harness
+            .invoke(Invocation::new("ticket").subcommand("close").user(MEMBER))
+            .await
+            .unwrap();
+    }
+
+    async fn seed_open_tickets(harness: &Harness, count: u64) {
+        for channel in OPEN_CHANNEL_BASE..OPEN_CHANNEL_BASE + count {
+            harness
+                .store()
+                .set(&format!("ticket:{channel}"), &ticket(1, OTHER, false))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn erase_invocation(confirm: bool) -> Invocation {
+        Invocation::new("ticket")
+            .subcommand("data erase")
+            .option("confirm", CommandOptionValue::Boolean(confirm))
+            .user(MEMBER)
+    }
+
+    fn export_invocation() -> Invocation {
+        Invocation::new("ticket")
+            .subcommand("data export")
+            .user(MEMBER)
+    }
+
+    async fn stored_history(harness: &Harness) -> TicketHistory {
+        let key = history_key(3, ChannelId::new(HERE));
+        harness.store().get(&key).await.unwrap().unwrap()
+    }
+
+    async fn stored_cursor(harness: &Harness, kind: &str) -> Option<String> {
+        harness
+            .store()
+            .get(&data_scan_cursor_key(kind, Id::new(MEMBER)))
+            .await
+            .unwrap()
+    }
+
+    // The test clock does not age the released lease, so it is cleared before the next run.
+    async fn release_lease(harness: &Harness) {
+        harness
+            .store()
+            .delete(&format!("ticket-data-operation:{MEMBER}"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn erase_confirm_stops_at_the_fetch_cap_and_resumes_from_the_cursor() {
+        let harness = harness();
+        close_member_ticket(&harness).await;
+        seed_open_tickets(&harness, OPEN_TICKET_COUNT).await;
+
+        let first = harness.invoke(erase_invocation(true)).await.unwrap();
+        assert!(
+            first.last().unwrap().content.contains(RESUME_MARKER),
+            "{first:?}"
+        );
+        assert!(
+            stored_cursor(&harness, "erase").await.is_some(),
+            "the capped run must save a cursor"
+        );
+        assert!(
+            stored_history(&harness).await.opener_erased,
+            "the closed history is anonymized before the open scan"
+        );
+
+        release_lease(&harness).await;
+        let second = harness.invoke(erase_invocation(true)).await.unwrap();
+        assert!(
+            !second.last().unwrap().content.contains(RESUME_MARKER),
+            "{second:?}"
+        );
+        assert!(
+            stored_cursor(&harness, "erase").await.is_none(),
+            "a finished scan must clear the cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn erase_finishes_when_the_cap_is_reached_on_the_last_ticket() {
+        let harness = harness();
+        seed_open_tickets(&harness, MAX_TICKET_FETCHES_PER_RUN as u64).await;
+
+        let reply = harness.invoke(erase_invocation(true)).await.unwrap();
+        assert!(
+            !reply.last().unwrap().content.contains(RESUME_MARKER),
+            "{reply:?}"
+        );
+        assert!(stored_cursor(&harness, "erase").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_erase_cursor_is_ignored_and_the_scan_starts_from_the_first_ticket() {
+        let harness = harness();
+        close_member_ticket(&harness).await;
+        seed_open_tickets(&harness, OPEN_TICKET_COUNT).await;
+        harness
+            .store()
+            .set(
+                &data_scan_cursor_key("erase", Id::new(MEMBER)),
+                &"not-a-ticket-key",
+            )
+            .await
+            .unwrap();
+
+        let reply = harness.invoke(erase_invocation(true)).await.unwrap();
+
+        assert!(
+            reply.last().unwrap().content.contains(RESUME_MARKER),
+            "{reply:?}"
+        );
+        assert!(
+            stored_history(&harness).await.opener_erased,
+            "an invalid cursor must run the first-run path"
+        );
+        let cursor = stored_cursor(&harness, "erase").await.unwrap_or_default();
+        assert!(cursor.starts_with("ticket:"), "{cursor}");
+    }
+
+    #[tokio::test]
+    async fn export_caps_the_open_scan_and_resumes_from_the_cursor() {
+        let harness = harness();
+        close_member_ticket(&harness).await;
+        seed_open_tickets(&harness, OPEN_TICKET_COUNT).await;
+
+        let first = harness.invoke(export_invocation()).await.unwrap();
+        assert!(
+            first.last().unwrap().content.contains(RESUME_MARKER),
+            "{first:?}"
+        );
+        assert!(stored_cursor(&harness, "export").await.is_some());
+
+        release_lease(&harness).await;
+        let second = harness.invoke(export_invocation()).await.unwrap();
+        assert!(
+            !second.last().unwrap().content.contains(RESUME_MARKER),
+            "{second:?}"
+        );
+        assert!(stored_cursor(&harness, "export").await.is_none());
     }
 }
