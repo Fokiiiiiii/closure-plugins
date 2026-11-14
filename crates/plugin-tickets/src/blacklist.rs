@@ -341,12 +341,13 @@ async fn modify(
         } else {
             super::audit::AuditAction::BlacklistRemove
         };
-        if let Err(error) = super::audit::record_event(
+        if let Err(error) = super::audit::record_event_for(
             cx.ctx(),
             cx.user().id.get(),
             audit_action,
             super::audit::AuditOutcome::Success,
             &audit_key,
+            Some(target.id().to_owned()),
         )
         .await
         {

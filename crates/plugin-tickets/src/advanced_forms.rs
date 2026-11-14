@@ -325,6 +325,34 @@ async fn resolve_form_questions_with_timeout(
     timeout: Duration,
     fresh: bool,
 ) -> Result<Vec<FormQuestion>, UserError> {
+    resolve_dynamic_questions(questions, timeout, move |source| async move {
+        if fresh {
+            integrations::fetch_options_fresh_with_timeout(
+                ctx,
+                integrations,
+                guild_id,
+                &source,
+                timeout,
+            )
+            .await
+        } else {
+            integrations::fetch_options_with_timeout(ctx, integrations, guild_id, &source, timeout)
+                .await
+        }
+    })
+    .await
+}
+
+// The fetch is injected so tests can replace the integration network path.
+async fn resolve_dynamic_questions<F, Fut>(
+    questions: &[FormQuestion],
+    timeout: Duration,
+    fetch: F,
+) -> Result<Vec<FormQuestion>, UserError>
+where
+    F: Fn(DynamicOptions) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<FormOption>, integrations::OptionsError>>,
+{
     if !valid_questions(questions) {
         return Err(UserError::message("tickets-form-invalid"));
     }
@@ -347,14 +375,12 @@ async fn resolve_form_questions_with_timeout(
     let deadline = tokio::time::Instant::now() + timeout;
     let requests: Vec<_> = pending
         .iter()
-        .map(|(_, source)| {
-            fetch_dynamic_options(ctx, integrations, guild_id, source, timeout, fresh)
-        })
+        .map(|(_, source)| fetch(source.clone()))
         .collect();
     let fetched = join_before_deadline(requests, deadline).await;
     for ((index, _), result) in pending.into_iter().zip(fetched) {
         let options = match result {
-            Some(result) => result?,
+            Some(result) => checked_fetched_options(result.map_err(options_error_to_user)?)?,
             None => return Err(UserError::message("tickets-form-options-unavailable")),
         };
         if let FormQuestion::Structured(FormQuestionKind::StringSelect { options: slot, .. }) =
@@ -369,6 +395,15 @@ async fn resolve_form_questions_with_timeout(
     Ok(resolved)
 }
 
+fn options_error_to_user(error: integrations::OptionsError) -> UserError {
+    match error {
+        integrations::OptionsError::TooManyOptions => {
+            UserError::message("tickets-form-options-too-many")
+        }
+        _ => UserError::message("tickets-form-options-unavailable"),
+    }
+}
+
 // An empty fetch cannot satisfy a required select, so it is reported as unavailable.
 fn checked_fetched_options(options: Vec<FormOption>) -> Result<Vec<FormOption>, UserError> {
     if options.is_empty() {
@@ -377,31 +412,8 @@ fn checked_fetched_options(options: Vec<FormOption>) -> Result<Vec<FormOption>, 
     Ok(options)
 }
 
-async fn fetch_dynamic_options(
-    ctx: &EventContext,
-    integrations: &[Integration],
-    guild_id: u64,
-    source: &DynamicOptions,
-    timeout: Duration,
-    fresh: bool,
-) -> Result<Vec<FormOption>, UserError> {
-    let fetched = if fresh {
-        integrations::fetch_options_fresh_with_timeout(ctx, integrations, guild_id, source, timeout)
-            .await
-    } else {
-        integrations::fetch_options_with_timeout(ctx, integrations, guild_id, source, timeout).await
-    };
-    let options = fetched.map_err(|error| match error {
-        integrations::OptionsError::TooManyOptions => {
-            UserError::message("tickets-form-options-too-many")
-        }
-        _ => UserError::message("tickets-form-options-unavailable"),
-    })?;
-    checked_fetched_options(options)
-}
-
 // Each fetch is cut off at the shared deadline; a cut-off fetch yields None.
-async fn join_before_deadline<F: std::future::Future>(
+pub(super) async fn join_before_deadline<F: std::future::Future>(
     futures: Vec<F>,
     deadline: tokio::time::Instant,
 ) -> Vec<Option<F::Output>> {
@@ -1573,6 +1585,59 @@ mod dynamic_option_tests {
         let results = join_before_deadline(requests, deadline).await;
         assert_eq!(results, vec![None]);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    async fn options_after(delay: Duration) -> Result<Vec<FormOption>, integrations::OptionsError> {
+        tokio::time::sleep(delay).await;
+        Ok(vec![option("1")])
+    }
+
+    #[tokio::test]
+    async fn dynamic_questions_fetch_together_and_wait_for_the_slowest() {
+        let questions = vec![
+            dynamic_select(1, 1, Vec::new()),
+            dynamic_select(1, 1, Vec::new()),
+            dynamic_select(1, 1, Vec::new()),
+        ];
+        let start = tokio::time::Instant::now();
+        let result = resolve_dynamic_questions(&questions, Duration::from_secs(2), |_| {
+            options_after(Duration::from_millis(150))
+        })
+        .await;
+        let elapsed = start.elapsed();
+        let Ok(resolved) = result else {
+            panic!("every fetch finishes within the deadline");
+        };
+        assert!(resolved.iter().all(|question| matches!(
+            question,
+            FormQuestion::Structured(FormQuestionKind::StringSelect { options, .. })
+                if options.len() == 1
+        )));
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "fetches ran one after another: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_fetch_past_the_shared_deadline_is_unavailable() {
+        let questions = vec![
+            dynamic_select(1, 1, Vec::new()),
+            dynamic_select(1, 1, Vec::new()),
+        ];
+        let start = tokio::time::Instant::now();
+        let result = resolve_dynamic_questions(&questions, Duration::from_millis(400), |_| {
+            options_after(Duration::from_secs(1))
+        })
+        .await;
+        let Err(error) = result else {
+            panic!("a fetch cut off at the deadline must not resolve");
+        };
+        assert!(
+            format!("{error:?}").contains("tickets-form-options-unavailable"),
+            "{error:?}"
+        );
+        assert!(start.elapsed() < Duration::from_millis(900));
     }
 }
 #[cfg(test)]

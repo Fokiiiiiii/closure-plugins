@@ -4454,12 +4454,13 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
     }
 
     let audit_key = format!("panel-resend-{}", cx.invocation().interaction_id.get());
-    if let Err(error) = audit::record_event(
+    if let Err(error) = audit::record_event_for(
         ctx,
         cx.user().id.get(),
         audit::AuditAction::PanelResend,
         audit::AuditOutcome::Success,
         &audit_key,
+        Some(channel.to_string()),
     )
     .await
     {
@@ -8106,12 +8107,13 @@ async fn close_button(cx: ComponentCx) -> Result<(), UserError> {
         .map_err(|error| failed(&error))?;
     if closed == Closed::Done || closed == Closed::RatingDmUnconfirmed {
         let audit_key = format!("close-{}", cx.click().interaction_id.get());
-        if let Err(error) = audit::record_event(
+        if let Err(error) = audit::record_event_for(
             ctx,
             cx.user().id.get(),
             audit::AuditAction::TicketClose,
             audit::AuditOutcome::Success,
             &audit_key,
+            Some(channel.to_string()),
         )
         .await
         {
@@ -8520,12 +8522,13 @@ async fn close_command(cx: CommandCx, args: Close) -> Result<(), UserError> {
         .map_err(|error| failed(&error))?;
     if closed == Closed::Done || closed == Closed::RatingDmUnconfirmed {
         let audit_key = format!("close-{}", cx.invocation().interaction_id.get());
-        if let Err(error) = audit::record_event(
+        if let Err(error) = audit::record_event_for(
             ctx,
             cx.user().id.get(),
             audit::AuditAction::TicketClose,
             audit::AuditOutcome::Success,
             &audit_key,
+            Some(channel.to_string()),
         )
         .await
         {
@@ -8641,12 +8644,13 @@ async fn close_request(cx: CommandCx, args: CloseRequestArgs) -> Result<(), User
         create_close_request(cx.clone(), ticket, revision, reason, timeout_hours).await
     };
     if result.is_ok()
-        && let Err(error) = audit::record_event(
+        && let Err(error) = audit::record_event_for(
             ctx,
             actor_id,
             audit::AuditAction::TicketCloseRequest,
             audit::AuditOutcome::Success,
             &audit_key,
+            Some(channel.to_string()),
         )
         .await
     {
@@ -8838,12 +8842,13 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
         {
             Ok(_) => {
                 let audit_key = format!("ticket-claim-{}", cx.click().interaction_id.get());
-                if let Err(error) = audit::record_event(
+                if let Err(error) = audit::record_event_for(
                     ctx,
                     cx.user().id.get(),
                     audit::AuditAction::TicketClaim,
                     audit::AuditOutcome::Success,
                     &audit_key,
+                    Some(channel.to_string()),
                 )
                 .await
                 {
@@ -8960,12 +8965,13 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
                 };
                 let audit_key =
                     format!("ticket-assignment-{}", cx.invocation().interaction_id.get());
-                if let Err(error) = audit::record_event(
+                if let Err(error) = audit::record_event_for(
                     ctx,
                     cx.user().id.get(),
                     audit_action,
                     audit::AuditOutcome::Success,
                     &audit_key,
+                    Some(channel.to_string()),
                 )
                 .await
                 {
@@ -9006,12 +9012,13 @@ async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Result<(), Use
         } else {
             audit::AuditAction::TicketMemberRemove
         };
-        if let Err(error) = audit::record_event(
+        if let Err(error) = audit::record_event_for(
             ctx,
             actor_id,
             action,
             audit::AuditOutcome::Success,
             &audit_key,
+            Some(cx.invocation().channel_id.to_string()),
         )
         .await
         {
@@ -9115,12 +9122,13 @@ async fn change_label(cx: CommandCx, value: String, add: bool) -> Result<(), Use
                     audit::AuditAction::TicketLabelDelete
                 };
                 let audit_key = format!("ticket-label-{}", cx.invocation().interaction_id.get());
-                if let Err(error) = audit::record_event(
+                if let Err(error) = audit::record_event_for(
                     ctx,
                     cx.user().id.get(),
                     audit_action,
                     audit::AuditOutcome::Success,
                     &audit_key,
+                    Some(label.clone()),
                 )
                 .await
                 {
@@ -9252,12 +9260,13 @@ async fn rename(cx: CommandCx, args: Rename) -> Result<(), UserError> {
             .map_err(|error| failed(&error))?;
     }
     let audit_key = format!("ticket-rename-{}", cx.invocation().interaction_id.get());
-    if let Err(error) = audit::record_event(
+    if let Err(error) = audit::record_event_for(
         ctx,
         cx.user().id.get(),
         audit::AuditAction::TicketRename,
         audit::AuditOutcome::Success,
         &audit_key,
+        Some(channel.to_string()),
     )
     .await
     {
@@ -9499,12 +9508,13 @@ async fn add_note(cx: CommandCx, args: NoteArgs) -> Result<(), UserError> {
     match save_note(ctx, channel, &ticket, note).await? {
         NoteSave::Saved => {
             let audit_key = format!("staff-note-{}", cx.invocation().interaction_id.get());
-            if let Err(error) = audit::record_event(
+            if let Err(error) = audit::record_event_for(
                 ctx,
                 cx.user().id.get(),
                 audit::AuditAction::StaffNoteAdd,
                 audit::AuditOutcome::Success,
                 &audit_key,
+                Some(channel.to_string()),
             )
             .await
             {

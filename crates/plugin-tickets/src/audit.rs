@@ -9,7 +9,7 @@ use closure_core::{
     storage::{Expect, StorageError},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const EVENT_PREFIX: &str = "tickets:audit:v1:e:";
 const DEDUPE_PREFIX: &str = "tickets:audit:v1:d:";
@@ -388,6 +388,11 @@ struct AuditEntry {
     action: AuditAction,
     resource: AuditResource,
     outcome: AuditOutcome,
+    // Absent in events written before these identifiers were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -412,12 +417,70 @@ fn event_timestamp_from_key(event_key: &str) -> Option<i64> {
     i64::try_from(u64::MAX - reverse).ok()
 }
 
+const MAX_TARGET_ID_BYTES: usize = 64;
+
 pub(crate) async fn record_event(
     ctx: &EventContext,
     actor_id: u64,
     action: AuditAction,
     outcome: AuditOutcome,
     dedupe_key: &str,
+) -> Result<(), DashboardActionError> {
+    record_event_for(ctx, actor_id, action, outcome, dedupe_key, None).await
+}
+
+async fn reserved_event(
+    ctx: &EventContext,
+    dedupe_store_key: &str,
+    outcome: AuditOutcome,
+    build: impl Fn(i64) -> AuditEntry,
+) -> Result<(), DashboardActionError> {
+    let marker = ctx
+        .store()
+        .entry(dedupe_store_key)
+        .await
+        .map_err(|_| DashboardActionError::Unavailable)?
+        .ok_or(DashboardActionError::Unavailable)?;
+    let existing_key: String =
+        serde_json::from_value(marker.value).map_err(|_| DashboardActionError::Unavailable)?;
+    if !existing_key.starts_with(EVENT_PREFIX) {
+        return Err(DashboardActionError::Unavailable);
+    }
+    if ctx
+        .store()
+        .entry(&existing_key)
+        .await
+        .map_err(|_| DashboardActionError::Unavailable)?
+        .is_some()
+    {
+        return record_outcome(ctx, &existing_key, outcome).await;
+    }
+    // The marker survived an interrupted first write; rebuild the event under the key it reserved.
+    let timestamp =
+        event_timestamp_from_key(&existing_key).ok_or(DashboardActionError::Unavailable)?;
+    return match ctx
+        .store()
+        .replace(
+            &existing_key,
+            &build(timestamp),
+            Expect::Missing,
+            Some(RETENTION),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(StorageError::Conflict) => record_outcome(ctx, &existing_key, outcome).await,
+        Err(_) => Err(DashboardActionError::Unavailable),
+    };
+}
+
+pub(crate) async fn record_event_for(
+    ctx: &EventContext,
+    actor_id: u64,
+    action: AuditAction,
+    outcome: AuditOutcome,
+    dedupe_key: &str,
+    target_id: Option<String>,
 ) -> Result<(), DashboardActionError> {
     if actor_id == 0
         || !(1..=64).contains(&dedupe_key.len())
@@ -430,6 +493,8 @@ pub(crate) async fn record_event(
         ));
     }
 
+    // A target that fails the same check as DashboardScope targets is stored as absent.
+    let target_id = target_id.filter(|value| valid_target_id(value));
     let timestamp = ctx.now();
     if timestamp < 0 {
         return Err(DashboardActionError::Unavailable);
@@ -443,6 +508,15 @@ pub(crate) async fn record_event(
         "{DEDUPE_PREFIX}{actor_id:016x}:{:02}:{dedupe_key}",
         action.code()
     );
+    let build = |timestamp: i64| AuditEntry {
+        timestamp,
+        actor_id,
+        action,
+        resource: action.resource(),
+        outcome,
+        target_id: target_id.clone(),
+        request_id: Some(dedupe_key.to_owned()),
+    };
 
     match ctx
         .store()
@@ -456,61 +530,23 @@ pub(crate) async fn record_event(
     {
         Ok(_) => {}
         Err(StorageError::Conflict) => {
-            let marker = ctx
-                .store()
-                .entry(&dedupe_store_key)
-                .await
-                .map_err(|_| DashboardActionError::Unavailable)?
-                .ok_or(DashboardActionError::Unavailable)?;
-            let existing_key: String = serde_json::from_value(marker.value)
-                .map_err(|_| DashboardActionError::Unavailable)?;
-            if !existing_key.starts_with(EVENT_PREFIX) {
-                return Err(DashboardActionError::Unavailable);
-            }
-            if ctx
-                .store()
-                .entry(&existing_key)
-                .await
-                .map_err(|_| DashboardActionError::Unavailable)?
-                .is_some()
-            {
-                return Ok(());
-            }
-            // The marker survived an interrupted first write; rebuild the event under the key it reserved.
-            let timestamp =
-                event_timestamp_from_key(&existing_key).ok_or(DashboardActionError::Unavailable)?;
-            let entry = AuditEntry {
-                timestamp,
-                actor_id,
-                action,
-                resource: action.resource(),
-                outcome,
-            };
-            return match ctx
-                .store()
-                .replace(&existing_key, &entry, Expect::Missing, Some(RETENTION))
-                .await
-            {
-                Ok(_) | Err(StorageError::Conflict) => Ok(()),
-                Err(_) => Err(DashboardActionError::Unavailable),
-            };
+            return reserved_event(ctx, &dedupe_store_key, outcome, &build).await;
         }
         Err(_) => return Err(DashboardActionError::Unavailable),
     }
 
-    let entry = AuditEntry {
-        timestamp,
-        actor_id,
-        action,
-        resource: action.resource(),
-        outcome,
-    };
     match ctx
         .store()
-        .replace(&event_key, &entry, Expect::Missing, Some(RETENTION))
+        .replace(
+            &event_key,
+            &build(timestamp),
+            Expect::Missing,
+            Some(RETENTION),
+        )
         .await
     {
-        Ok(_) | Err(StorageError::Conflict) => Ok(()),
+        Ok(_) => Ok(()),
+        Err(StorageError::Conflict) => record_outcome(ctx, &event_key, outcome).await,
         Err(_) => {
             let _ = ctx.store().delete(&dedupe_store_key).await;
             Err(DashboardActionError::Unavailable)
@@ -518,18 +554,83 @@ pub(crate) async fn record_event(
     }
 }
 
-pub(crate) async fn record_dashboard_action(
+// A retry that succeeds replaces the earlier failure it duplicates; the event key keeps its timestamp.
+async fn record_outcome(
     ctx: &EventContext,
-    actor: &Actor,
-    request: &DashboardActionRequest,
-    result: &Result<DashboardActionResult, DashboardActionError>,
+    event_key: &str,
+    outcome: AuditOutcome,
 ) -> Result<(), DashboardActionError> {
-    let action = match (&request.scope, request.action.as_str()) {
+    let stored = ctx
+        .store()
+        .entry(event_key)
+        .await
+        .map_err(|_| DashboardActionError::Unavailable)?
+        .ok_or(DashboardActionError::Unavailable)?;
+    let existing: AuditEntry =
+        serde_json::from_value(stored.value).map_err(|_| DashboardActionError::Unavailable)?;
+    let Some(updated) = outcome_update(&existing, outcome) else {
+        return Ok(());
+    };
+    ctx.store()
+        .replace(event_key, &updated, Expect::Any, Some(RETENTION))
+        .await
+        .map(|_| ())
+        .map_err(|_| DashboardActionError::Unavailable)
+}
+
+// None when the stored outcome already stands; a recorded success is never replaced by a later non-success.
+fn outcome_update(existing: &AuditEntry, outcome: AuditOutcome) -> Option<AuditEntry> {
+    let standing = existing.outcome == outcome
+        || (existing.outcome == AuditOutcome::Success && outcome != AuditOutcome::Success);
+    (!standing).then(|| AuditEntry {
+        outcome,
+        ..existing.clone()
+    })
+}
+
+// The object the action touched; secret values and message bodies are never read here.
+fn target_id(scope: &DashboardScope, data: &Value) -> Option<String> {
+    let raw = match scope {
+        DashboardScope::Ticket { channel_id } | DashboardScope::TicketHistory { channel_id } => {
+            Some(channel_id.to_string())
+        }
+        DashboardScope::TicketLabels { .. } => data["name"].as_str().map(str::to_owned),
+        DashboardScope::IntegrationSecrets => data["integration_id"].as_str().map(str::to_owned),
+        DashboardScope::Knowledge { .. } | DashboardScope::Tags { .. } => {
+            data["id"].as_str().map(str::to_owned)
+        }
+        DashboardScope::Guild | DashboardScope::Panel { .. } => {
+            data["target"]["id"].as_str().map(str::to_owned)
+        }
+        _ => None,
+    };
+    raw.map(|value| value.trim().to_owned())
+        .filter(|value| valid_target_id(value))
+}
+
+fn valid_target_id(value: &str) -> bool {
+    (1..=MAX_TARGET_ID_BYTES).contains(&value.len()) && !value.chars().any(char::is_control)
+}
+
+fn entry_json(entry: &AuditEntry) -> Value {
+    json!({
+        "timestamp": entry.timestamp,
+        "actor_id": entry.actor_id.to_string(),
+        "action": entry.action.as_str(),
+        "resource": entry.resource.as_str(),
+        "outcome": entry.outcome.as_str(),
+        "target_id": entry.target_id.as_deref(),
+        "request_id": entry.request_id.as_deref(),
+    })
+}
+
+fn audit_action_for(scope: &DashboardScope, action: &str, data: &Value) -> Option<AuditAction> {
+    match (scope, action) {
         (DashboardScope::Guild | DashboardScope::Panel { .. }, "blacklist.add") => {
             Some(AuditAction::BlacklistAdd)
         }
         (DashboardScope::Guild | DashboardScope::Panel { .. }, "blacklist.remove") => {
-            match request.data["target"]["kind"].as_str() {
+            match data["target"]["kind"].as_str() {
                 Some("user") => Some(AuditAction::BlacklistRemoveUser),
                 Some("role") => Some(AuditAction::BlacklistRemoveRole),
                 _ => Some(AuditAction::BlacklistRemove),
@@ -541,15 +642,11 @@ pub(crate) async fn record_dashboard_action(
         }
         (DashboardScope::Ticket { .. }, "ticket.reply") => Some(AuditAction::TicketSendMessage),
         (DashboardScope::Ticket { .. }, "ticket.add_label") => Some(AuditAction::TicketLabelAssign),
-        (
-            DashboardScope::Ticket { .. } | DashboardScope::Guild | DashboardScope::Tags { .. },
-            "ticket.label.create",
-        ) => Some(AuditAction::TicketLabelCreate),
-        (
-            DashboardScope::Ticket { .. } | DashboardScope::Guild | DashboardScope::Tags { .. },
-            "ticket.label.delete",
-        ) => Some(AuditAction::TicketLabelDelete),
-        (DashboardScope::Ticket { .. }, "ticket.remove_label") => {
+        (DashboardScope::TicketLabels { .. }, "ticket.label.create") => {
+            Some(AuditAction::TicketLabelCreate)
+        }
+        (DashboardScope::TicketLabels { .. }, "ticket.label.delete")
+        | (DashboardScope::Ticket { .. }, "ticket.remove_label") => {
             Some(AuditAction::TicketLabelDelete)
         }
         (DashboardScope::TicketHistory { .. }, "ticket.history.update") => {
@@ -577,8 +674,16 @@ pub(crate) async fn record_dashboard_action(
             Some(AuditAction::IntegrationSecretRemove)
         }
         _ => None,
-    };
-    let Some(action) = action else {
+    }
+}
+
+pub(crate) async fn record_dashboard_action(
+    ctx: &EventContext,
+    actor: &Actor,
+    request: &DashboardActionRequest,
+    result: &Result<DashboardActionResult, DashboardActionError>,
+) -> Result<(), DashboardActionError> {
+    let Some(action) = audit_action_for(&request.scope, &request.action, &request.data) else {
         return Ok(());
     };
 
@@ -600,12 +705,13 @@ pub(crate) async fn record_dashboard_action(
     {
         return Ok(());
     }
-    record_event(
+    record_event_for(
         ctx,
         actor.user.get(),
         action,
         outcome,
         &request.idempotency_key,
+        target_id(&request.scope, &request.data),
     )
     .await
 }
@@ -756,15 +862,7 @@ pub(crate) async fn query(
     let has_more = total > offset + entries.len();
     let entries = entries
         .into_iter()
-        .map(|entry| {
-            json!({
-                "timestamp": entry.timestamp,
-                "actor_id": entry.actor_id.to_string(),
-                "action": entry.action.as_str(),
-                "resource": entry.resource.as_str(),
-                "outcome": entry.outcome.as_str(),
-            })
-        })
+        .map(|entry| entry_json(&entry))
         .collect::<Vec<_>>();
     let action_options = AuditAction::ALL
         .into_iter()
@@ -806,5 +904,307 @@ mod event_key_tests {
         let key = format!("{EVENT_PREFIX}{reverse:020}:0000000000000001:01:abc");
         assert_eq!(event_timestamp_from_key(&key), Some(timestamp));
         assert_eq!(event_timestamp_from_key("tickets:other:key"), None);
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use std::collections::BTreeSet;
+
+    use closure_core::module::DashboardScope;
+    use serde_json::json;
+
+    use super::{AuditAction, audit_action_for};
+
+    // Every action registered in lib.rs. A new public action must be classified in `expected`.
+    const PUBLIC_ACTIONS: [&str; 22] = [
+        "blacklist.add",
+        "blacklist.remove",
+        "ticket.close",
+        "ticket.request_close",
+        "ticket.reply",
+        "ticket.add_label",
+        "ticket.remove_label",
+        "knowledge.create",
+        "knowledge.update",
+        "knowledge.delete",
+        "integration.secret.set",
+        "integration.secret.remove",
+        "tag.create",
+        "tag.update",
+        "tag.clone",
+        "tag.delete",
+        "gallery.import",
+        "gallery.export",
+        "audit.search",
+        "ticket.history.update",
+        "ticket.label.create",
+        "ticket.label.delete",
+    ];
+
+    fn scopes() -> Vec<DashboardScope> {
+        vec![
+            DashboardScope::Guild,
+            DashboardScope::PanelList,
+            DashboardScope::Panel {
+                panel_id: "panel".into(),
+            },
+            DashboardScope::Ticket { channel_id: 1 },
+            DashboardScope::TicketHistory { channel_id: 1 },
+            DashboardScope::TicketLabels { cursor: None },
+            DashboardScope::Gallery {
+                cursor: None,
+                query: None,
+            },
+            DashboardScope::Knowledge {
+                query: None,
+                cursor: None,
+            },
+            DashboardScope::Tags {
+                query: None,
+                cursor: None,
+            },
+            DashboardScope::Analytics {
+                period_days: 7,
+                cursor: None,
+            },
+            DashboardScope::IntegrationSecrets,
+        ]
+    }
+
+    // No wildcard arm: a new scope in closure_core fails to compile here until it is listed.
+    fn scope_kind(scope: &DashboardScope) -> &'static str {
+        match scope {
+            DashboardScope::Guild => "guild",
+            DashboardScope::PanelList => "panel_list",
+            DashboardScope::Panel { .. } => "panel",
+            DashboardScope::Ticket { .. } => "ticket",
+            DashboardScope::TicketHistory { .. } => "ticket_history",
+            DashboardScope::TicketLabels { .. } => "ticket_labels",
+            DashboardScope::Gallery { .. } => "gallery",
+            DashboardScope::Knowledge { .. } => "knowledge",
+            DashboardScope::Tags { .. } => "tags",
+            DashboardScope::Analytics { .. } => "analytics",
+            DashboardScope::IntegrationSecrets => "integration_secrets",
+        }
+    }
+
+    // The audit spec: what each (action, scope) pair records, None when it is not audited.
+    fn expected(action: &str, kind: &str) -> Option<AuditAction> {
+        Some(match (action, kind) {
+            ("blacklist.add", "guild" | "panel") => AuditAction::BlacklistAdd,
+            ("blacklist.remove", "guild" | "panel") => AuditAction::BlacklistRemove,
+            ("ticket.close", "ticket") => AuditAction::TicketClose,
+            ("ticket.request_close", "ticket") => AuditAction::TicketCloseRequest,
+            ("ticket.reply", "ticket") => AuditAction::TicketSendMessage,
+            ("ticket.add_label", "ticket") => AuditAction::TicketLabelAssign,
+            ("ticket.label.create", "ticket_labels") => AuditAction::TicketLabelCreate,
+            ("ticket.label.delete", "ticket_labels") | ("ticket.remove_label", "ticket") => {
+                AuditAction::TicketLabelDelete
+            }
+            ("ticket.history.update", "ticket_history") => AuditAction::TicketHistoryUpdate,
+            ("tag.create", "tags") => AuditAction::TagCreate,
+            ("tag.update", "tags") => AuditAction::TagUpdate,
+            ("tag.clone", "tags") => AuditAction::TagClone,
+            ("tag.delete", "tags") => AuditAction::TagDelete,
+            ("gallery.import", "gallery") => AuditAction::GalleryImport,
+            ("gallery.export", "gallery") => AuditAction::GalleryExport,
+            ("knowledge.create", "knowledge") => AuditAction::KnowledgeCreate,
+            ("knowledge.update", "knowledge") => AuditAction::KnowledgeUpdate,
+            ("knowledge.delete", "knowledge") => AuditAction::KnowledgeDelete,
+            ("integration.secret.set", "integration_secrets") => AuditAction::IntegrationSecretSet,
+            ("integration.secret.remove", "integration_secrets") => {
+                AuditAction::IntegrationSecretRemove
+            }
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn ticket_label_actions_on_the_label_registry_scope_are_audited() {
+        let scope = DashboardScope::TicketLabels { cursor: None };
+        let data = json!({"name": "urgent", "color": "red"});
+
+        assert_eq!(
+            audit_action_for(&scope, "ticket.label.create", &data),
+            Some(AuditAction::TicketLabelCreate)
+        );
+        assert_eq!(
+            audit_action_for(&scope, "ticket.label.delete", &json!({"name": "urgent"})),
+            Some(AuditAction::TicketLabelDelete)
+        );
+    }
+
+    #[test]
+    fn every_public_action_is_audited_exactly_as_specified_for_each_scope() {
+        for action in PUBLIC_ACTIONS {
+            for scope in scopes() {
+                let kind = scope_kind(&scope);
+                assert_eq!(
+                    audit_action_for(&scope, action, &json!({})),
+                    expected(action, kind),
+                    "action {action} on scope {kind}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scope_list_covers_every_scope_and_every_recorded_action_is_classified() {
+        let kinds: BTreeSet<&str> = scopes().iter().map(scope_kind).collect();
+        assert_eq!(kinds.len(), 11, "scopes() must list every DashboardScope");
+
+        for action in PUBLIC_ACTIONS
+            .into_iter()
+            .filter(|action| *action != "audit.search")
+        {
+            assert!(
+                scopes()
+                    .iter()
+                    .any(|scope| expected(action, scope_kind(scope)).is_some()),
+                "action {action} is not classified as audited on any scope"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use closure_core::module::DashboardScope;
+    use serde_json::json;
+
+    use super::{
+        AuditAction, AuditEntry, AuditOutcome, AuditResource, entry_json, outcome_update, target_id,
+    };
+
+    fn entry(outcome: AuditOutcome) -> AuditEntry {
+        AuditEntry {
+            timestamp: 1_700_000_000,
+            actor_id: 7,
+            action: AuditAction::TicketClose,
+            resource: AuditResource::Ticket,
+            outcome,
+            target_id: Some("42".into()),
+            request_id: Some("key-1".into()),
+        }
+    }
+
+    #[test]
+    fn a_failed_attempt_reports_success_once_the_retry_succeeds() {
+        let stored = entry(AuditOutcome::Failure);
+
+        let updated = outcome_update(&stored, AuditOutcome::Success)
+            .expect("a successful retry must replace the recorded failure");
+
+        assert_eq!(updated.outcome, AuditOutcome::Success);
+        assert_eq!(updated.timestamp, stored.timestamp);
+        assert_eq!(updated.target_id, stored.target_id);
+    }
+
+    #[test]
+    fn a_recorded_success_is_not_downgraded_by_a_duplicate() {
+        assert!(outcome_update(&entry(AuditOutcome::Success), AuditOutcome::Failure).is_none());
+        assert!(outcome_update(&entry(AuditOutcome::Success), AuditOutcome::Uncertain).is_none());
+    }
+
+    #[test]
+    fn an_unchanged_outcome_needs_no_write() {
+        assert!(outcome_update(&entry(AuditOutcome::Failure), AuditOutcome::Failure).is_none());
+    }
+
+    #[test]
+    fn target_id_names_the_object_without_secret_values_or_bodies() {
+        assert_eq!(
+            target_id(&DashboardScope::Ticket { channel_id: 42 }, &json!({})),
+            Some("42".into())
+        );
+        assert_eq!(
+            target_id(
+                &DashboardScope::Guild,
+                &json!({"target": {"kind": "role", "id": "900"}})
+            ),
+            Some("900".into())
+        );
+        assert_eq!(
+            target_id(
+                &DashboardScope::Knowledge {
+                    query: None,
+                    cursor: None
+                },
+                &json!({"id": "faq-1", "body": "private"})
+            ),
+            Some("faq-1".into())
+        );
+        assert_eq!(
+            target_id(
+                &DashboardScope::TicketLabels { cursor: None },
+                &json!({"name": "urgent", "color": "red"})
+            ),
+            Some("urgent".into())
+        );
+        assert_eq!(
+            target_id(
+                &DashboardScope::IntegrationSecrets,
+                &json!({"integration_id": "github", "generation": "1", "secret_name": "token", "value": "hunter2"})
+            ),
+            Some("github".into())
+        );
+    }
+
+    #[test]
+    fn target_id_rejects_missing_empty_oversized_and_control_values() {
+        let scope = DashboardScope::Knowledge {
+            query: None,
+            cursor: None,
+        };
+
+        assert_eq!(target_id(&scope, &json!({})), None);
+        assert_eq!(target_id(&scope, &json!({"id": "  "})), None);
+        assert_eq!(target_id(&scope, &json!({"id": "x".repeat(65)})), None);
+        assert_eq!(target_id(&scope, &json!({"id": "a\nb"})), None);
+    }
+
+    #[test]
+    fn events_written_before_targets_were_recorded_still_read() {
+        let legacy = json!({
+            "timestamp": 1_700_000_000,
+            "actor_id": 7,
+            "action": "ticket_close",
+            "resource": "ticket",
+            "outcome": "success"
+        });
+
+        let parsed: AuditEntry = serde_json::from_value(legacy).expect("legacy event must read");
+
+        assert_eq!(parsed.target_id, None);
+        assert_eq!(parsed.request_id, None);
+    }
+
+    #[test]
+    fn query_rows_carry_target_and_request_identifiers() {
+        let row = entry_json(&entry(AuditOutcome::Success));
+        assert_eq!(row["target_id"], "42");
+        assert_eq!(row["request_id"], "key-1");
+
+        let bare = AuditEntry {
+            target_id: None,
+            request_id: None,
+            ..entry(AuditOutcome::Success)
+        };
+        assert!(entry_json(&bare)["target_id"].is_null());
+    }
+
+    #[test]
+    fn stored_entries_omit_absent_identifiers() {
+        let bare = AuditEntry {
+            target_id: None,
+            request_id: None,
+            ..entry(AuditOutcome::Success)
+        };
+
+        let value = serde_json::to_value(bare).expect("entry must serialize");
+
+        assert!(value.get("target_id").is_none());
+        assert!(value.get("request_id").is_none());
     }
 }

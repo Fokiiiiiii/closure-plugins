@@ -440,7 +440,7 @@ pub async fn action(
     outcome
 }
 
-async fn gallery_state(
+pub(super) async fn gallery_state(
     ctx: &EventContext,
     config: &Config,
     query: Option<&str>,

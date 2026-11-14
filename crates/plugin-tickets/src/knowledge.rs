@@ -520,14 +520,16 @@ async fn record_knowledge_success(
     ctx: &EventContext,
     action: crate::audit::AuditAction,
     key_prefix: &str,
+    article_id: &str,
 ) {
     let dedupe_key = format!("{key_prefix}-{}", cx.interaction_id().get());
-    if crate::audit::record_event(
+    if crate::audit::record_event_for(
         ctx,
         cx.user().id.get(),
         action,
         crate::audit::AuditOutcome::Success,
         &dedupe_key,
+        Some(article_id.to_owned()),
     )
     .await
     .is_err()
@@ -1112,6 +1114,7 @@ pub(crate) async fn add(cx: CommandCx, args: AddArgs) -> Result<(), UserError> {
                 ctx,
                 crate::audit::AuditAction::KnowledgeCreate,
                 "knowledge-create",
+                &article.id,
             )
             .await;
             cx.reply_private_t(
@@ -1168,6 +1171,7 @@ pub(crate) async fn edit(cx: CommandCx, args: EditArgs) -> Result<(), UserError>
                 ctx,
                 crate::audit::AuditAction::KnowledgeUpdate,
                 "knowledge-update",
+                &article.id,
             )
             .await;
             cx.reply_private_t(
@@ -1224,6 +1228,7 @@ pub(crate) async fn delete(cx: CommandCx, args: DeleteArgs) -> Result<(), UserEr
                 ctx,
                 crate::audit::AuditAction::KnowledgeDelete,
                 "knowledge-delete",
+                id,
             )
             .await;
             cx.reply_private_t(

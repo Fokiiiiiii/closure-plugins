@@ -19,13 +19,14 @@ use crate::{
     CLOSE_REQUEST_TIMEOUT, CLOSING, CloseRequestExpiry, CloseRequestTimeout, ClosingJob, Config,
     HISTORY_PAGE_BYTES, HISTORY_SEARCH_PAGE_BUDGET, HISTORY_VALUE_BYTES, HistorySearchState,
     HistoryStatus, LABEL_LIST_UTF16_UNITS, MAX_CLOSE_REQUEST_DEADLINE_UNIX_SECONDS, NOTE_MAX_CHARS,
-    NOTE_PAGE_LIMIT, NOTE_RETENTION, NOTES_PER_PAGE, NamedPanel, REPLY_CHUNK_MAX_UTF16,
-    REPLY_SEND_COUNTER, RatingRequest, ReplySendAttempt, SavedReply, StaffNote, StaffNotePage,
-    Ticket, TicketHistory, TicketRating, builder, close_request_expiry, close_request_timeout_key,
-    closing_key, display_label, history_content_key, history_id_key, history_index_key,
-    history_key, history_search_initial_state, history_search_state_valid, label_key, label_pages,
-    note_page_key, note_pages_prefix, parse_rating_request, rating_button_id, reply_key,
-    reply_send_attempt_key, transcript_is_incomplete, transcript_page_ranges,
+    NOTE_PAGE_LIMIT, NOTE_RETENTION, NOTES_PER_PAGE, NamedPanel, OpenReservation,
+    REPLY_CHUNK_MAX_UTF16, REPLY_SEND_COUNTER, RatingRequest, ReplySendAttempt, SavedReply,
+    StaffNote, StaffNotePage, Ticket, TicketHistory, TicketRating, builder, close_request_expiry,
+    close_request_timeout_key, closing_key, display_label, history_content_key, history_id_key,
+    history_index_key, history_key, history_search_initial_state, history_search_state_valid,
+    label_key, label_pages, note_page_key, note_pages_prefix, parse_rating_request,
+    rating_button_id, reply_key, reply_send_attempt_key, transcript_is_incomplete,
+    transcript_page_ranges,
 };
 
 const STAFF_ROLE: u64 = 30;
@@ -7508,4 +7509,391 @@ async fn the_form_copy_sweep_removes_only_copies_of_inline_tickets() {
         .map(|(key, _)| key)
         .collect();
     assert_eq!(left, ["ticket-form:4:0"]);
+}
+
+async fn seed_tag(harness: &Harness, id: &str) {
+    let record = json!({
+        "reply": { "id": id, "title": id, "body": format!("body of {id}"), "deleted": false },
+        "embed": null,
+        "article_id": null,
+        "custom_command_alias": false,
+        "alias_sync_pending": false,
+        "alias_sync_idempotency_key": null,
+        "deleted_from_revision": null,
+        "created_by_idempotency_key": null,
+        "last_update_idempotency_key": null
+    });
+    harness
+        .store()
+        .set(&format!("ticket-tag:{id}"), &record)
+        .await
+        .unwrap();
+}
+
+fn source_ids(page: &serde_json::Value) -> Vec<String> {
+    page["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn gallery_pages_tags_by_twenty_five_and_ends_on_the_last_page() {
+    let harness = harness();
+    for number in 1..=30 {
+        seed_tag(&harness, &format!("tag-{number:02}")).await;
+    }
+    let ctx = harness.context();
+    let config = Config::default();
+
+    let first = crate::dashboard::gallery_state(&ctx, &config, None, None)
+        .await
+        .unwrap();
+    assert_eq!(source_ids(&first.value).len(), 25);
+    assert_eq!(first.value["next_cursor"], json!("tag-25"));
+    assert_eq!(first.value["truncated"], json!(true));
+
+    let last = crate::dashboard::gallery_state(&ctx, &config, None, Some("tag-25"))
+        .await
+        .unwrap();
+    assert_eq!(
+        source_ids(&last.value),
+        ["tag-26", "tag-27", "tag-28", "tag-29", "tag-30"]
+    );
+    assert!(last.value["next_cursor"].is_null(), "{}", last.value);
+    assert_eq!(last.value["truncated"], json!(false));
+}
+
+#[tokio::test]
+async fn gallery_search_filters_tags_by_name_and_refuses_a_malformed_cursor() {
+    let harness = harness();
+    for number in 1..=30 {
+        seed_tag(&harness, &format!("tag-{number:02}")).await;
+    }
+    let ctx = harness.context();
+    let config = Config::default();
+
+    let found = crate::dashboard::gallery_state(&ctx, &config, Some("tag-1"), None)
+        .await
+        .unwrap();
+    let ids = source_ids(&found.value);
+    assert_eq!(ids.len(), 10, "{ids:?}");
+    assert!(ids.iter().all(|id| id.starts_with("tag-1")), "{ids:?}");
+    assert!(found.value["next_cursor"].is_null());
+
+    let malformed =
+        crate::dashboard::gallery_state(&ctx, &config, None, Some("not a cursor!")).await;
+    assert!(malformed.is_err());
+}
+
+async fn opened_ticket(harness: &Harness, user: u64) -> (u64, Ticket) {
+    let replies = harness.click(press("open", user)).await.unwrap();
+    let text = &replies.last().unwrap().content;
+    let channel: u64 = text
+        .split("<#")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let ticket = stored_ticket(harness, channel).await;
+    (channel, ticket)
+}
+
+async fn stored_ticket(harness: &Harness, channel: u64) -> Ticket {
+    harness
+        .store()
+        .get(&format!("ticket:{channel}"))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_staff_reply_withdraws_the_first_response_timer_while_an_unanswered_ticket_closes() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "max_open": 2,
+        "first_response_timeout_hours": 1
+    }));
+    let (replied, _) = opened_ticket(&harness, MEMBER).await;
+    let (unanswered, _) = opened_ticket(&harness, OTHER).await;
+
+    crate::automation::record_staff_reply(&harness.context(), Id::new(replied), 1 << 40)
+        .await
+        .unwrap();
+    assert!(
+        stored_ticket(&harness, replied)
+            .await
+            .automation
+            .first_response_replied
+    );
+
+    harness.advance(Duration::from_hours(2));
+    let results = harness.run_due_jobs().await;
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+
+    assert!(
+        stored_ticket(&harness, replied).await.is_open(),
+        "the answered ticket must stay open"
+    );
+    // A closed ticket may leave the open-ticket store, so a missing record counts as closed.
+    let unanswered_record: Option<Ticket> = harness
+        .store()
+        .get(&format!("ticket:{unanswered}"))
+        .await
+        .unwrap();
+    assert!(
+        unanswered_record.is_none_or(|ticket| !ticket.is_open()),
+        "the unanswered ticket must close at its first response deadline"
+    );
+}
+
+#[tokio::test]
+async fn form_option_fetches_run_together_under_one_deadline() {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(5);
+    let requests: Vec<_> = (0..3_u8)
+        .map(|n| async move {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            n
+        })
+        .collect();
+    let results = crate::advanced_forms::join_before_deadline(requests, deadline).await;
+    assert_eq!(results, vec![Some(0), Some(1), Some(2)]);
+    assert!(started.elapsed() < Duration::from_millis(2_000));
+}
+
+async fn audit_targets(harness: &Harness) -> Vec<Option<String>> {
+    let events = harness
+        .store()
+        .list("tickets:audit:v1:e:", 100)
+        .await
+        .unwrap();
+    let mut targets = Vec::new();
+    for (key, _) in events {
+        let event: serde_json::Value = harness.store().get(&key).await.unwrap().unwrap();
+        targets.push(event["target_id"].as_str().map(str::to_owned));
+    }
+    targets
+}
+
+#[tokio::test]
+async fn ticket_close_audit_event_names_the_ticket_channel() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("close")
+                .user(MEMBER)
+                .channel(HERE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit_targets(&harness).await, [Some(HERE.to_string())]);
+}
+
+#[tokio::test]
+async fn label_add_audit_event_names_the_label() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    harness
+        .invoke(label_invocation(
+            "label-add",
+            Some("Needs Review"),
+            MODERATOR,
+            &[MODERATOR],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_targets(&harness).await,
+        [Some("Needs Review".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn blacklist_add_audit_event_names_the_blacklisted_user() {
+    let harness = harness();
+    harness.api().set_member(Id::new(1), member(OTHER, &[]));
+    let replies = harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("blacklist add-user")
+                .option("user", CommandOptionValue::User(Id::new(OTHER)))
+                .roles([STAFF_ROLE])
+                .user(MODERATOR),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_targets(&harness).await,
+        [Some(OTHER.to_string())],
+        "{replies:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_thread_ticket_is_recorded_under_the_thread_it_created() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "max_open": 1,
+        "thread_channel": HERE.to_string()
+    }));
+    harness.api().set_roles(
+        Id::new(1),
+        vec![
+            guild_role(
+                1,
+                Permissions::VIEW_CHANNEL
+                    .union(Permissions::READ_MESSAGE_HISTORY)
+                    .union(Permissions::SEND_MESSAGES_IN_THREADS),
+            ),
+            guild_role(
+                STAFF_ROLE,
+                Permissions::VIEW_CHANNEL
+                    .union(Permissions::READ_MESSAGE_HISTORY)
+                    .union(Permissions::SEND_MESSAGES_IN_THREADS)
+                    .union(Permissions::MANAGE_THREADS),
+            ),
+        ],
+    );
+    let bot = harness.bot_id().unwrap().get();
+    let bot_role: twilight_model::guild::Role = serde_json::from_value(json!({
+        "id": "9998",
+        "name": "bot",
+        "color": 0,
+        "hoist": false,
+        "managed": true,
+        "mentionable": false,
+        "permissions": Permissions::VIEW_CHANNEL
+            .union(Permissions::READ_MESSAGE_HISTORY)
+            .union(Permissions::SEND_MESSAGES_IN_THREADS)
+            .union(Permissions::CREATE_PRIVATE_THREADS)
+            .union(Permissions::MANAGE_THREADS)
+            .bits()
+            .to_string(),
+        "position": 1,
+        "flags": 0,
+        "icon": null,
+        "unicode_emoji": null,
+        "tags": { "bot_id": bot.to_string() },
+        "colors": { "primary_color": 0, "secondary_color": null, "tertiary_color": null }
+    }))
+    .unwrap();
+    let mut roles = harness.api().roles(Id::new(1));
+    roles.push(bot_role);
+    harness.api().set_roles(Id::new(1), roles);
+    harness.api().set_member(Id::new(1), member(bot, &[9998]));
+    harness.api().set_member(Id::new(1), member(MEMBER, &[]));
+
+    let replies = harness.click(press("open", MEMBER)).await.unwrap();
+
+    assert!(
+        replies.last().unwrap().content.contains("<#"),
+        "{replies:?}"
+    );
+    assert!(deleted(&harness).is_empty(), "{:?}", harness.actions());
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    assert_eq!(tickets.len(), 1, "{tickets:?}");
+    assert_ne!(tickets[0].0, format!("ticket:{HERE}"));
+}
+
+#[tokio::test]
+async fn a_thread_whose_id_cannot_be_saved_is_deleted_and_its_reservation_stays_pending() {
+    let harness = harness();
+    harness.set_config(json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "max_open": 1,
+        "thread_channel": HERE.to_string()
+    }));
+    harness.api().set_roles(
+        Id::new(1),
+        vec![
+            guild_role(
+                1,
+                Permissions::VIEW_CHANNEL
+                    .union(Permissions::READ_MESSAGE_HISTORY)
+                    .union(Permissions::SEND_MESSAGES_IN_THREADS),
+            ),
+            guild_role(
+                STAFF_ROLE,
+                Permissions::VIEW_CHANNEL
+                    .union(Permissions::READ_MESSAGE_HISTORY)
+                    .union(Permissions::SEND_MESSAGES_IN_THREADS)
+                    .union(Permissions::MANAGE_THREADS),
+            ),
+        ],
+    );
+    let bot = harness.bot_id().unwrap().get();
+    let bot_role: twilight_model::guild::Role = serde_json::from_value(json!({
+        "id": "9998",
+        "name": "bot",
+        "color": 0,
+        "hoist": false,
+        "managed": true,
+        "mentionable": false,
+        "permissions": Permissions::VIEW_CHANNEL
+            .union(Permissions::READ_MESSAGE_HISTORY)
+            .union(Permissions::SEND_MESSAGES_IN_THREADS)
+            .union(Permissions::CREATE_PRIVATE_THREADS)
+            .union(Permissions::MANAGE_THREADS)
+            .bits()
+            .to_string(),
+        "position": 1,
+        "flags": 0,
+        "icon": null,
+        "unicode_emoji": null,
+        "tags": { "bot_id": bot.to_string() },
+        "colors": { "primary_color": 0, "secondary_color": null, "tertiary_color": null }
+    }))
+    .unwrap();
+    let mut roles = harness.api().roles(Id::new(1));
+    roles.push(bot_role);
+    harness.api().set_roles(Id::new(1), roles);
+    harness.api().set_member(Id::new(1), member(bot, &[9998]));
+    harness.api().set_member(Id::new(1), member(MEMBER, &[]));
+
+    // The reservation write and the advance before thread creation pass; the write that stores the thread ID fails.
+    harness.fail_store_writes_after(
+        "open-reservation:",
+        2,
+        closure_core::storage::StorageError::Backend("down".to_owned()),
+    );
+    let replies = harness.click(press("open", MEMBER)).await.unwrap();
+
+    assert!(
+        replies.last().unwrap().content.contains("still checking"),
+        "{replies:?}"
+    );
+    let removed = deleted(&harness);
+    assert_eq!(removed.len(), 1, "{:?}", harness.actions());
+    assert_ne!(removed[0], HERE);
+    assert!(
+        harness
+            .store()
+            .list("ticket:", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let reservations = harness.store().list("open-reservation:", 10).await.unwrap();
+    assert_eq!(reservations.len(), 1, "{reservations:?}");
+    let reservation: OpenReservation = harness
+        .store()
+        .get(&reservations[0].0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reservation.api_started);
+    assert_eq!(reservation.channel, None);
+    assert_eq!(reservation.released_at, None);
 }
