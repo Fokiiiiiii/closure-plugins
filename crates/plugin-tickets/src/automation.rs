@@ -434,19 +434,7 @@ pub(super) async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, 
             if message_id <= ticket.automation.latest_message_id {
                 return Ok(Flow::Continue);
             }
-            let first_cycle = ticket.automation.started_close_generation.is_none();
-            ticket.automation.generation =
-                ticket.automation.generation.checked_add(1).ok_or_else(|| {
-                    ModuleError::other("ticket automation generation is exhausted")
-                })?;
-            ticket.automation.latest_message_id = 0;
-            ticket.automation.first_response_replied = false;
-            ticket.automation.started_close_generation = Some(ticket.close_generation);
-            ticket.automation.first_response_since = Some(if first_cycle {
-                ticket.created
-            } else {
-                ctx.now()
-            });
+            start_close_cycle(&mut ticket, ctx.now())?;
         }
         if message_id < ticket.automation.latest_message_id {
             return Ok(Flow::Continue);
@@ -467,27 +455,7 @@ pub(super) async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, 
                 .any(|role| staff_roles.contains(role));
         let permission_pending = !opener && !staff;
 
-        ticket.automation.generation = ticket
-            .automation
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| ModuleError::other("ticket automation generation is exhausted"))?;
-        ticket.automation.latest_message_id = message_id;
-        if staff && !ticket.automation.first_response_replied {
-            ticket.automation.first_response_generation = ticket
-                .automation
-                .first_response_generation
-                .checked_add(1)
-                .ok_or_else(|| {
-                    ModuleError::other("ticket first response generation is exhausted")
-                })?;
-            ticket.automation.first_response_replied = true;
-        }
-        if opener {
-            ticket.waiting_for_reply = false;
-        } else if staff {
-            ticket.waiting_for_reply = true;
-        }
+        apply_message(&mut ticket, message_id, opener, staff)?;
         if permission_pending {
             let check = PendingStaffCheck {
                 message_id,
@@ -525,6 +493,106 @@ pub(super) async fn on_message(ctx: EventContext, event: Event) -> Result<Flow, 
     }
     Err(ModuleError::other(
         "ticket changed repeatedly while recording a message",
+    ))
+}
+
+fn start_close_cycle(ticket: &mut Ticket, now: i64) -> Result<(), ModuleError> {
+    let first_cycle = ticket.automation.started_close_generation.is_none();
+    ticket.automation.generation = ticket
+        .automation
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| ModuleError::other("ticket automation generation is exhausted"))?;
+    ticket.automation.latest_message_id = 0;
+    ticket.automation.first_response_replied = false;
+    ticket.automation.started_close_generation = Some(ticket.close_generation);
+    ticket.automation.first_response_since = Some(if first_cycle { ticket.created } else { now });
+    Ok(())
+}
+
+// Shared by the Gateway path and the dashboard reply path, so both move the timers the same way.
+fn apply_message(
+    ticket: &mut Ticket,
+    message_id: u64,
+    opener: bool,
+    staff: bool,
+) -> Result<(), ModuleError> {
+    ticket.automation.generation = ticket
+        .automation
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| ModuleError::other("ticket automation generation is exhausted"))?;
+    ticket.automation.latest_message_id = message_id;
+    if staff && !ticket.automation.first_response_replied {
+        ticket.automation.first_response_generation = ticket
+            .automation
+            .first_response_generation
+            .checked_add(1)
+            .ok_or_else(|| ModuleError::other("ticket first response generation is exhausted"))?;
+        ticket.automation.first_response_replied = true;
+    }
+    if opener {
+        ticket.waiting_for_reply = false;
+    } else if staff {
+        ticket.waiting_for_reply = true;
+    }
+    Ok(())
+}
+
+// A message is new when it is later than the last one recorded; a repeat is not counted again.
+fn is_new_message(ticket: &Ticket, message_id: u64) -> bool {
+    message_id > ticket.automation.latest_message_id
+}
+
+/// Records a reply the bot sent for an authorized staff member. The bot's own Gateway events are
+/// ignored, so a dashboard reply would otherwise leave the first-response and waiting timers as they were.
+pub(super) async fn record_staff_reply(
+    ctx: &EventContext,
+    channel: ChannelId,
+    message_id: u64,
+) -> Result<(), ModuleError> {
+    let key = ticket_key(channel);
+    for _ in 0..5 {
+        let Some(entry) = ctx
+            .store()
+            .entry(&key)
+            .await
+            .map_err(|error| stored(&error))?
+        else {
+            return Ok(());
+        };
+        let mut ticket: Ticket = serde_json::from_value(entry.value)
+            .map_err(|error| ModuleError::other(error.to_string()))?;
+        if !ticket.is_open() || !is_new_message(&ticket, message_id) {
+            return Ok(());
+        }
+        if ticket.automation.started_close_generation != Some(ticket.close_generation) {
+            start_close_cycle(&mut ticket, ctx.now())?;
+        }
+        apply_message(&mut ticket, message_id, false, true)?;
+        let config: Config = ctx.parse_config()?;
+        let config = config.for_ticket(&ticket);
+        refresh_ticket_form_answer_ttl(ctx, &ticket).await?;
+        match ctx
+            .store()
+            .replace(
+                &key,
+                &ticket,
+                Expect::Revision(entry.revision),
+                Some(ticket_ttl(&ticket, ctx.now())),
+            )
+            .await
+        {
+            Ok(_) => {
+                return schedule_after_message(ctx, channel, &ticket, &config, made_at(message_id))
+                    .await;
+            }
+            Err(StorageError::Conflict) => {}
+            Err(error) => return Err(stored(&error)),
+        }
+    }
+    Err(ModuleError::other(
+        "ticket changed repeatedly while recording a staff reply",
     ))
 }
 
@@ -595,6 +663,32 @@ async fn schedule_after_message(
 
 /// Run a persisted timer. Its ticket generations fence obsolete jobs after newer messages or closes.
 #[allow(clippy::large_futures, clippy::too_many_lines)]
+/// Rebuilds every automation timer the ticket's current state needs. Timer keys replace older timers, so calling this repeatedly never duplicates them.
+pub(super) async fn reconcile(ctx: &EventContext, channel: ChannelId) -> Result<(), ModuleError> {
+    start(ctx, channel).await?;
+    let Some(entry) = ctx
+        .store()
+        .entry(&ticket_key(channel))
+        .await
+        .map_err(|error| stored(&error))?
+    else {
+        return Ok(());
+    };
+    let ticket: Ticket = serde_json::from_value(entry.value)
+        .map_err(|error| ModuleError::other(error.to_string()))?;
+    let config: Config = ctx.parse_config()?;
+    let config = config.for_ticket(&ticket);
+    if ticket.is_open()
+        && !ticket.thread
+        && !ticket.waiting_for_reply
+        && waiting_category(&config).is_some()
+    {
+        schedule(ctx, channel, &ticket, Kind::Restore, ctx.now(), ctx.now()).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 pub(super) async fn job(cx: JobCx) -> Result<(), ModuleError> {
     let timer: Timer = cx.payload()?;
     let ctx = cx.ctx();
@@ -1070,4 +1164,67 @@ async fn reconcile_category(
         expected_generation = ticket.automation.generation;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod staff_reply_tests {
+    use super::*;
+
+    fn open_ticket() -> Ticket {
+        Ticket {
+            number: 3,
+            opener: 7,
+            claimed_by: None,
+            created: 0,
+            closing: None,
+            close_generation: 0,
+            close_request: None,
+            panel: None,
+            staff_roles: None,
+            form_answers: Vec::new(),
+            labels: Vec::new(),
+            settings: None,
+            form_answer_count: 0,
+            thread: false,
+            thread_parent: None,
+            closed: false,
+            pending_operation: None,
+            panel_role_baselines: Vec::new(),
+            participant_roles: Vec::new(),
+            panel_user_baselines: Vec::new(),
+            participant_users: Vec::new(),
+            waiting_for_reply: false,
+            staff_access: None,
+            automation: State::default(),
+            message_quote: None,
+            message_quote_message_id: None,
+        }
+    }
+
+    #[test]
+    fn staff_reply_records_first_response_and_waiting() {
+        let mut ticket = open_ticket();
+        apply_message(&mut ticket, 500, false, true).unwrap();
+        assert!(ticket.automation.first_response_replied);
+        assert_eq!(ticket.automation.first_response_generation, 1);
+        assert!(ticket.waiting_for_reply);
+        assert_eq!(ticket.automation.latest_message_id, 500);
+    }
+
+    #[test]
+    fn opener_reply_clears_waiting_and_does_not_record_first_response() {
+        let mut ticket = open_ticket();
+        ticket.waiting_for_reply = true;
+        apply_message(&mut ticket, 500, true, false).unwrap();
+        assert!(!ticket.automation.first_response_replied);
+        assert!(!ticket.waiting_for_reply);
+    }
+
+    #[test]
+    fn repeated_message_id_is_not_counted_again() {
+        let mut ticket = open_ticket();
+        apply_message(&mut ticket, 500, false, true).unwrap();
+        assert!(!is_new_message(&ticket, 500));
+        assert!(is_new_message(&ticket, 501));
+    }
 }

@@ -3,7 +3,6 @@
 use std::fmt::Display;
 use std::time::Duration;
 
-use closure_core::action::{Action, MentionPolicy};
 use closure_core::event::ChannelId;
 use closure_core::integration_secrets::{IntegrationSecretError, SecretString};
 use closure_core::module::{
@@ -193,13 +192,13 @@ pub async fn state(
     if matches!(&scope, DashboardScope::IntegrationSecrets) {
         return integration_secret_state(&ctx, &actor).await;
     }
-    if matches!(&scope, DashboardScope::Gallery) {
+    if let DashboardScope::Gallery { cursor, query } = &scope {
         let can_manage = tickets_manage(&ctx, &actor)?;
         if !can_manage {
             return Err(DashboardActionError::Forbidden);
         }
         let config: Config = ctx.parse_config().map_err(internal)?;
-        return gallery_state(&ctx, &config).await;
+        return gallery_state(&ctx, &config, query.as_deref(), cursor.as_deref()).await;
     }
     if let DashboardScope::Tags { query, cursor } = &scope {
         if !tickets_manage(&ctx, &actor)? {
@@ -310,7 +309,7 @@ pub async fn state(
         | DashboardScope::TicketHistory { .. }
         | DashboardScope::TicketLabels { .. }
         | DashboardScope::IntegrationSecrets
-        | DashboardScope::Gallery => {
+        | DashboardScope::Gallery { .. } => {
             unreachable!("aggregate dashboard scope returned above")
         }
     }
@@ -345,7 +344,7 @@ pub async fn action(
         audit::record_dashboard_action(&ctx, &actor, &audit_request, &outcome).await?;
         return outcome;
     }
-    if matches!(&request.scope, DashboardScope::Gallery) {
+    if matches!(&request.scope, DashboardScope::Gallery { .. }) {
         let outcome = gallery_action(&ctx, &actor, &request).await;
         audit::record_dashboard_action(&ctx, &actor, &request, &outcome).await?;
         return outcome;
@@ -444,73 +443,79 @@ pub async fn action(
 async fn gallery_state(
     ctx: &EventContext,
     config: &Config,
+    query: Option<&str>,
+    cursor: Option<&str>,
 ) -> Result<DashboardActionResult, DashboardActionError> {
     let mut sources = Vec::new();
     let mut truncated = false;
 
-    for panel in config
-        .panels
-        .iter()
-        .take(GALLERY_SOURCE_LIMIT.saturating_add(1))
-    {
-        if sources.len() == GALLERY_SOURCE_LIMIT {
-            truncated = true;
-            break;
-        }
-        if !panel.customization.valid() {
-            continue;
-        }
-        sources.push(json!({
-            "kind": "panel",
-            "id": panel.id,
-            "name": panel.name.as_deref().unwrap_or(&panel.id),
-            "payload": panel_gallery_payload(panel),
-        }));
-    }
-
-    if !truncated {
-        for form in config
-            .forms
+    // Panels and forms are not paged by tag cursor, so they only appear on the unfiltered first page.
+    if query.is_none() && cursor.is_none() {
+        for panel in config
+            .panels
             .iter()
             .take(GALLERY_SOURCE_LIMIT.saturating_add(1))
         {
-            let Some(payload) = form_library::gallery_payload(form) else {
-                continue;
-            };
             if sources.len() == GALLERY_SOURCE_LIMIT {
                 truncated = true;
                 break;
             }
+            if !panel.customization.valid() {
+                continue;
+            }
             sources.push(json!({
-                "kind": "form",
-                "id": form.id,
-                "name": form.title,
-                "payload": payload,
+                "kind": "panel",
+                "id": panel.id,
+                "name": panel.name.as_deref().unwrap_or(&panel.id),
+                "payload": panel_gallery_payload(panel),
             }));
+        }
+
+        if !truncated {
+            for form in config
+                .forms
+                .iter()
+                .take(GALLERY_SOURCE_LIMIT.saturating_add(1))
+            {
+                let Some(payload) = form_library::gallery_payload(form) else {
+                    continue;
+                };
+                if sources.len() == GALLERY_SOURCE_LIMIT {
+                    truncated = true;
+                    break;
+                }
+                sources.push(json!({
+                    "kind": "form",
+                    "id": form.id,
+                    "name": form.title,
+                    "payload": payload,
+                }));
+            }
         }
     }
 
-    let tags_page = tags::gallery_sources(ctx, None, None).await?;
-    if let Some(tag_sources) = tags_page.value.get("sources").and_then(Value::as_array) {
-        for source in tag_sources {
-            if sources.len() == GALLERY_SOURCE_LIMIT {
-                truncated = true;
-                break;
-            }
-            sources.push(source.clone());
-        }
-    } else {
+    let tags_page = tags::gallery_sources(ctx, query, cursor).await?;
+    gallery_response(sources, truncated, &tags_page.value)
+}
+
+// The tag page is appended whole: its next_cursor points past every item it scanned, so
+// dropping any of them here would silently skip them on the next page.
+fn gallery_response(
+    mut sources: Vec<Value>,
+    mut truncated: bool,
+    tags_page: &Value,
+) -> Result<DashboardActionResult, DashboardActionError> {
+    let Some(tag_sources) = tags_page.get("sources").and_then(Value::as_array) else {
         return Err(DashboardActionError::Internal(
             "invalid gallery tag source state".into(),
         ));
-    }
-    truncated |= tags_page
-        .value
-        .get("next_cursor")
-        .is_some_and(|cursor| !cursor.is_null());
+    };
+    sources.extend(tag_sources.iter().cloned());
+    let next_cursor = tags_page.get("next_cursor").cloned().unwrap_or(Value::Null);
+    truncated |= !next_cursor.is_null();
 
     Ok(result(
-        json!({ "sources": sources, "truncated": truncated }),
+        json!({ "sources": sources, "truncated": truncated, "next_cursor": next_cursor }),
         0,
     ))
 }
@@ -520,7 +525,7 @@ async fn gallery_action(
     actor: &Actor,
     request: &DashboardActionRequest,
 ) -> Result<DashboardActionResult, DashboardActionError> {
-    if !matches!(&request.scope, DashboardScope::Gallery) {
+    if !matches!(&request.scope, DashboardScope::Gallery { .. }) {
         return Err(DashboardActionError::Unsupported);
     }
     if !matches!(request.action.as_str(), "gallery.import" | "gallery.export") {
@@ -1594,16 +1599,18 @@ async fn dashboard_reply(
             )
             .await
             .map_err(internal)?;
-        if let Err(error) = ctx
+        let sent = match ctx
             .api
-            .execute(Action::SendMessage {
-                channel_id: channel,
-                content: Some(attempt.chunks[index].clone()),
-                embeds: Vec::new(),
-                reply_to: None,
-                mentions: MentionPolicy::None,
-            })
+            .send_message(channel, attempt.chunks[index].clone())
             .await
+        {
+            Ok(sent) => sent,
+            Err(error) => {
+                mark_uncertain(ctx, receipt_key, receipt, receipt_revision).await;
+                return Err(internal(error));
+            }
+        };
+        if let Err(error) = super::automation::record_staff_reply(ctx, channel, sent.id.get()).await
         {
             mark_uncertain(ctx, receipt_key, receipt, receipt_revision).await;
             return Err(internal(error));
@@ -2019,7 +2026,7 @@ fn scope_identity(scope: &DashboardScope) -> String {
             format!("analytics:{period_days}:{cursor:?}")
         }
         DashboardScope::IntegrationSecrets => "integration-secrets".into(),
-        DashboardScope::Gallery => "gallery".into(),
+        DashboardScope::Gallery { .. } => "gallery".into(),
     }
 }
 
@@ -2337,4 +2344,54 @@ pub(super) fn user_error(error: super::UserError) -> DashboardActionError {
 
 pub(super) fn internal(error: impl Display) -> DashboardActionError {
     DashboardActionError::Internal(error.to_string())
+}
+
+#[cfg(test)]
+mod gallery_response_tests {
+    use super::{DashboardActionError, gallery_response};
+    use serde_json::{Value, json};
+
+    fn tag_page(count: usize, next_cursor: Option<&str>) -> Value {
+        let sources: Vec<Value> = (0..count)
+            .map(|index| json!({ "kind": "tag", "id": format!("tag-{index:02}") }))
+            .collect();
+        json!({ "sources": sources, "next_cursor": next_cursor })
+    }
+
+    #[test]
+    fn first_tag_page_passes_next_cursor_through_and_marks_truncated() {
+        let response = gallery_response(Vec::new(), false, &tag_page(25, Some("tag-24")))
+            .expect("valid tag page");
+
+        assert_eq!(response.value["sources"].as_array().map(Vec::len), Some(25));
+        assert_eq!(response.value["next_cursor"], json!("tag-24"));
+        assert_eq!(response.value["truncated"], json!(true));
+    }
+
+    #[test]
+    fn last_tag_page_has_null_next_cursor_and_is_not_truncated() {
+        let response =
+            gallery_response(Vec::new(), false, &tag_page(5, None)).expect("valid tag page");
+
+        assert_eq!(response.value["sources"].as_array().map(Vec::len), Some(5));
+        assert_eq!(response.value["next_cursor"], Value::Null);
+        assert_eq!(response.value["truncated"], json!(false));
+    }
+
+    #[test]
+    fn tag_items_are_kept_even_when_panel_sources_reached_the_cap() {
+        let panels = vec![json!({ "kind": "panel" }); 3];
+        let response =
+            gallery_response(panels, true, &tag_page(25, Some("tag-24"))).expect("valid tag page");
+
+        assert_eq!(response.value["sources"].as_array().map(Vec::len), Some(28));
+        assert_eq!(response.value["next_cursor"], json!("tag-24"));
+    }
+
+    #[test]
+    fn tag_page_without_sources_is_an_internal_error() {
+        let result = gallery_response(Vec::new(), false, &json!({ "next_cursor": null }));
+
+        assert!(matches!(result, Err(DashboardActionError::Internal(_))));
+    }
 }

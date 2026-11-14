@@ -9,7 +9,8 @@ use closure_core::event::{ChannelId, UserId};
 use closure_core::module::EventContext;
 use closure_core::storage::{Entry, Expect, MAX_VALUE_BYTES, StorageError};
 use closure_sdk::{
-    Args, CommandArgs, CommandCx, DirectMessage, EmbedBuilder, JobCx, Locale, Sent, UserError,
+    Args, CommandArgs, CommandCx, DirectMessage, EmbedBuilder, InteractionReply, JobCx, Locale,
+    Sent, UserError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -429,14 +430,89 @@ pub(crate) async fn view(cx: CommandCx, args: ViewArgs) -> Result<(), UserError>
     if !article.published {
         return Err(UserError::message("tickets-knowledge-not-found"));
     }
-    cx.reply_private_t(
+    let heading = cx.t(
         "tickets-knowledge-view",
         &Args::new()
-            .with("id", article.id)
-            .with("title", article.title)
-            .with("body", article.body),
-    )
-    .await
+            .with("id", article.id.clone())
+            .with("title", article.title.clone()),
+    );
+    for embed in article_view_embeds(&heading, &article.body)? {
+        cx.reply_with(InteractionReply {
+            embeds: vec![embed],
+            ephemeral: true,
+            ..InteractionReply::default()
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+// Discord caps an embed description at 4096 characters; a longer body continues in more embeds.
+const ARTICLE_DESCRIPTION_CHARS: usize = 4096;
+
+fn article_view_embeds(heading: &str, body: &str) -> Result<Vec<Embed>, UserError> {
+    let characters: Vec<char> = body.chars().collect();
+    let mut parts: Vec<String> = characters
+        .chunks(ARTICLE_DESCRIPTION_CHARS)
+        .map(|part| part.iter().collect())
+        .collect();
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let mut builder = EmbedBuilder::new();
+            if index == 0 {
+                builder = builder.title(heading);
+            }
+            if !part.is_empty() {
+                builder = builder.description(part);
+            }
+            builder
+                .build()
+                .map_err(|_| UserError::message("tickets-failed"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod article_view_tests {
+    use super::*;
+
+    fn description_text(embeds: &[Embed]) -> String {
+        embeds
+            .iter()
+            .filter_map(|embed| embed.description.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn full_length_article_is_shown_in_one_embed_with_its_title() {
+        let body = "b".repeat(4096);
+        let Ok(embeds) = article_view_embeds("[id] title", &body) else {
+            panic!("a 4096-character article must render");
+        };
+        assert_eq!(embeds.len(), 1);
+        assert_eq!(embeds[0].title.as_deref(), Some("[id] title"));
+        assert_eq!(description_text(&embeds), body);
+    }
+
+    #[test]
+    fn body_beyond_one_description_continues_without_loss() {
+        let body = format!("{}{}", "a".repeat(4096), "z".repeat(10));
+        let Ok(embeds) = article_view_embeds("[id] title", &body) else {
+            panic!("a longer article must still render");
+        };
+        assert_eq!(embeds.len(), 2);
+        assert!(
+            embeds
+                .iter()
+                .all(|embed| embed.description.as_deref().map_or(0, str::len) <= 4096)
+        );
+        assert_eq!(description_text(&embeds), body);
+    }
 }
 
 async fn record_knowledge_success(

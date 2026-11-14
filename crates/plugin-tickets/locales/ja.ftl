@@ -567,9 +567,7 @@ tickets-knowledge-page-not-found = 検索結果のページがありません。
 tickets-knowledge-invalid-id = 記事IDは英小文字、数字、ハイフンを使った1〜32文字で指定してください。
 tickets-knowledge-not-found = ナレッジ記事が見つかりません。
 tickets-knowledge-view = [{ $id }] { $title }
-
-    { $body }
-tickets-knowledge-invalid-article = 英小文字などで有効なID、100文字以内のタイトル、1,700文字以内の本文を入力してください。
+tickets-knowledge-invalid-article = 英小文字などで有効なID、100文字以内のタイトル、4,096文字以内の本文を入力してください。
 tickets-knowledge-limit = ナレッジ記事の上限に達しました。
 tickets-knowledge-id-exists = その記事IDはすでに使用されています。
 tickets-knowledge-added = ナレッジ記事{ $id }を追加しました。

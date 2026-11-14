@@ -2,14 +2,14 @@ use closure_core::action::Action;
 use closure_core::error::DiscordError;
 use closure_core::event::{RoleId, UserId};
 use closure_core::module::EventContext;
-use closure_core::storage::{Expect, StorageError};
+use closure_core::storage::{Expect, StorageError, Store};
 use closure_sdk::{Args, CommandArgs, CommandCx, UserError};
 use serde::{Deserialize, Serialize};
 
 use super::{Config, failed, is_staff_command};
 
 const PREFIX: &str = "ticket-blacklist";
-const CAS_ATTEMPTS: usize = 5;
+const READ_PAGE: usize = 500;
 const PAGE_SIZE: usize = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -98,12 +98,6 @@ pub(super) struct ChangeResult {
     pub(super) changed: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Operation {
-    Add,
-    Remove,
-}
-
 #[derive(CommandArgs)]
 pub(super) struct UserArgs {
     /// The member to block or unblock
@@ -129,13 +123,6 @@ pub(super) struct ScopeArgs {
     panel: Option<String>,
     /// The page number
     page: Option<i64>,
-}
-
-fn key(ctx: &EventContext, panel: Option<&str>) -> String {
-    match panel {
-        Some(panel) => format!("{PREFIX}:{}:panel:{panel}:state", ctx.guild_id.get()),
-        None => format!("{PREFIX}:{}:guild:state", ctx.guild_id.get()),
-    }
 }
 
 pub(super) fn scope_config(config: &Config, panel: Option<&str>) -> Result<Config, UserError> {
@@ -190,32 +177,19 @@ pub(super) async fn dashboard_change(
 }
 
 pub(super) async fn state(ctx: &EventContext, panel: Option<&str>) -> Result<Snapshot, UserError> {
-    let key = key(ctx, panel);
-    let entries = ctx.store().list(&key, 1).await.map_err(|error| {
-        tracing::warn!(?error, guild = %ctx.guild_id, "could not read ticket blacklist");
-        UserError::message("tickets-failed")
-    })?;
-    let entry = entries
-        .into_iter()
-        .find(|(stored_key, _)| stored_key == &key)
-        .map(|(_, entry)| entry);
-    let mut state = match entry.as_ref() {
-        Some(entry) => serde_json::from_value(entry.value.clone()).map_err(|error| {
-            tracing::warn!(?error, guild = %ctx.guild_id, "could not decode ticket blacklist");
-            UserError::message("tickets-failed")
-        })?,
-        None => State::default(),
-    };
-    for target in &mut state.entries {
-        *target = target.canonical(ctx.guild_id.get()).map_err(|error| {
-            tracing::warn!(?error, guild = %ctx.guild_id, "ticket blacklist contains an invalid target");
-            UserError::message("tickets-failed")
-        })?;
-    }
-    state.entries.sort_unstable();
+    let store = ctx.store();
+    let guild = ctx.guild_id.get();
+    let entries = stored_targets(store, guild, panel)
+        .await
+        .map_err(|error| store_failed(ctx, &error))?;
+    let revision = store
+        .entry(&meta_key(&scope(guild, panel)))
+        .await
+        .map_err(|error| store_failed(ctx, &error))?
+        .map(|entry| entry.revision);
     Ok(Snapshot {
-        revision: entry.map(|entry| entry.revision),
-        state,
+        revision,
+        state: State { entries },
     })
 }
 
@@ -272,66 +246,39 @@ pub(super) async fn change(
     add: bool,
     guard: RevisionGuard,
 ) -> Result<ChangeResult, UserError> {
-    let target = target.canonical(ctx.guild_id.get())?;
-    let operation = if add {
+    let guild = ctx.guild_id.get();
+    let target = target.canonical(guild)?;
+    if add {
         validate_add_target(ctx, &target).await?;
-        Operation::Add
-    } else {
-        Operation::Remove
-    };
-    let key = key(ctx, panel);
-    for _ in 0..CAS_ATTEMPTS {
-        let current = state(ctx, panel).await?;
-        let expect = match guard {
-            RevisionGuard::Any => current.revision.map_or(Expect::Missing, Expect::Revision),
-            RevisionGuard::Missing if current.revision.is_none() => Expect::Missing,
-            RevisionGuard::Revision(revision) if current.revision == Some(revision) => {
-                Expect::Revision(revision)
-            }
-            RevisionGuard::Missing | RevisionGuard::Revision(_) => {
-                return Err(UserError::message("tickets-blacklist-conflict"));
-            }
-        };
-
-        let mut state = current.state.clone();
-        let was_present = state.entries.contains(&target);
-        let changed = match operation {
-            Operation::Add if !was_present => {
-                state.entries.push(target.clone());
-                state.entries.sort_unstable();
-                true
-            }
-            Operation::Remove if was_present => {
-                state.entries.retain(|entry| entry != &target);
-                true
-            }
-            Operation::Add | Operation::Remove => false,
-        };
-        if !changed {
-            return Ok(ChangeResult {
-                snapshot: current,
-                changed: false,
-            });
-        }
-
-        match ctx.store().replace(&key, &state, expect, None).await {
-            Ok(_) => {
-                return Ok(ChangeResult {
-                    snapshot: self::state(ctx, panel).await?,
-                    changed: true,
-                });
-            }
-            Err(StorageError::Conflict) if guard == RevisionGuard::Any => {}
-            Err(StorageError::Conflict) => {
-                return Err(UserError::message("tickets-blacklist-conflict"));
-            }
-            Err(error) => {
-                tracing::warn!(?error, guild = %ctx.guild_id, "could not update ticket blacklist");
-                return Err(UserError::message("tickets-failed"));
-            }
-        }
     }
-    Err(UserError::message("tickets-failed"))
+    let store = ctx.store();
+    let meta = meta_key(&scope(guild, panel));
+    let revision = store
+        .entry(&meta)
+        .await
+        .map_err(|error| store_failed(ctx, &error))?
+        .map(|entry| entry.revision);
+    let guarded = match guard {
+        RevisionGuard::Any => true,
+        RevisionGuard::Missing => revision.is_none(),
+        RevisionGuard::Revision(expected) => revision == Some(expected),
+    };
+    if !guarded {
+        return Err(UserError::message("tickets-blacklist-conflict"));
+    }
+    let changed = write_target(store, guild, panel, &target, add)
+        .await
+        .map_err(|error| store_failed(ctx, &error))?;
+    if changed {
+        store
+            .replace(&meta, &true, Expect::Any, None)
+            .await
+            .map_err(|error| store_failed(ctx, &error))?;
+    }
+    Ok(ChangeResult {
+        snapshot: state(ctx, panel).await?,
+        changed,
+    })
 }
 
 pub(super) async fn is_blocked(
@@ -340,23 +287,20 @@ pub(super) async fn is_blocked(
     effective_roles: &[RoleId],
     panel: Option<&str>,
 ) -> Result<bool, UserError> {
-    let matches = |state: &State| {
-        state.entries.iter().any(|target| match target {
-            Target::User { id } => id == &user.get().to_string(),
-            Target::Role { id } => effective_roles
-                .iter()
-                .any(|role| id == &role.get().to_string()),
-        })
-    };
-    if matches(&state(ctx, None).await?.state) {
-        return Ok(true);
-    }
-    if let Some(panel) = panel
-        && matches(&state(ctx, Some(panel)).await?.state)
+    let store = ctx.store();
+    let guild = ctx.guild_id.get();
+    if is_listed(store, guild, None, user, effective_roles)
+        .await
+        .map_err(|error| store_failed(ctx, &error))?
     {
         return Ok(true);
     }
-    Ok(false)
+    match panel {
+        Some(panel) => is_listed(store, guild, Some(panel), user, effective_roles)
+            .await
+            .map_err(|error| store_failed(ctx, &error)),
+        None => Ok(false),
+    }
 }
 
 fn scope_label(cx: &CommandCx, config: &Config, panel: Option<&str>) -> Result<String, UserError> {
@@ -503,4 +447,291 @@ pub(super) async fn list(cx: CommandCx, args: ScopeArgs) -> Result<(), UserError
         );
     }
     cx.reply_private(content).await
+}
+
+fn scope(guild: u64, panel: Option<&str>) -> String {
+    match panel {
+        Some(panel) => format!("{PREFIX}:{guild}:panel:{panel}"),
+        None => format!("{PREFIX}:{guild}:guild"),
+    }
+}
+
+/// The single record that older builds wrote; it is still read and moved away on the next write.
+fn legacy_key(guild: u64, panel: Option<&str>) -> String {
+    format!("{}:state", scope(guild, panel))
+}
+
+fn entries_prefix(scope: &str) -> String {
+    format!("{scope}:entry:")
+}
+
+fn meta_key(scope: &str) -> String {
+    format!("{scope}:meta")
+}
+
+fn entry_key(scope: &str, target: &Target) -> String {
+    match target {
+        Target::User { id } => format!("{scope}:entry:user:{id}"),
+        Target::Role { id } => format!("{scope}:entry:role:{id}"),
+    }
+}
+
+fn valid_target(target: &Target, guild: u64) -> Result<Target, StorageError> {
+    target
+        .canonical(guild)
+        .map_err(|_| StorageError::Value("invalid blacklist target".to_owned()))
+}
+
+fn member_of(target: &Target, user: UserId, roles: &[RoleId]) -> bool {
+    match target {
+        Target::User { id } => id == &user.get().to_string(),
+        Target::Role { id } => roles.iter().any(|role| id == &role.get().to_string()),
+    }
+}
+
+/// Every record that can make `user` blocked here: one per user and per effective role.
+fn member_keys(scope: &str, user: UserId, roles: &[RoleId]) -> Vec<String> {
+    std::iter::once(entry_key(scope, &Target::user(user)))
+        .chain(
+            roles
+                .iter()
+                .map(|role| entry_key(scope, &Target::role(*role))),
+        )
+        .collect()
+}
+
+/// All targets of one scope, from per-entry records plus the legacy record, deduplicated.
+async fn stored_targets(
+    store: &Store,
+    guild: u64,
+    panel: Option<&str>,
+) -> Result<Vec<Target>, StorageError> {
+    let prefix = entries_prefix(&scope(guild, panel));
+    let mut targets = Vec::new();
+    let mut after = prefix.clone();
+    loop {
+        let page = store.list_after(&prefix, &after, READ_PAGE).await?;
+        let full = page.len() == READ_PAGE;
+        for (key, entry) in page {
+            let target = serde_json::from_value::<Target>(entry.value)
+                .map_err(|error| StorageError::Value(error.to_string()))?;
+            targets.push(valid_target(&target, guild)?);
+            after = key;
+        }
+        if !full {
+            break;
+        }
+    }
+    if let Some(legacy) = store.get::<State>(&legacy_key(guild, panel)).await? {
+        for target in legacy.entries {
+            targets.push(valid_target(&target, guild)?);
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    Ok(targets)
+}
+
+/// Moves the legacy record into per-entry records. Entries are written before the legacy record
+/// is deleted, so an interruption leaves both, which reads treat as one set.
+async fn migrate_legacy(
+    store: &Store,
+    guild: u64,
+    panel: Option<&str>,
+) -> Result<(), StorageError> {
+    let legacy = legacy_key(guild, panel);
+    let Some(record) = store.get::<State>(&legacy).await? else {
+        return Ok(());
+    };
+    let scope = scope(guild, panel);
+    for target in record.entries {
+        let target = valid_target(&target, guild)?;
+        store
+            .replace(&entry_key(&scope, &target), &target, Expect::Any, None)
+            .await?;
+    }
+    store.delete(&legacy).await?;
+    Ok(())
+}
+
+/// Adds or removes one target. Returns whether the stored set changed.
+async fn write_target(
+    store: &Store,
+    guild: u64,
+    panel: Option<&str>,
+    target: &Target,
+    add: bool,
+) -> Result<bool, StorageError> {
+    migrate_legacy(store, guild, panel).await?;
+    let key = entry_key(&scope(guild, panel), target);
+    if !add {
+        return store.delete(&key).await;
+    }
+    match store.replace(&key, target, Expect::Missing, None).await {
+        Ok(_) => Ok(true),
+        Err(StorageError::Conflict) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn is_listed(
+    store: &Store,
+    guild: u64,
+    panel: Option<&str>,
+    user: UserId,
+    roles: &[RoleId],
+) -> Result<bool, StorageError> {
+    for key in member_keys(&scope(guild, panel), user, roles) {
+        if store.entry(&key).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(match store.get::<State>(&legacy_key(guild, panel)).await? {
+        Some(record) => record
+            .entries
+            .iter()
+            .any(|target| member_of(target, user, roles)),
+        None => false,
+    })
+}
+
+fn store_failed(ctx: &EventContext, error: &StorageError) -> UserError {
+    tracing::warn!(?error, guild = %ctx.guild_id, "could not use ticket blacklist");
+    UserError::message("tickets-failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use closure_core::storage::Store;
+    use closure_sdk::testing::Harness;
+
+    use super::*;
+
+    const GUILD: u64 = 1;
+    const BASE: u64 = 1_000_000_000_000_000_000;
+
+    fn user(id: u64) -> Target {
+        Target::User { id: id.to_string() }
+    }
+
+    #[tokio::test]
+    async fn adds_past_the_old_single_record_limit() {
+        let harness = Harness::new(crate::builder().unwrap()).unwrap();
+        let store: Store = harness.store();
+        for n in 0..800 {
+            assert!(
+                write_target(&store, GUILD, None, &user(BASE + n), true)
+                    .await
+                    .unwrap(),
+                "entry {n} was not added"
+            );
+        }
+        assert_eq!(
+            stored_targets(&store, GUILD, None).await.unwrap().len(),
+            800
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_record_is_read_and_moved_on_write() {
+        let harness = Harness::new(crate::builder().unwrap()).unwrap();
+        let store: Store = harness.store();
+        let legacy = legacy_key(GUILD, None);
+        let old = State {
+            entries: vec![user(5)],
+        };
+        store
+            .replace(&legacy, &old, Expect::Any, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_targets(&store, GUILD, None).await.unwrap(),
+            vec![user(5)]
+        );
+
+        assert!(
+            write_target(&store, GUILD, None, &user(6), true)
+                .await
+                .unwrap()
+        );
+
+        assert!(store.entry(&legacy).await.unwrap().is_none());
+        assert_eq!(
+            stored_targets(&store, GUILD, None).await.unwrap(),
+            vec![user(5), user(6)]
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_migration_does_not_duplicate_entries() {
+        let harness = Harness::new(crate::builder().unwrap()).unwrap();
+        let store: Store = harness.store();
+        let legacy = legacy_key(GUILD, None);
+        let old = State {
+            entries: vec![user(5)],
+        };
+        store
+            .replace(&legacy, &old, Expect::Any, None)
+            .await
+            .unwrap();
+        let scope = scope(GUILD, None);
+        store
+            .replace(&entry_key(&scope, &user(5)), &user(5), Expect::Any, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_targets(&store, GUILD, None).await.unwrap(),
+            vec![user(5)]
+        );
+
+        assert!(
+            write_target(&store, GUILD, None, &user(7), true)
+                .await
+                .unwrap()
+        );
+
+        assert!(store.entry(&legacy).await.unwrap().is_none());
+        assert_eq!(
+            stored_targets(&store, GUILD, None).await.unwrap(),
+            vec![user(5), user(7)]
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_membership_reads_only_the_candidate_keys() {
+        let harness = Harness::new(crate::builder().unwrap()).unwrap();
+        let store: Store = harness.store();
+        let scope = scope(GUILD, None);
+        let roles = [RoleId::new(9), RoleId::new(10)];
+        assert_eq!(
+            member_keys(&scope, UserId::new(5), &roles).len(),
+            1 + roles.len()
+        );
+
+        for n in 0..3 {
+            write_target(&store, GUILD, None, &user(BASE + n), true)
+                .await
+                .unwrap();
+        }
+        let role = Target::Role { id: "9".to_owned() };
+        write_target(&store, GUILD, None, &role, true)
+            .await
+            .unwrap();
+
+        assert!(
+            is_listed(&store, GUILD, None, UserId::new(BASE + 2), &roles)
+                .await
+                .unwrap()
+        );
+        assert!(
+            is_listed(&store, GUILD, None, UserId::new(5), &roles)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !is_listed(&store, GUILD, None, UserId::new(5), &roles[1..])
+                .await
+                .unwrap()
+        );
+    }
 }

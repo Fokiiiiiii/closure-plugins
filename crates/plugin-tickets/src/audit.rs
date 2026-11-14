@@ -559,8 +559,8 @@ pub(crate) async fn record_dashboard_action(
         (DashboardScope::Tags { .. }, "tag.update") => Some(AuditAction::TagUpdate),
         (DashboardScope::Tags { .. }, "tag.clone") => Some(AuditAction::TagClone),
         (DashboardScope::Tags { .. }, "tag.delete") => Some(AuditAction::TagDelete),
-        (DashboardScope::Gallery, "gallery.import") => Some(AuditAction::GalleryImport),
-        (DashboardScope::Gallery, "gallery.export") => Some(AuditAction::GalleryExport),
+        (DashboardScope::Gallery { .. }, "gallery.import") => Some(AuditAction::GalleryImport),
+        (DashboardScope::Gallery { .. }, "gallery.export") => Some(AuditAction::GalleryExport),
         (DashboardScope::Knowledge { .. }, "knowledge.create") => {
             Some(AuditAction::KnowledgeCreate)
         }

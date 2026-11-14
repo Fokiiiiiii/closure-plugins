@@ -1393,6 +1393,9 @@ async fn finish_panel(
                 {
                     tracing::warn!(?error, %channel, "could not reschedule ticket idle close");
                 }
+                if let Err(error) = Box::pin(super::automation::reconcile(ctx, channel)).await {
+                    tracing::warn!(?error, %channel, "ticket automation timers could not be rescheduled after a panel change");
+                }
                 return Ok(());
             }
             Err(StorageError::Conflict) => {}
@@ -2682,6 +2685,9 @@ pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), User
             .await
         {
             Ok(_) => {
+                if changed && let Err(error) = super::automation::reconcile(ctx, channel).await {
+                    tracing::warn!(?error, %channel, "ticket waiting timers could not be rescheduled");
+                }
                 if changed {
                     let audit_key =
                         format!("ticket-waiting-{}", cx.invocation().interaction_id.get());

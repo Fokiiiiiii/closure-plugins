@@ -29,8 +29,8 @@ use closure_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use twilight_model::channel::ChannelType;
-use twilight_model::channel::message::Component;
 use twilight_model::channel::message::component::ButtonStyle;
+use twilight_model::channel::message::{Component, Embed};
 use twilight_model::guild::Permissions;
 
 const EN: &str = include_str!("../locales/en.ftl");
@@ -1723,6 +1723,16 @@ async fn remember_open_channel(
     if verify_open_channel(ctx, reservation, channel).await? != OpenChannelStatus::Verified {
         return Ok(false);
     }
+    store_open_channel(ctx, user, reservation, channel).await
+}
+
+/// Saves the channel ID on the reservation without asking Discord to confirm it first. Only use it for a channel this call has just created.
+async fn store_open_channel(
+    ctx: &EventContext,
+    user: u64,
+    reservation: &OpenReservation,
+    channel: ChannelId,
+) -> Result<bool, ModuleError> {
     let Some(token) = acquire_open_lock(ctx, user).await? else {
         return Ok(false);
     };
@@ -2002,6 +2012,42 @@ async fn save_open_ticket_locked(
     Ok(true)
 }
 
+/// Discord rejects a message whose embeds together exceed 6000 characters.
+const MESSAGE_EMBED_CHAR_LIMIT: usize = 6000;
+
+fn embed_chars(embed: &Embed) -> usize {
+    let text = |value: Option<&str>| value.map_or(0, |text| text.chars().count());
+    text(embed.title.as_deref())
+        + text(embed.description.as_deref())
+        + text(embed.author.as_ref().map(|author| author.name.as_str()))
+        + text(embed.footer.as_ref().map(|footer| footer.text.as_str()))
+        + embed
+            .fields
+            .iter()
+            .map(|field| field.name.chars().count() + field.value.chars().count())
+            .sum::<usize>()
+}
+
+/// Groups embeds in order so that each group fits in one message.
+fn pack_embeds(embeds: Vec<Embed>) -> Vec<Vec<Embed>> {
+    let mut messages: Vec<Vec<Embed>> = Vec::new();
+    let mut used = 0;
+    for embed in embeds {
+        let size = embed_chars(&embed);
+        if let Some(current) = messages
+            .last_mut()
+            .filter(|_| used + size <= MESSAGE_EMBED_CHAR_LIMIT)
+        {
+            current.push(embed);
+            used += size;
+        } else {
+            messages.push(vec![embed]);
+            used = size;
+        }
+    }
+    messages
+}
+
 #[allow(clippy::too_many_lines)]
 async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket) {
     if let Err(error) = add_team_users_to_thread(ctx, channel, ticket).await {
@@ -2031,14 +2077,16 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
             Vec::new()
         }
     };
-    let mut welcome_embeds = answer_embeds.clone();
+    let mut embeds = Vec::new();
     match ticket_welcome_embed(ctx, channel, ticket, &config, &saved_answers).await {
-        Ok(Some(embed)) => welcome_embeds.insert(0, embed),
+        Ok(Some(embed)) => embeds.push(embed),
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(?error, channel = %channel, "custom ticket welcome embed could not be built");
         }
     }
+    embeds.extend(answer_embeds);
+    // Controls get their own message so that no embed packet can make them disappear.
     let welcome = ctx
         .api
         .execute(Action::PostMessage {
@@ -2054,7 +2102,7 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
                         .with("number", ticket.number),
                 ),
             ),
-            embeds: welcome_embeds,
+            embeds: Vec::new(),
             components: vec![ui::row(vec![
                 button(ctx, "claim", ButtonStyle::Secondary, "tickets-claim-button"),
                 button(ctx, "close", ButtonStyle::Danger, "tickets-close-button"),
@@ -2064,11 +2112,22 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
         .await;
     if let Err(error) = welcome {
         tracing::warn!(?error, guild = %ctx.guild_id, "could not greet in a new ticket");
-        if !answer_embeds.is_empty()
-            && let Err(error) =
-                advanced_forms::send_form_answers(ctx, channel, &answer_embeds).await
-        {
-            tracing::warn!(?error, guild = %ctx.guild_id, "could not post saved ticket answers");
+    }
+    for message in pack_embeds(embeds) {
+        let posted = ctx
+            .api
+            .execute(Action::PostMessage {
+                channel_id: channel,
+                message_id: None,
+                reply_to: None,
+                content: None,
+                embeds: message,
+                components: Vec::new(),
+                files: Vec::new(),
+            })
+            .await;
+        if let Err(error) = posted {
+            tracing::warn!(?error, guild = %ctx.guild_id, "could not post ticket welcome embeds");
         }
     }
     if let Err(error) =
@@ -5164,9 +5223,22 @@ async fn delete_ticket_form_answers(
     ctx: &EventContext,
     ticket: &Ticket,
 ) -> Result<(), ModuleError> {
-    advanced_forms::delete_ticket_form_answers(ctx, ticket)
-        .await
-        .map_err(|error| stored(&error))
+    // Inline tickets (count 0) can still hold copies written by earlier versions, so clear every slot.
+    let mut first_error = None;
+    for index in 0..advanced_forms::MAX_FORM_QUESTIONS {
+        if let Err(error) = ctx
+            .store()
+            .delete(&advanced_forms::ticket_form_answer_key(
+                ticket.number,
+                index,
+            ))
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), |error| Err(stored(&error)))
 }
 
 #[allow(
@@ -5598,14 +5670,20 @@ async fn create_ticket<I: InteractionRef + 'static>(
         return say(&cx, "tickets-opening-pending", &Args::new()).await;
     };
     if thread_parent.is_some() {
-        match remember_open_channel(ctx, user, &reservation, channel).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(guild = %ctx.guild_id, %channel, "ticket thread ID could not be persisted before setup");
-            }
-            Err(error) => {
-                tracing::warn!(?error, guild = %ctx.guild_id, %channel, "ticket thread ID could not be persisted before setup");
-            }
+        // This call just created the thread, so its ID is recorded before any other step can fail.
+        if !matches!(
+            store_open_channel(ctx, user, &reservation, channel).await,
+            Ok(true)
+        ) {
+            tracing::warn!(guild = %ctx.guild_id, %channel, "ticket thread ID could not be persisted; deleting the unrecorded thread");
+            let _ = ctx
+                .api
+                .execute(Action::DeleteChannel {
+                    channel_id: channel,
+                    reason: Reason::truncated(&cx.t("tickets-reason-open", &Args::new())),
+                })
+                .await;
+            return say(&cx, "tickets-opening-pending", &Args::new()).await;
         }
     }
 
@@ -11096,6 +11174,10 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                 transcript_management::LABEL_BACKFILL_JOB,
                 transcript_management::backfill_job,
             )
+            .job(
+                transcript_management::FORM_ORPHAN_JOB,
+                transcript_management::form_orphan_job,
+            )
             .job(LEFT_SCAN, left_scan_job)
             .job(LEFT_CLOSE, left_close_job)
             .job(CLOSING, closing_job)
@@ -11516,5 +11598,66 @@ mod replies_visibility_tests {
             carrying_note.iter().all(|reply| reply.ephemeral),
             "{shown:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod welcome_packing_tests {
+    use serde_json::json;
+    use twilight_model::channel::message::Embed;
+
+    use super::{MESSAGE_EMBED_CHAR_LIMIT, embed_chars, pack_embeds};
+
+    fn embed_with_field_chars(chars: usize) -> Embed {
+        serde_json::from_value(json!({
+            "type": "rich",
+            "title": "answers",
+            "fields": [{ "name": "q", "value": "x".repeat(chars), "inline": false }]
+        }))
+        .unwrap()
+    }
+
+    fn message_chars(message: &[Embed]) -> usize {
+        message.iter().map(embed_chars).sum()
+    }
+
+    #[test]
+    fn five_answers_of_4000_characters_are_split_into_messages_within_the_limit() {
+        const FIELD_CHARS: usize = 1024;
+        // Each 4000-character answer becomes four 1024-character fields, five fields per embed.
+        let fields_per_answer = 4;
+        let fields: Vec<usize> = (0..5 * fields_per_answer).map(|_| FIELD_CHARS).collect();
+        let embeds: Vec<Embed> = fields
+            .chunks(5)
+            .map(|chunk| {
+                let fields: Vec<_> = chunk
+                    .iter()
+                    .map(|chars| json!({ "name": "q", "value": "x".repeat(*chars), "inline": false }))
+                    .collect();
+                serde_json::from_value(json!({ "type": "rich", "title": "answers", "fields": fields }))
+                    .unwrap()
+            })
+            .collect();
+        let total = embeds.len();
+
+        let messages = pack_embeds(embeds);
+
+        assert!(
+            messages
+                .iter()
+                .all(|message| message_chars(message) <= MESSAGE_EMBED_CHAR_LIMIT)
+        );
+        assert_eq!(messages.iter().map(Vec::len).sum::<usize>(), total);
+    }
+
+    #[test]
+    fn embeds_are_grouped_in_order_without_exceeding_the_limit() {
+        // Each embed is 1007 characters, so five fit under the 6000 limit and the sixth starts a message.
+        let embeds: Vec<Embed> = (0..7).map(|_| embed_with_field_chars(999)).collect();
+        assert!(embeds.iter().all(|embed| embed_chars(embed) == 1007));
+
+        let messages = pack_embeds(embeds);
+
+        assert_eq!(messages.iter().map(Vec::len).collect::<Vec<_>>(), [5, 2]);
     }
 }

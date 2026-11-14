@@ -315,6 +315,8 @@ pub(super) async fn labels_action(
 }
 
 pub(super) async fn register_label(ctx: &EventContext, value: &str) -> Result<(), ModuleError> {
+    // Admin writes are the only hook here, so the sweep is queued from the first label write.
+    ensure_form_orphan_sweep(ctx).await?;
     let Some((name, normalized)) = normalized_label(value) else {
         return Err(ModuleError::other("invalid ticket label"));
     };
@@ -746,6 +748,129 @@ async fn schedule_backfill(ctx: &EventContext) -> Result<(), ModuleError> {
         .after(BACKFILL_DELAY)
         .await
         .map_err(|error| ModuleError::other(error.to_string()))
+}
+
+const FORM_ORPHAN_PREFIX: &str = "ticket-form:";
+const FORM_ORPHAN_KEY: &str = "ticket-form-orphan-sweep";
+const FORM_ORPHAN_DONE_KEY: &str = "ticket-form-orphan-sweep:v1";
+// The marker only stops a finished sweep from being scheduled again; a rerun after expiry is harmless.
+const FORM_ORPHAN_DONE_TTL: Duration = Duration::from_hours(24 * 365);
+const FORM_ORPHAN_PAGE_SIZE: usize = 100;
+pub(crate) const FORM_ORPHAN_JOB: &str = "ticket-form-orphan-sweep";
+
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct FormOrphanCursor {
+    after: Option<String>,
+}
+
+/// Schedules the one-time sweep of form copies left by earlier versions, unless it already finished.
+async fn ensure_form_orphan_sweep(ctx: &EventContext) -> Result<(), ModuleError> {
+    let done = ctx
+        .store()
+        .get::<bool>(FORM_ORPHAN_DONE_KEY)
+        .await
+        .map_err(|error| super::stored(&error))?;
+    if done.is_some() {
+        return Ok(());
+    }
+    schedule_form_orphan_sweep(ctx, None).await
+}
+
+async fn schedule_form_orphan_sweep(
+    ctx: &EventContext,
+    after: Option<String>,
+) -> Result<(), ModuleError> {
+    ctx.scheduler()
+        .job(FORM_ORPHAN_JOB, &FormOrphanCursor { after })
+        .map_err(|error| ModuleError::other(error.to_string()))?
+        .key(FORM_ORPHAN_KEY)
+        // A sweep already waiting must keep its cursor instead of restarting from the beginning.
+        .unless_waiting()
+        .after(BACKFILL_DELAY)
+        .await
+        .map_err(|error| ModuleError::other(error.to_string()))
+}
+
+pub(crate) async fn form_orphan_job(cx: JobCx) -> Result<(), ModuleError> {
+    let cursor: FormOrphanCursor = cx.payload()?;
+    let ctx = cx.ctx();
+    let entries = match cursor.after.as_deref() {
+        Some(after) => {
+            ctx.store()
+                .list_after(FORM_ORPHAN_PREFIX, after, FORM_ORPHAN_PAGE_SIZE)
+                .await
+        }
+        None => {
+            ctx.store()
+                .list(FORM_ORPHAN_PREFIX, FORM_ORPHAN_PAGE_SIZE)
+                .await
+        }
+    }
+    .map_err(|error| super::stored(&error))?;
+
+    if !entries.is_empty() {
+        let inline = inline_only_ticket_numbers(ctx).await?;
+        for (key, _) in &entries {
+            if form_key_number(key).is_some_and(|number| inline.contains(&number)) {
+                ctx.store()
+                    .delete(key.as_str())
+                    .await
+                    .map_err(|error| super::stored(&error))?;
+            }
+        }
+    }
+
+    if entries.len() < FORM_ORPHAN_PAGE_SIZE {
+        ctx.store()
+            .set_for(FORM_ORPHAN_DONE_KEY, &true, FORM_ORPHAN_DONE_TTL)
+            .await
+            .map_err(|error| super::stored(&error))?;
+        return Ok(());
+    }
+    let last = entries.last().map(|(key, _)| key.clone());
+    schedule_form_orphan_sweep(ctx, last).await
+}
+
+/// Numbers whose ticket records all have no inline answers copies; a ticket with copies keeps them.
+async fn inline_only_ticket_numbers(ctx: &EventContext) -> Result<HashSet<i64>, ModuleError> {
+    let mut inline = HashSet::new();
+    let mut copied = HashSet::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = match after.as_deref() {
+            Some(after) => {
+                ctx.store()
+                    .list_after("ticket:", after, FORM_ORPHAN_PAGE_SIZE)
+                    .await
+            }
+            None => ctx.store().list("ticket:", FORM_ORPHAN_PAGE_SIZE).await,
+        }
+        .map_err(|error| super::stored(&error))?;
+        for (_, entry) in &page {
+            let Ok(ticket) = serde_json::from_value::<Ticket>(entry.value.clone()) else {
+                continue;
+            };
+            if ticket.form_answer_count == 0 {
+                inline.insert(ticket.number);
+            } else {
+                copied.insert(ticket.number);
+            }
+        }
+        if page.len() < FORM_ORPHAN_PAGE_SIZE {
+            break;
+        }
+        after = page.last().map(|(key, _)| key.clone());
+    }
+    inline.retain(|number| !copied.contains(number));
+    Ok(inline)
+}
+
+fn form_key_number(key: &str) -> Option<i64> {
+    key.strip_prefix(FORM_ORPHAN_PREFIX)?
+        .split_once(':')?
+        .0
+        .parse()
+        .ok()
 }
 
 fn map_label_error(error: ModuleError) -> DashboardActionError {

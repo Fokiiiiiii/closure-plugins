@@ -7251,3 +7251,261 @@ async fn deleting_a_team_denies_its_old_ticket_access() {
         "{denied:?}"
     );
 }
+
+fn settings_invocation(name: &str) -> Invocation {
+    Invocation::new("ticket")
+        .subcommand(&format!("settings {name}"))
+        .roles([STAFF_ROLE])
+        .user(MODERATOR)
+}
+
+fn automation_config() -> serde_json::Value {
+    json!({
+        "staff_roles": [STAFF_ROLE.to_string()],
+        "log_channel": LOG.to_string(),
+        "max_open": 1,
+        "first_response_timeout_hours": 0,
+        "last_message_timeout_hours": 0,
+        "waiting_after_hours": 24,
+        "waiting_category": LOG.to_string(),
+        "close_after_days": 0
+    })
+}
+
+#[tokio::test]
+async fn marking_a_ticket_waiting_schedules_its_waiting_timer() {
+    let harness = harness();
+    harness.set_config(automation_config());
+    seed_ticket(&harness, HERE, MEMBER).await;
+    assert_eq!(harness.jobs(), 0);
+
+    let replies = harness
+        .invoke(settings_invocation("waiting").option("waiting", CommandOptionValue::Boolean(true)))
+        .await
+        .unwrap();
+
+    let ticket: Ticket = harness
+        .store()
+        .get(&format!("ticket:{HERE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ticket.waiting_for_reply, "{replies:?}");
+    assert_eq!(
+        harness.jobs(),
+        1,
+        "marking the ticket waiting must schedule its waiting timer"
+    );
+}
+
+#[tokio::test]
+async fn changing_the_panel_of_a_waiting_ticket_schedules_its_waiting_timer() {
+    let harness = harness();
+    harness.set_config(automation_config());
+    harness.api().set_roles(
+        Id::new(1),
+        vec![guild_role(STAFF_ROLE, Permissions::empty())],
+    );
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.waiting_for_reply = true;
+    harness.store().set(&key, &ticket).await.unwrap();
+    assert_eq!(harness.jobs(), 0);
+
+    let replies = harness
+        .invoke(settings_invocation("set-panel"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.jobs(),
+        2,
+        "a panel change must reschedule the waiting timer: {replies:?}, jobs={}",
+        harness.jobs()
+    );
+}
+
+#[tokio::test]
+async fn welcome_with_five_long_answers_splits_embeds_and_always_sends_the_controls() {
+    let harness = harness();
+    harness.api().fail_nth(
+        2,
+        closure_core::error::DiscordError::Transient("connection lost".into()),
+    );
+    harness.click(press("open", MEMBER)).await.unwrap();
+    let mut reservation = open_reservations(&harness, MEMBER).await.remove(0);
+    reservation.form_answers = (1..=5)
+        .map(|index| (format!("Question {index}"), "a".repeat(4000)))
+        .collect();
+    harness
+        .store()
+        .set(
+            &crate::open_reservation_key(MEMBER, reservation.number),
+            &reservation,
+        )
+        .await
+        .unwrap();
+    let channel_id: ChannelId = Id::new(1_234_567_890_123_456_789_u64);
+    let channel: twilight_model::channel::Channel = serde_json::from_value(json!({
+        "id": channel_id.get().to_string(),
+        "type": 0,
+        "guild_id": "1",
+        "name": format!("ticket-{:04}", reservation.number),
+        "topic": format!("<@{MEMBER}> ticket-reservation:{}", reservation.token),
+        "permission_overwrites": []
+    }))
+    .unwrap();
+    harness.api().set_channels(Id::new(1), vec![channel]);
+
+    harness.advance(Duration::from_secs(crate::OPEN_LEASE_SECONDS as u64));
+    let results = harness.run_due_jobs().await;
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+
+    let posts: Vec<(
+        Option<String>,
+        Vec<twilight_model::channel::message::Embed>,
+        usize,
+    )> = harness
+        .actions()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::PostMessage {
+                channel_id: posted,
+                content,
+                embeds,
+                components,
+                ..
+            } if posted == channel_id => Some((content, embeds, components.len())),
+            _ => None,
+        })
+        .collect();
+    let controls = posts.iter().filter(|(_, _, rows)| *rows > 0).count();
+    assert_eq!(
+        controls, 1,
+        "the controls must be sent in their own message: {posts:?}"
+    );
+    let answer_messages: Vec<_> = posts
+        .iter()
+        .filter(|(_, embeds, _)| !embeds.is_empty())
+        .collect();
+    assert!(
+        answer_messages.len() >= 2,
+        "long answers must span several messages"
+    );
+    for (_, embeds, _) in &answer_messages {
+        let chars: usize = embeds.iter().map(crate::embed_chars).sum();
+        assert!(
+            chars <= crate::MESSAGE_EMBED_CHAR_LIMIT,
+            "message has {chars} characters"
+        );
+    }
+}
+
+#[tokio::test]
+async fn clearing_waiting_schedules_one_category_restore_timer() {
+    let harness = harness();
+    harness.set_config(automation_config());
+    seed_ticket(&harness, HERE, MEMBER).await;
+    let key = format!("ticket:{HERE}");
+    let mut ticket: Ticket = harness.store().get(&key).await.unwrap().unwrap();
+    ticket.waiting_for_reply = true;
+    harness.store().set(&key, &ticket).await.unwrap();
+
+    harness
+        .invoke(
+            settings_invocation("waiting").option("waiting", CommandOptionValue::Boolean(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.jobs(),
+        1,
+        "clearing waiting must schedule the category restore"
+    );
+
+    harness
+        .invoke(
+            settings_invocation("waiting").option("waiting", CommandOptionValue::Boolean(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.jobs(),
+        1,
+        "repeating the restore must not duplicate its timer"
+    );
+}
+
+#[tokio::test]
+async fn closing_an_inline_ticket_removes_form_copies_left_by_earlier_versions() {
+    let harness = harness();
+    harness.click(press("open", MEMBER)).await.unwrap();
+    let tickets = harness.store().list("ticket:", 10).await.unwrap();
+    let channel_id = tickets[0]
+        .0
+        .strip_prefix("ticket:")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let ticket: Ticket = harness.store().get(&tickets[0].0).await.unwrap().unwrap();
+    assert_eq!(ticket.form_answer_count, 0);
+    for index in 0..2 {
+        harness
+            .store()
+            .set(
+                &format!("ticket-form:{}:{index}", ticket.number),
+                &("Question".to_owned(), "Answer".to_owned()),
+            )
+            .await
+            .unwrap();
+    }
+    harness
+        .invoke(
+            Invocation::new("ticket")
+                .subcommand("close")
+                .user(MEMBER)
+                .channel(channel_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted(&harness), [channel_id]);
+    let copies = harness.store().list("ticket-form:", 10).await.unwrap();
+    assert!(copies.is_empty(), "{copies:?}");
+}
+
+#[tokio::test]
+async fn the_form_copy_sweep_removes_only_copies_of_inline_tickets() {
+    let harness = harness();
+    seed_ticket(&harness, HERE, MEMBER).await;
+    seed_ticket(&harness, 10, OTHER).await;
+    let mut copied: Ticket = harness.store().get("ticket:10").await.unwrap().unwrap();
+    copied.number = 4;
+    copied.form_answer_count = 1;
+    harness.store().set("ticket:10", &copied).await.unwrap();
+    for key in ["ticket-form:3:0", "ticket-form:3:1", "ticket-form:4:0"] {
+        harness
+            .store()
+            .set(key, &("Question".to_owned(), "Answer".to_owned()))
+            .await
+            .unwrap();
+    }
+
+    harness
+        .invoke(label_invocation("add", Some("vip"), MODERATOR, &[MODERATOR]).channel(HERE))
+        .await
+        .unwrap();
+    harness.advance(Duration::from_secs(2));
+    let jobs = harness.run_due_jobs().await;
+    assert!(jobs.iter().all(Result::is_ok), "{jobs:?}");
+
+    let left: Vec<String> = harness
+        .store()
+        .list("ticket-form:", 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(left, ["ticket-form:4:0"]);
+}

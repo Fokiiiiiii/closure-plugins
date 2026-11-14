@@ -23,6 +23,10 @@ pub(crate) const MAX_FORM_QUESTIONS: usize = 5;
 pub(crate) const MAX_FORM_QUESTION_CHARS: usize = 45;
 pub(crate) const MAX_FORM_ANSWER_CHARS: u16 = 4000;
 const MAX_EMBED_FIELD_CHARS: usize = 1024;
+const MAX_EMBED_FIELD_NAME_CHARS: usize = 256;
+const MAX_EMBED_FIELDS: usize = 25;
+const MAX_EMBED_TOTAL_CHARS: usize = 6000;
+const MAX_MESSAGE_EMBEDS: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(untagged)]
@@ -325,7 +329,8 @@ async fn resolve_form_questions_with_timeout(
         return Err(UserError::message("tickets-form-invalid"));
     }
     let mut resolved = questions.to_vec();
-    for question in &mut resolved {
+    let mut pending = Vec::new();
+    for (index, question) in resolved.iter().enumerate() {
         if let FormQuestion::Structured(FormQuestionKind::StringSelect {
             options,
             dynamic_options: Some(source),
@@ -335,32 +340,27 @@ async fn resolve_form_questions_with_timeout(
             if !options.is_empty() {
                 return Err(UserError::message("tickets-form-invalid"));
             }
-            let fetched = if fresh {
-                integrations::fetch_options_fresh_with_timeout(
-                    ctx,
-                    integrations,
-                    guild_id,
-                    source,
-                    timeout,
-                )
-                .await
-            } else {
-                integrations::fetch_options_with_timeout(
-                    ctx,
-                    integrations,
-                    guild_id,
-                    source,
-                    timeout,
-                )
-                .await
-            };
-            let fetched = fetched.map_err(|error| match error {
-                integrations::OptionsError::TooManyOptions => {
-                    UserError::message("tickets-form-options-too-many")
-                }
-                _ => UserError::message("tickets-form-options-unavailable"),
-            })?;
-            *options = checked_fetched_options(fetched)?;
+            pending.push((index, source.clone()));
+        }
+    }
+    // One deadline for all questions: the wait is the slowest fetch, not the sum of them.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let requests: Vec<_> = pending
+        .iter()
+        .map(|(_, source)| {
+            fetch_dynamic_options(ctx, integrations, guild_id, source, timeout, fresh)
+        })
+        .collect();
+    let fetched = join_before_deadline(requests, deadline).await;
+    for ((index, _), result) in pending.into_iter().zip(fetched) {
+        let options = match result {
+            Some(result) => result?,
+            None => return Err(UserError::message("tickets-form-options-unavailable")),
+        };
+        if let FormQuestion::Structured(FormQuestionKind::StringSelect { options: slot, .. }) =
+            &mut resolved[index]
+        {
+            *slot = options;
         }
     }
     if !valid_questions(&resolved) {
@@ -375,6 +375,67 @@ fn checked_fetched_options(options: Vec<FormOption>) -> Result<Vec<FormOption>, 
         return Err(UserError::message("tickets-form-options-unavailable"));
     }
     Ok(options)
+}
+
+async fn fetch_dynamic_options(
+    ctx: &EventContext,
+    integrations: &[Integration],
+    guild_id: u64,
+    source: &DynamicOptions,
+    timeout: Duration,
+    fresh: bool,
+) -> Result<Vec<FormOption>, UserError> {
+    let fetched = if fresh {
+        integrations::fetch_options_fresh_with_timeout(ctx, integrations, guild_id, source, timeout)
+            .await
+    } else {
+        integrations::fetch_options_with_timeout(ctx, integrations, guild_id, source, timeout).await
+    };
+    let options = fetched.map_err(|error| match error {
+        integrations::OptionsError::TooManyOptions => {
+            UserError::message("tickets-form-options-too-many")
+        }
+        _ => UserError::message("tickets-form-options-unavailable"),
+    })?;
+    checked_fetched_options(options)
+}
+
+// Each fetch is cut off at the shared deadline; a cut-off fetch yields None.
+async fn join_before_deadline<F: std::future::Future>(
+    futures: Vec<F>,
+    deadline: tokio::time::Instant,
+) -> Vec<Option<F::Output>> {
+    join_all(
+        futures
+            .into_iter()
+            .map(|future| async move { tokio::time::timeout_at(deadline, future).await.ok() })
+            .collect::<Vec<_>>(),
+    )
+    .await
+}
+
+// Polls every future on this task, so the wait is the slowest one rather than their sum.
+async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut any_pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => *output = Some(value),
+                    std::task::Poll::Pending => any_pending = true,
+                }
+            }
+        }
+        if any_pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }
 
 pub(crate) fn form_modal_revision(base_revision: u64, questions: &[FormQuestion]) -> u64 {
@@ -1286,78 +1347,110 @@ pub(crate) fn form_answers_embeds<I: InteractionRef + 'static>(
     cx: &Cx<I>,
     answers: &[(String, String)],
 ) -> Result<Vec<Embed>, UserError> {
-    let mut fields = Vec::new();
-    for (question, answer) in answers {
-        if answer.chars().count() > usize::from(MAX_FORM_ANSWER_CHARS) || answer.contains('\0') {
-            return Err(UserError::message("tickets-form-invalid"));
-        }
-        let parts = split_form_answer(answer);
-        let count = parts.len();
-        fields.extend(parts.into_iter().enumerate().map(|(index, part)| {
-            let name = if count == 1 {
-                question.clone()
-            } else {
-                format!("{question} ({}/{count})", index + 1)
-            };
-            (name, part)
-        }));
-    }
-    fields
-        .chunks(5)
-        .map(|fields| {
-            fields
-                .iter()
-                .fold(
-                    EmbedBuilder::new().title(cx.t("tickets-form-answers-title", &Args::new())),
-                    |embed, (question, answer)| {
-                        embed.field(question.clone(), answer.clone(), false)
-                    },
-                )
-                .build()
-                .map_err(|_| UserError::message("tickets-form-invalid"))
-        })
-        .collect()
+    let title = cx.t("tickets-form-answers-title", &Args::new());
+    answer_embeds(&title, answers).ok_or_else(|| UserError::message("tickets-form-invalid"))
 }
 
 pub(crate) fn form_answers_embeds_in(
     ctx: &EventContext,
     answers: &[(String, String)],
 ) -> Result<Vec<Embed>, ModuleError> {
+    let title = ctx.t_in(ctx.locale, "tickets-form-answers-title", &Args::new());
+    answer_embeds(&title, answers).ok_or_else(|| ModuleError::other("invalid ticket form answer"))
+}
+
+// Fields are packed into embeds first, then twilight validates each embed as built.
+fn answer_embeds(title: &str, answers: &[(String, String)]) -> Option<Vec<Embed>> {
+    let fields = answer_fields(answers)?;
+    pack_within(
+        fields,
+        title.chars().count(),
+        MAX_EMBED_FIELDS,
+        MAX_EMBED_TOTAL_CHARS,
+        field_chars,
+    )
+    .into_iter()
+    .map(|group| {
+        group
+            .into_iter()
+            .fold(EmbedBuilder::new().title(title), |embed, (name, value)| {
+                embed.field(name, value, false)
+            })
+            .build()
+            .ok()
+    })
+    .collect()
+}
+
+fn answer_fields(answers: &[(String, String)]) -> Option<Vec<(String, String)>> {
     let mut fields = Vec::new();
     for (question, answer) in answers {
         if answer.chars().count() > usize::from(MAX_FORM_ANSWER_CHARS) || answer.contains('\0') {
-            return Err(ModuleError::other("invalid ticket form answer"));
+            return None;
         }
         let parts = split_form_answer(answer);
         let count = parts.len();
-        fields.extend(parts.into_iter().enumerate().map(|(index, part)| {
+        for (index, part) in parts.into_iter().enumerate() {
             let name = if count == 1 {
                 question.clone()
             } else {
                 format!("{question} ({}/{count})", index + 1)
             };
-            (name, part)
-        }));
+            if name.chars().count() > MAX_EMBED_FIELD_NAME_CHARS {
+                return None;
+            }
+            fields.push((name, part));
+        }
     }
-    fields
-        .chunks(5)
-        .map(|fields| {
-            fields
-                .iter()
-                .fold(
-                    EmbedBuilder::new().title(ctx.t_in(
-                        ctx.locale,
-                        "tickets-form-answers-title",
-                        &Args::new(),
-                    )),
-                    |embed, (question, answer)| {
-                        embed.field(question.clone(), answer.clone(), false)
-                    },
-                )
-                .build()
-                .map_err(|error| ModuleError::other(error.to_string()))
+    Some(fields)
+}
+
+fn field_chars(field: &(String, String)) -> usize {
+    field.0.chars().count() + field.1.chars().count()
+}
+
+// Discord counts title, description, field names and values toward the 6000-character embed limit.
+fn embed_text_chars(embed: &Embed) -> usize {
+    let title = embed
+        .title
+        .as_deref()
+        .map_or(0, |text| text.chars().count());
+    let description = embed
+        .description
+        .as_deref()
+        .map_or(0, |text| text.chars().count());
+    embed
+        .fields
+        .iter()
+        .fold(title + description, |total, field| {
+            total + field.name.chars().count() + field.value.chars().count()
         })
-        .collect()
+}
+
+// Greedy packing: a group is closed when adding an item would exceed the item or character limit.
+fn pack_within<T>(
+    items: Vec<T>,
+    base_chars: usize,
+    max_items: usize,
+    max_chars: usize,
+    chars_of: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let mut groups: Vec<Vec<T>> = Vec::new();
+    let mut chars = 0;
+    for item in items {
+        let item_chars = chars_of(&item);
+        let fits = groups.last().is_some_and(|group| group.len() < max_items)
+            && chars + item_chars <= max_chars;
+        if !fits {
+            groups.push(Vec::new());
+            chars = base_chars;
+        }
+        chars += item_chars;
+        if let Some(group) = groups.last_mut() {
+            group.push(item);
+        }
+    }
+    groups
 }
 
 pub(crate) async fn send_form_answers(
@@ -1365,12 +1458,18 @@ pub(crate) async fn send_form_answers(
     channel: ChannelId,
     embeds: &[Embed],
 ) -> Result<(), UserError> {
-    for embed in embeds {
+    for message_embeds in pack_within(
+        embeds.to_vec(),
+        0,
+        MAX_MESSAGE_EMBEDS,
+        MAX_EMBED_TOTAL_CHARS,
+        embed_text_chars,
+    ) {
         ctx.api
             .execute(Action::SendMessage {
                 channel_id: channel,
                 content: None,
-                embeds: vec![embed.clone()],
+                embeds: message_embeds,
                 reply_to: None,
                 mentions: MentionPolicy::None,
             })
@@ -1446,5 +1545,88 @@ mod dynamic_option_tests {
             max_values: None,
         });
         assert!(!valid_questions(&[question]));
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetches_wait_for_the_slowest_not_the_sum() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        let requests: Vec<_> = (0..3_u8)
+            .map(|n| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                n
+            })
+            .collect();
+        let results = join_before_deadline(requests, deadline).await;
+        assert_eq!(results, vec![Some(0), Some(1), Some(2)]);
+        assert!(start.elapsed() < Duration::from_millis(450));
+    }
+
+    #[tokio::test]
+    async fn fetch_past_the_shared_deadline_is_cut_off() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let requests = vec![async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            1_u8
+        }];
+        let results = join_before_deadline(requests, deadline).await;
+        assert_eq!(results, vec![None]);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+}
+#[cfg(test)]
+mod answer_packing_tests {
+    use super::*;
+
+    fn long_answers() -> Vec<(String, String)> {
+        (1..=MAX_FORM_QUESTIONS)
+            .map(|n| {
+                (
+                    format!("Question {n}"),
+                    "a".repeat(usize::from(MAX_FORM_ANSWER_CHARS)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn five_long_answers_fit_every_message_limit_without_losing_text() {
+        let Some(embeds) = answer_embeds("Answers", &long_answers()) else {
+            panic!("long answers must build into embeds");
+        };
+        assert!(
+            embeds
+                .iter()
+                .all(|embed| embed.fields.len() <= MAX_EMBED_FIELDS)
+        );
+        let messages = pack_within(
+            embeds,
+            0,
+            MAX_MESSAGE_EMBEDS,
+            MAX_EMBED_TOTAL_CHARS,
+            embed_text_chars,
+        );
+        assert!(messages.iter().all(|message| {
+            message.len() <= MAX_MESSAGE_EMBEDS
+                && message.iter().map(embed_text_chars).sum::<usize>() <= MAX_EMBED_TOTAL_CHARS
+        }));
+        let answer_chars: usize = messages
+            .iter()
+            .flatten()
+            .flat_map(|embed| embed.fields.iter())
+            .map(|field| field.value.chars().count())
+            .sum();
+        assert_eq!(
+            answer_chars,
+            MAX_FORM_QUESTIONS * usize::from(MAX_FORM_ANSWER_CHARS)
+        );
+    }
+
+    #[test]
+    fn pack_within_closes_a_group_at_the_item_limit() {
+        let groups = pack_within(vec![1_usize, 1, 1], 0, 2, 100, |item| *item);
+        let sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![2, 1]);
     }
 }

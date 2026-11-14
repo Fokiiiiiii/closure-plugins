@@ -567,9 +567,7 @@ tickets-knowledge-page-not-found = That result page does not exist.
 tickets-knowledge-invalid-id = Article IDs must use 1–32 lowercase letters, numbers, or hyphens.
 tickets-knowledge-not-found = Knowledge article not found.
 tickets-knowledge-view = [{ $id }] { $title }
-
-    { $body }
-tickets-knowledge-invalid-article = Enter a valid lowercase ID, a title up to 100 characters, and content up to 1,700 characters.
+tickets-knowledge-invalid-article = Enter a valid lowercase ID, a title up to 100 characters, and content up to 4,096 characters.
 tickets-knowledge-limit = The knowledge base is full.
 tickets-knowledge-id-exists = That article ID is already in use.
 tickets-knowledge-added = Added knowledge article { $id }.
