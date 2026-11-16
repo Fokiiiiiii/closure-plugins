@@ -1592,9 +1592,7 @@ fn session_service() -> Arc<SessionService> {
 }
 
 fn session_providers(session: Option<&str>) -> Vec<Arc<dyn Provider>> {
-    vec![Arc::new(PixivProvider::new(
-        session.map(|value| ApiKey::new(value)),
-    ))]
+    vec![Arc::new(PixivProvider::new(session.map(ApiKey::new)))]
 }
 
 /// Posts `content` from a channel for adults, the only one where an adult artwork is expanded.
