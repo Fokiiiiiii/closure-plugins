@@ -1,120 +1,197 @@
-//! A post on X, as the `FxTwitter` service gives it, and the messages it becomes.
+//! X, as the `FxTwitter` service gives its posts: how their links are found, and how a post is read.
 //!
-//! A post is shown with what it answers or quotes: the post it replies to comes before it, the
-//! post it quotes after it, each as a message of its own (the caller chains them as replies). Its
-//! pictures and video are not in the embed: the caller attaches them as files.
+//! A post is shown with what it answers or quotes, see `thread`. Its pictures and video are not in the
+//! embed: the caller attaches them as files.
+
+use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result};
-use plugin_kit::{grouped, image, truncate};
+use plugin_kit::grouped;
+use regex::Regex;
 use serde::Deserialize;
-use twilight_model::channel::message::Embed;
-use twilight_model::util::Timestamp;
-use twilight_util::builder::embed::{EmbedAuthorBuilder, EmbedBuilder, EmbedFooterBuilder};
+
+use crate::Config;
+use crate::links::{self, PostLink};
+use crate::model::{Author, Post};
+use crate::provider::{Provider, is_at_hosts};
 
 const X_COLOR: u32 = 0x1D_9BF0;
 /// X's limit on the pictures of one post.
 const MAX_PHOTOS: usize = 20;
+const MEDIA_HOSTS: &[&str] = &["twimg.com"];
+
+#[allow(clippy::expect_used, reason = "a fixed pattern, compiled by the tests")]
+static POST_LINK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?P<open><)?https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/(?P<user>[A-Za-z0-9_]{1,15})/status/(?P<id>\d{1,20})(?P<close>>)?",
+    )
+    .expect("a fixed pattern")
+});
+
+/// X: the links to its posts, and its service.
+#[derive(Debug, Clone, Copy)]
+pub struct XProvider;
+
+impl Provider for XProvider {
+    fn enabled(&self, config: &Config) -> bool {
+        config.x_links
+    }
+
+    fn detect(&self, text: &str) -> Vec<PostLink> {
+        post_links(text)
+    }
+
+    fn api_url(&self, id: u64) -> String {
+        format!("https://api.fxtwitter.com/status/{id}")
+    }
+
+    fn parse(&self, bytes: &[u8]) -> Result<Post> {
+        parse_tweet(bytes)
+    }
+
+    fn media_hosts(&self) -> &'static [&'static str] {
+        MEDIA_HOSTS
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct FxResponse {
     tweet: Option<Tweet>,
 }
 
-/// A post on X.
+/// A post on X, as the service answers it.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Tweet {
-    pub url: String,
+struct Tweet {
+    url: String,
     #[serde(default)]
-    pub text: String,
-    pub author: TweetAuthor,
+    text: String,
+    author: TweetAuthor,
     #[serde(default)]
-    pub media: Media,
+    media: Media,
     /// The counts, when the service gave them: a quoted post inside another may come without.
     #[serde(default)]
-    pub likes: Option<u64>,
+    likes: Option<u64>,
     #[serde(default)]
-    pub retweets: Option<u64>,
+    retweets: Option<u64>,
     #[serde(default)]
-    pub replies: Option<u64>,
-    pub created_timestamp: Option<i64>,
+    replies: Option<u64>,
+    created_timestamp: Option<i64>,
     #[serde(default)]
-    pub quote: Option<Box<Tweet>>,
+    quote: Option<Box<Tweet>>,
     #[serde(default)]
-    pub replying_to_status: Option<String>,
+    replying_to_status: Option<String>,
     /// Who reposted it, when the link is to a repost.
     #[serde(default)]
-    pub reposted_by: Option<TweetAuthor>,
+    reposted_by: Option<TweetAuthor>,
+    /// Whether the service marks the post for adults.
+    #[serde(default)]
+    possibly_sensitive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TweetAuthor {
-    pub name: String,
-    pub screen_name: String,
-    pub avatar_url: Option<String>,
+struct TweetAuthor {
+    name: String,
+    screen_name: String,
+    avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct Media {
+struct Media {
     #[serde(default)]
-    pub photos: Vec<Picture>,
+    photos: Vec<Picture>,
     #[serde(default)]
-    pub videos: Vec<Picture>,
+    videos: Vec<Picture>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Picture {
-    pub url: String,
+struct Picture {
+    url: String,
 }
 
 /// # Errors
 /// The answer is not JSON, or has no post in it (the post is gone, or is private).
-pub fn parse_tweet(bytes: &[u8]) -> Result<Tweet> {
+pub fn parse_tweet(bytes: &[u8]) -> Result<Post> {
     let response: FxResponse = serde_json::from_slice(bytes).context("reading the post")?;
-    response.tweet.context("the answer has no post")
+    let tweet = response.tweet.context("the answer has no post")?;
+    Ok(tweet.into_post())
+}
+
+/// The id in a link to a post, which is not 0 when there is one.
+fn status_id(url: &str) -> Option<u64> {
+    url.split('?')
+        .next()?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+        .filter(|id| *id > 0)
 }
 
 impl Tweet {
-    #[must_use]
-    pub fn quote_id(&self) -> Option<u64> {
-        let url = &self.quote.as_ref()?.url;
-        url.split('?')
-            .next()?
-            .rsplit('/')
-            .next()?
-            .parse()
-            .ok()
-            .filter(|id| *id > 0)
-    }
-
-    /// The id of the post this one replies to, when it is one.
-    #[must_use]
-    pub fn parent_id(&self) -> Option<u64> {
-        self.replying_to_status
-            .as_deref()
-            .and_then(|id| id.parse().ok())
-            .filter(|id| *id > 0)
+    fn into_post(self) -> Post {
+        let id = status_id(&self.url).unwrap_or_default();
+        let images = self
+            .media
+            .photos
+            .iter()
+            .map(|photo| photo.url.clone())
+            .filter(|url| is_media(url))
+            .take(MAX_PHOTOS)
+            .collect();
+        let video = self
+            .media
+            .videos
+            .first()
+            .map(|video| video.url.clone())
+            .filter(|url| is_media(url));
+        let counts = counts(&self);
+        Post {
+            id,
+            url: self.url,
+            author: author(&self.author),
+            text: self.text,
+            images,
+            video,
+            counts,
+            created: self.created_timestamp,
+            sensitive: self.possibly_sensitive == Some(true),
+            color: X_COLOR,
+            reply_to: self
+                .replying_to_status
+                .as_deref()
+                .and_then(|id| id.parse().ok())
+                .filter(|id| *id > 0),
+            quote: self
+                .quote
+                .map(|quote| (*quote).into_post())
+                .filter(|quote| quote.id > 0)
+                .map(Box::new),
+            reposted_by: self.reposted_by.as_ref().map(author),
+            media_referer: None,
+        }
     }
 }
 
-/// The words around the embeds, in the language of the server.
-#[derive(Debug, Clone)]
-pub struct Labels {
-    pub replied_to: String,
-    pub quoted: String,
-    pub reposted_by: String,
+fn author(author: &TweetAuthor) -> Author {
+    Author {
+        name: author.name.clone(),
+        handle: author.screen_name.clone(),
+        avatar: author.avatar_url.clone(),
+        profile: format!("https://x.com/{}", author.screen_name),
+    }
 }
 
-/// A post as one message: its embed, its pictures and video to attach, and its own link.
-#[derive(Debug)]
-pub struct Piece {
-    pub embed: Embed,
-    /// The pictures, at most four.
-    pub photos: Vec<String>,
-    /// The video, or the animation.
-    pub video: Option<String>,
-    pub link: String,
-    /// Whether this is the post that was linked, and not the one it answers or quotes.
-    pub main: bool,
+/// The counts under a post, such as `💬 32`, `🔁 1,628` and `❤ 12,468`; the ones the service did not
+/// give are left out.
+fn counts(tweet: &Tweet) -> Vec<String> {
+    [
+        ("💬", tweet.replies),
+        ("🔁", tweet.retweets),
+        ("❤", tweet.likes),
+    ]
+    .into_iter()
+    .filter_map(|(mark, count)| Some(format!("{mark} {}", grouped(count?))))
+    .collect()
 }
 
 /// Whether `url` is a file at the media servers of X. The service names the files of a post, and
@@ -122,175 +199,25 @@ pub struct Piece {
 /// taken: not another host, not an address with a user name in it, not a plain `http` one.
 #[must_use]
 pub fn is_media(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains(['@', '\\', ':']) {
-        return false;
-    }
-    let host = authority.to_ascii_lowercase();
-    host == "twimg.com"
-        || host
-            .strip_suffix(".twimg.com")
-            .is_some_and(|name| !name.is_empty())
+    is_at_hosts(url, MEDIA_HOSTS)
 }
 
-fn author_line(author: &TweetAuthor) -> EmbedAuthorBuilder {
-    let mut line = EmbedAuthorBuilder::new(truncate(
-        &format!("{} (@{})", author.name, author.screen_name),
-        250,
-    ))
-    .url(format!("https://x.com/{}", author.screen_name));
-    if let Some(icon) = author.avatar_url.as_deref().and_then(image) {
-        line = line.icon_url(icon);
-    }
-    line
-}
-
-/// The counts under a post, such as `💬 32  🔁 1,628  ❤ 12,468`; the ones the service did not give
-/// are left out.
-fn counts(tweet: &Tweet) -> Option<String> {
-    let parts: Vec<String> = [
-        ("💬", tweet.replies),
-        ("🔁", tweet.retweets),
-        ("❤", tweet.likes),
-    ]
-    .into_iter()
-    .filter_map(|(mark, count)| Some(format!("{mark} {}", grouped(count?))))
-    .collect();
-    (!parts.is_empty()).then(|| parts.join("  "))
-}
-
-/// The colour of the bar of a post that is shown for the sake of another: what a reader needs to
-/// tell it from the post that was linked.
-const REPLIED_COLOR: u32 = 0x8E_95_9E;
-const QUOTED_COLOR: u32 = 0xA3_6C_F5;
-const REPOST_COLOR: u32 = 0x00_BA_7C;
-
-/// One post as a message. `title` says what the post is to the one that was linked (the post it
-/// answers, the post it quotes, or a repost) and `color` is its bar.
-fn piece(tweet: &Tweet, title: Option<String>, color: u32, limit: usize, main: bool) -> Piece {
-    let mut embed = EmbedBuilder::new()
-        .color(color)
-        .author(author_line(&tweet.author))
-        .url(&tweet.url);
-    if let Some(counts) = counts(tweet) {
-        embed = embed.footer(EmbedFooterBuilder::new(counts));
-    }
-    if let Some(title) = title {
-        embed = embed.title(title);
-    }
-    if !tweet.text.trim().is_empty() {
-        embed = embed.description(truncate(&tweet.text, limit));
-    }
-    if let Some(at) = tweet
-        .created_timestamp
-        .and_then(|s| Timestamp::from_secs(s).ok())
-    {
-        embed = embed.timestamp(at);
-    }
-    Piece {
-        embed: embed.build(),
-        photos: tweet
-            .media
-            .photos
-            .iter()
-            .map(|p| p.url.clone())
-            .filter(|url| is_media(url))
-            .take(MAX_PHOTOS)
-            .collect(),
-        video: tweet
-            .media
-            .videos
-            .first()
-            .map(|v| v.url.clone())
-            .filter(|url| is_media(url)),
-        link: tweet.url.clone(),
-        main,
-    }
-}
-
-/// A post with the posts around it: every post it answers up to the first one, and the posts it
-/// quotes, one inside the other.
-#[derive(Debug, Clone)]
-pub struct Thread {
-    /// What the post answers: the first post of the conversation first, the post it answers last.
-    pub ancestors: Vec<Tweet>,
-    pub post: Tweet,
-    /// The post it quotes, the post that one quotes, and so on.
-    pub quotes: Vec<Tweet>,
-}
-
-impl Thread {
-    #[must_use]
-    pub fn new(post: Tweet) -> Self {
-        Self {
-            ancestors: Vec::new(),
-            post,
-            quotes: Vec::new(),
-        }
-    }
-
-    /// How many posts there are, the one that was linked among them.
-    #[must_use]
-    pub fn size(&self) -> usize {
-        1 + self.ancestors.len() + self.quotes.len()
-    }
-
-    /// Drops the posts farthest from the one that was linked until at most `room` are left.
-    pub fn fit(&mut self, room: usize) {
-        while self.size() > room.max(1) {
-            if self.ancestors.len() > self.quotes.len() {
-                self.ancestors.remove(0);
-            } else {
-                self.quotes.pop();
-            }
-        }
-    }
-}
-
-/// `label`, with how far the post is from the one that was linked when there are several.
-fn numbered(label: &str, distance: usize, of: usize) -> String {
-    if of > 1 {
-        format!("{label} {distance}")
-    } else {
-        label.to_owned()
-    }
-}
-
-/// The messages of a thread, in the order they are read: what the post answers, the post, and what
-/// it quotes.
+/// The links to posts on X in `text`, each once, in order, at most `MAX_PER_MESSAGE`.
 #[must_use]
-pub fn pieces(thread: &Thread, labels: &Labels, limit: usize) -> Vec<Piece> {
-    let mut all = Vec::new();
-    let answered = thread.ancestors.len();
-    for (at, parent) in thread.ancestors.iter().enumerate() {
-        let title = numbered(&labels.replied_to, answered - at, answered);
-        all.push(piece(parent, Some(title), REPLIED_COLOR, limit, false));
-    }
-    let tweet = &thread.post;
-    all.push(match &tweet.reposted_by {
-        Some(who) => piece(
-            tweet,
-            Some(format!("{} {}", labels.reposted_by, who.name)),
-            REPOST_COLOR,
-            limit,
-            true,
-        ),
-        None => piece(tweet, None, X_COLOR, limit, true),
-    });
-    let quoted = thread.quotes.len();
-    for (at, quote) in thread.quotes.iter().enumerate() {
-        let title = numbered(&labels.quoted, at + 1, quoted);
-        all.push(piece(quote, Some(title), QUOTED_COLOR, limit, false));
-    }
-    all
+pub fn post_links(text: &str) -> Vec<PostLink> {
+    links::scan(&POST_LINK, text, |captures| {
+        let id = captures["id"].parse::<u64>().ok().filter(|id| *id > 0)?;
+        Some(PostLink {
+            user: captures["user"].to_owned(),
+            id,
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread::{Labels, REPOST_COLOR, Thread, pieces};
 
     const POST: &str = r#"{"code":200,"message":"OK","tweet":{
         "url":"https://x.com/jack/status/20","text":"just setting up my twttr",
@@ -348,7 +275,7 @@ mod tests {
     #[test]
     fn the_post_it_replies_to_comes_first_and_the_post_it_quotes_last() {
         let tweet = parse_tweet(POST.as_bytes()).unwrap();
-        assert_eq!(tweet.parent_id(), Some(19));
+        assert_eq!(tweet.reply_to, Some(19));
         let parent = parse_tweet(PARENT.as_bytes()).unwrap();
         let thread = Thread {
             ancestors: vec![parent],
@@ -385,7 +312,7 @@ mod tests {
             r#""reposted_by":{"name":"kit","screen_name":"kit"},"#,
         );
         let tweet = parse_tweet(json.as_bytes()).unwrap();
-        assert_eq!(tweet.parent_id(), None);
+        assert_eq!(tweet.reply_to, None);
         let shown = pieces(&Thread::new(tweet), &labels(), 1000);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].embed.title.as_deref(), Some("Reposted by kit"));
@@ -485,5 +412,17 @@ mod tests {
     fn an_answer_without_a_post_is_an_error() {
         assert!(parse_tweet(br#"{"code":404,"message":"NOT_FOUND"}"#).is_err());
         assert!(parse_tweet(b"not json").is_err());
+    }
+
+    #[test]
+    fn a_post_marked_for_adults_is_marked_so_and_an_unmarked_one_is_not() {
+        let marked = parse_tweet(
+            br#"{"tweet":{"url":"https://x.com/a/status/1","possibly_sensitive":true,
+            "author":{"name":"a","screen_name":"a"}}}"#,
+        )
+        .unwrap();
+        assert!(marked.sensitive);
+        let unmarked = parse_tweet(POST.as_bytes()).unwrap();
+        assert!(!unmarked.sensitive);
     }
 }

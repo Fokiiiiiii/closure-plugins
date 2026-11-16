@@ -1,6 +1,7 @@
 module-description = Answers a link to a message of the server, or to a post on X, with a preview of it.
 config-linkexpand-message_links = Quote the message that a link to a message of this server leads to.
 config-linkexpand-x_links = Show the text, the pictures and the counts of a link to a post on X.
+config-linkexpand-pixiv_links = Show the title, the text, the pictures and the counts of a link to an artwork on Pixiv.
 config-linkexpand-replied_post = Show the post that a post on X replies to, before it.
 config-linkexpand-quoted_post = Show the post that a post on X quotes, after it.
 config-linkexpand-translate_button = A button that translates a post on X.

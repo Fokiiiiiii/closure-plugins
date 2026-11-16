@@ -99,16 +99,22 @@ pub fn chunks_of(text: &str) -> Vec<String> {
     out
 }
 
-/// Translates `text` into `to`, in pieces when long; a text beyond the allowed pieces ends with an ellipsis.
-/// # Errors
-/// The service is out of reach, or its answer cannot be read.
-pub async fn translate(get: &dyn Get, text: &str, to: &str) -> Result<Translation> {
+/// The pieces `text` is sent in, and whether `text` was cut short.
+pub(crate) fn pieces(text: &str) -> (Vec<String>, bool) {
     let mut chunks = chunks_of(text);
     // An empty last piece says that there was more.
     let cut = chunks.last().is_some_and(String::is_empty);
     if cut {
         chunks.pop();
     }
+    (chunks, cut)
+}
+
+/// Translates `text` into `to`, in pieces when long; a text beyond the allowed pieces ends with an ellipsis.
+/// # Errors
+/// The service is out of reach, or its answer cannot be read.
+pub async fn translate(get: &dyn Get, text: &str, to: &str) -> Result<Translation> {
+    let (chunks, cut) = pieces(text);
     let mut joined = String::new();
     let mut from = String::from("?");
     for (n, chunk) in chunks.iter().enumerate() {

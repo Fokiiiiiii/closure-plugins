@@ -9,13 +9,18 @@ use closure_sdk::{
     ContextCommand, ContextCx, CoreError, InteractionReply, Level, Locale, ModuleBuilder,
     PermissionSpec, SdkModule, UserError,
 };
-use plugin_kit::net::{Fetcher, Get};
-use plugin_kit::translate::{self, MAX_CHARS};
+use plugin_kit::net::{Fetcher, Http};
+use plugin_kit::translate::MAX_CHARS;
+use plugin_kit::translator::Translator;
 
 const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
 
-async fn translate_message(get: Arc<dyn Get>, cx: ContextCx) -> Result<(), UserError> {
+async fn translate_message(
+    http: Arc<dyn Http>,
+    translator: Arc<Translator>,
+    cx: ContextCx,
+) -> Result<(), UserError> {
     let Some(message) = cx.target_message() else {
         return Err(UserError::message("translate-nothing"));
     };
@@ -29,7 +34,8 @@ async fn translate_message(get: Arc<dyn Get>, cx: ContextCx) -> Result<(), UserE
     }
     cx.defer(true).await?;
     let to = cx.locale().tag();
-    let done = translate::translate(&*get, &text, to)
+    let done = translator
+        .translate(&*http, &text, to)
         .await
         .map_err(|_| UserError::message("translate-failed"))?;
     let cut = text.chars().count() > MAX_CHARS;
@@ -52,10 +58,13 @@ async fn translate_message(get: Arc<dyn Get>, cx: ContextCx) -> Result<(), UserE
     .await
 }
 
-/// The module, with the network it reaches the translator through.
+/// The module, with the translator it asks and the network it reaches the services through.
 /// # Errors
 /// The module declaration is refused by the SDK.
-pub fn builder_with(get: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
+pub fn builder_with(
+    translator: Arc<Translator>,
+    http: Arc<dyn Http>,
+) -> Result<ModuleBuilder, CoreError> {
     Ok(
         ModuleBuilder::new("translate", "Translate", env!("CARGO_PKG_VERSION"))?
             .capability(closure_sdk::Capability::RespondToInteractions)
@@ -67,7 +76,9 @@ pub fn builder_with(get: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
             .context(
                 ContextCommand::message("Translate")
                     .requires("translate.use")
-                    .handler(move |cx| translate_message(Arc::clone(&get), cx)),
+                    .handler(move |cx| {
+                        translate_message(Arc::clone(&http), Arc::clone(&translator), cx)
+                    }),
             )
             .catalog(Locale::En, EN)
             .catalog(Locale::Ja, JA)
@@ -75,11 +86,18 @@ pub fn builder_with(get: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
     )
 }
 
-/// The module, reaching the network as it is.
+/// The module, with the free translator.
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {
-    builder_with(Arc::new(Fetcher::new()))?.build()
+    module_with(Arc::new(Translator::free()))
+}
+
+/// The module, with the translator the operator set up.
+/// # Errors
+/// The module declaration is refused by the SDK.
+pub fn module_with(translator: Arc<Translator>) -> Result<SdkModule, CoreError> {
+    builder_with(translator, Arc::new(Fetcher::new()))?.build()
 }
 
 #[cfg(test)]

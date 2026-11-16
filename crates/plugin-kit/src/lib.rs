@@ -5,6 +5,7 @@
 pub mod net;
 pub mod safe_fetch;
 pub mod translate;
+pub mod translator;
 
 use twilight_model::channel::message::Embed;
 use twilight_model::util::Timestamp;

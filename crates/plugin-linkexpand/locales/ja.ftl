@@ -1,6 +1,7 @@
 module-description = このサーバーのメッセージへのリンクや X の投稿へのリンクに、中身のプレビューを返します。
 config-linkexpand-message_links = このサーバーのメッセージへのリンクに、そのメッセージを引用して返す。
 config-linkexpand-x_links = X の投稿へのリンクに、本文・画像・反応数を返す。
+config-linkexpand-pixiv_links = Pixiv の作品へのリンクを、題名・本文・画像・数字とともに表示する。
 config-linkexpand-replied_post = X の投稿が返信なら、返信先の投稿を前に出す。
 config-linkexpand-quoted_post = X の投稿が引用なら、引用元の投稿を後ろに出す。
 config-linkexpand-translate_button = X の投稿を翻訳するボタンを付ける。

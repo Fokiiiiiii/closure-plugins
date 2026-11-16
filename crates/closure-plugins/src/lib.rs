@@ -7,16 +7,94 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use closure_core::module::Module;
+use closure_core::operator_settings::OperatorSettings;
 
 /// # Errors
 /// A module declaration is refused by the SDK.
 pub fn modules() -> Result<Vec<Arc<dyn Module>>> {
+    modules_with(&OperatorSettings::default())
+}
+
+/// The same list, for a host that hands the operator's settings to the plugins. The translating
+/// plugins share the translator the settings ask for.
+///
+/// # Errors
+/// A module declaration is refused by the SDK.
+pub fn modules_with(settings: &OperatorSettings) -> Result<Vec<Arc<dyn Module>>> {
+    let translator = Arc::new(plugin_kit::translator::from_settings(settings));
     Ok(vec![
-        Arc::new(plugin_linkexpand::module()?),
+        Arc::new(plugin_linkexpand::module_with(Arc::clone(&translator))?),
         Arc::new(plugin_starboard::module()?),
         Arc::new(plugin_leveling::module()?),
-        Arc::new(plugin_translate::module()?),
+        Arc::new(plugin_translate::module_with(translator)?),
         Arc::new(plugin_giveaway::module()?),
         Arc::new(plugin_tickets::module()?),
+        Arc::new(plugin_feeds::module_with(feed_settings(settings))?),
     ])
+}
+
+/// The feeds section of the operator's file. A section that does not fit is logged without its
+/// values, and the defaults are used.
+fn feed_settings(settings: &OperatorSettings) -> plugin_feeds::FeedSettings {
+    settings
+        .plugin_section::<plugin_feeds::FeedSettings>("feeds")
+        .unwrap_or_else(|_| {
+            tracing::warn!("the feeds settings do not fit; using the defaults");
+            None
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use closure_core::operator_settings::OperatorSettings;
+
+    use super::*;
+
+    fn settings(label: &str, yaml: &str) -> OperatorSettings {
+        let path = std::env::temp_dir().join(format!(
+            "closure-plugins-{label}-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, yaml).unwrap();
+        let loaded = OperatorSettings::load(&path);
+        std::fs::remove_file(&path).unwrap();
+        loaded.unwrap()
+    }
+
+    #[test]
+    fn no_feeds_section_means_the_default_interval() {
+        assert_eq!(
+            feed_settings(&settings("nofeeds", "")),
+            plugin_feeds::FeedSettings::default()
+        );
+    }
+
+    #[test]
+    fn the_feeds_interval_is_read_from_the_yaml_file() {
+        let yaml = "plugins:\n  feeds:\n    interval_secs: 120\n";
+        assert_eq!(
+            feed_settings(&settings("interval", yaml)).interval_secs,
+            120
+        );
+    }
+
+    #[test]
+    fn a_feeds_section_that_does_not_fit_falls_back_to_the_defaults() {
+        for yaml in [
+            "plugins:\n  feeds:\n    interval_secs: soon\n",
+            "plugins:\n  feeds:\n    intervl_secs: 120\n",
+        ] {
+            assert_eq!(
+                feed_settings(&settings("misfit", yaml)),
+                plugin_feeds::FeedSettings::default()
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_includes_the_feeds_module() {
+        assert_eq!(modules().unwrap().len(), 7);
+    }
 }

@@ -17,6 +17,9 @@ plugin-leveling.workspace = true
 plugin-translate.workspace = true
 plugin-giveaway.workspace = true
 plugin-tickets.workspace = true
+plugin-feeds.workspace = true
+plugin-kit.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

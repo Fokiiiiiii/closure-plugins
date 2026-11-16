@@ -6,14 +6,25 @@ use closure_core::action::Action;
 use closure_core::error::DiscordError;
 use closure_core::event::{GuildId, UserId};
 use closure_sdk::testing::{Click, Harness, Message};
-use plugin_kit::net::Get;
+use plugin_kit::net::{Get, Http, HttpStatus};
+use plugin_kit::translator::{ApiKey, Translator};
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use twilight_model::channel::Channel;
 use twilight_model::channel::message::Component;
 use twilight_model::guild::Role;
 use twilight_model::id::Id;
 
+use crate::Config;
 use crate::builder_with;
+use crate::builder_with_sites;
+use crate::links::{MAX_PER_MESSAGE, PostLink};
+use crate::model::Post;
+use crate::pixiv::fixtures::{
+    ERROR_103, INFO_101, INFO_102, INFO_104, PAGES_101, PAGES_102, PAGES_104,
+};
+use crate::provider::Provider;
+use serde::Deserialize;
 
 const GUILD: u64 = 1;
 const VIEW: u64 = (1 << 10) | (1 << 16);
@@ -44,6 +55,18 @@ impl Get for Fake {
 
 fn down(_: &str) -> Option<&'static str> {
     None
+}
+
+#[async_trait]
+impl plugin_kit::net::Post for Fake {
+    async fn post_json(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+        _body: &serde_json::Value,
+    ) -> Result<Vec<u8>> {
+        bail!("the test service has no Gemini")
+    }
 }
 
 #[allow(
@@ -143,8 +166,16 @@ fn everyone() -> Role {
     .unwrap()
 }
 
-fn harness(service: impl Get + 'static) -> Harness {
-    let harness = Harness::new(builder_with(Arc::new(service)).unwrap()).unwrap();
+fn harness(service: impl Http + 'static) -> Harness {
+    harness_with(Arc::new(service), Translator::free())
+}
+
+fn gemini_translator() -> Translator {
+    Translator::gemini(ApiKey::new("test-key"), "gemini-test".to_owned())
+}
+
+fn harness_with(service: Arc<dyn Http>, translator: Translator) -> Harness {
+    let harness = Harness::new(builder_with(service, Arc::new(translator)).unwrap()).unwrap();
     let guild: GuildId = Id::new(GUILD);
     harness.api().set_channels(
         guild,
@@ -173,6 +204,7 @@ struct Posted {
     files: Vec<String>,
     components: Vec<Component>,
     silent: bool,
+    field_values: Vec<String>,
 }
 
 fn posted(harness: &Harness) -> Vec<Posted> {
@@ -202,6 +234,10 @@ fn posted(harness: &Harness) -> Vec<Posted> {
                 files: files.into_iter().map(|f| f.filename).collect(),
                 components,
                 silent,
+                field_values: embeds
+                    .iter()
+                    .flat_map(|e| e.fields.iter().map(|f| f.value.clone()))
+                    .collect(),
             }),
             _ => None,
         })
@@ -795,8 +831,8 @@ fn a_chain_that_is_too_long_keeps_what_was_linked_and_its_neighbours() {
         },
         photos: Vec::new(),
         video: None,
-        link: None,
         main,
+        referer: None,
     };
     let units = vec![
         unit(false),
@@ -811,6 +847,152 @@ fn a_chain_that_is_too_long_keeps_what_was_linked_and_its_neighbours() {
         kept.iter().any(|unit| unit.main),
         "what was linked is never the one that goes"
     );
+}
+
+const SENSITIVE: &str = r#"{"code":200,"tweet":{
+    "url":"https://x.com/jack/status/20","text":"a sensitive post",
+    "author":{"name":"jack","screen_name":"jack"},"possibly_sensitive":true}}"#;
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "an answerer, as the type of `Fake` says"
+)]
+fn sensitive(_: &str) -> Option<&'static str> {
+    Some(SENSITIVE)
+}
+
+#[tokio::test]
+async fn a_post_marked_sensitive_is_not_expanded_outside_an_adult_channel() {
+    let harness = harness(Fake(sensitive));
+    say(&harness, "https://x.com/jack/status/20").await;
+    assert!(posted(&harness).is_empty());
+    assert!(
+        !hid_the_original(&harness),
+        "the link stays as it was written"
+    );
+}
+
+#[tokio::test]
+async fn a_post_marked_sensitive_is_expanded_in_an_adult_channel() {
+    let harness = harness(Fake(sensitive));
+    let adult: Channel = serde_json::from_value(json!({
+        "id": "10", "type": 0, "guild_id": GUILD.to_string(), "name": "adults",
+        "nsfw": true, "permission_overwrites": [],
+    }))
+    .unwrap();
+    harness
+        .api()
+        .set_channels(Id::new(GUILD), vec![channel(7, &json!([])), adult]);
+    harness
+        .message(Message::new(50, 10).content("https://x.com/jack/status/20"))
+        .await
+        .unwrap();
+    let all = posted(&harness);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].embeds, 1);
+}
+
+/// A site that is not X: it has its own link, its own service and its own pictures.
+struct Dummy;
+
+impl Provider for Dummy {
+    fn enabled(&self, _config: &Config) -> bool {
+        true
+    }
+
+    fn detect(&self, text: &str) -> Vec<PostLink> {
+        text.split_whitespace()
+            .filter_map(|word| word.strip_prefix("https://fake.example/post/"))
+            .filter_map(|id| id.parse().ok())
+            .map(|id| PostLink {
+                user: "fake".into(),
+                id,
+            })
+            .take(MAX_PER_MESSAGE)
+            .collect()
+    }
+
+    fn api_url(&self, id: u64) -> String {
+        format!("https://api.fake.example/post/{id}")
+    }
+
+    fn parse(&self, bytes: &[u8]) -> Result<Post> {
+        #[derive(Deserialize)]
+        struct Body {
+            id: u64,
+            name: String,
+            text: String,
+            image: String,
+        }
+        let body: Body = serde_json::from_slice(bytes)?;
+        Ok(Post {
+            id: body.id,
+            url: format!("https://fake.example/post/{}", body.id),
+            author: crate::model::Author {
+                name: body.name.clone(),
+                handle: body.name.clone(),
+                avatar: None,
+                profile: String::new(),
+            },
+            text: body.text,
+            images: vec![body.image],
+            video: None,
+            counts: Vec::new(),
+            created: None,
+            sensitive: false,
+            color: 0x12_3456,
+            reply_to: None,
+            quote: None,
+            reposted_by: None,
+            media_referer: None,
+        })
+    }
+
+    fn media_hosts(&self) -> &'static [&'static str] {
+        &["media.fake.example"]
+    }
+}
+
+const DUMMY_POST: &str = r#"{"id":7,"name":"Fake Author","text":"a post elsewhere",
+    "image":"https://media.fake.example/1.jpg"}"#;
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "an answerer, as the type of `Fake` says"
+)]
+fn dummy_site(url: &str) -> Option<&'static str> {
+    if url.starts_with("https://api.fake.example/post/") {
+        Some(DUMMY_POST)
+    } else if url.starts_with("https://media.fake.example/") {
+        Some("picture")
+    } else {
+        None
+    }
+}
+
+#[tokio::test]
+async fn a_post_of_another_site_is_expanded_by_the_same_sending() {
+    let harness = Harness::new(
+        builder_with_sites(
+            Arc::new(Fake(dummy_site)),
+            Arc::new(Translator::free()),
+            vec![Arc::new(Dummy)],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    harness.api().add_channel(Id::new(5), Some(Id::new(GUILD)));
+    harness
+        .message(Message::new(50, 5).content("see https://fake.example/post/7"))
+        .await
+        .unwrap();
+    let all = posted(&harness);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].embeds, 1);
+    assert_eq!(all[0].files, ["photo-1.jpg"]);
+    assert!(all[0].reply_to.is_some());
+    assert!(all[0].silent);
+    assert!(hid_the_original(&harness));
 }
 
 fn urls(count: usize) -> Vec<String> {
@@ -854,6 +1036,18 @@ impl Get for Pictures {
         } else {
             bail!("down")
         }
+    }
+}
+
+#[async_trait]
+impl plugin_kit::net::Post for Pictures {
+    async fn post_json(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+        _body: &serde_json::Value,
+    ) -> Result<Vec<u8>> {
+        bail!("the test service has no Gemini")
     }
 }
 
@@ -1068,4 +1262,250 @@ async fn a_video_goes_first_then_the_pictures_and_the_answer_last() {
     assert_eq!(all[3].embeds, 1);
     assert!(all[3].files.is_empty());
     assert!(!buttons(&all[3]).is_empty());
+}
+
+/// The free endpoint of `thread`, and a Gemini that answers as `gemini` says, counting its asks.
+struct WithGemini {
+    free: Fake,
+    gemini: fn() -> Result<Vec<u8>>,
+    asked: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Get for WithGemini {
+    async fn get(&self, url: &str) -> Result<Vec<u8>> {
+        self.free.get(url).await
+    }
+}
+
+#[async_trait]
+impl plugin_kit::net::Post for WithGemini {
+    async fn post_json(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+        _body: &serde_json::Value,
+    ) -> Result<Vec<u8>> {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        (self.gemini)()
+    }
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "an answerer, as the type of `WithGemini` says"
+)]
+fn gemini_says_words() -> Result<Vec<u8>> {
+    let structured = json!({"translation": "Gemini words", "source_language": "ja"}).to_string();
+    Ok(
+        json!({"candidates": [{"content": {"parts": [{"text": structured}]}}]})
+            .to_string()
+            .into_bytes(),
+    )
+}
+
+fn gemini_is_down() -> Result<Vec<u8>> {
+    Err(HttpStatus(503).into())
+}
+
+fn with_gemini(gemini: fn() -> Result<Vec<u8>>) -> (WithGemini, Arc<AtomicUsize>) {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let service = WithGemini {
+        free: Fake(thread),
+        gemini,
+        asked: Arc::clone(&asked),
+    };
+    (service, asked)
+}
+
+#[tokio::test]
+async fn a_post_is_translated_by_gemini_first_for_each_of_its_posts() {
+    let (service, asked) = with_gemini(gemini_says_words);
+    let harness = harness_with(Arc::new(service), gemini_translator());
+    say(&harness, "https://x.com/jack/status/20").await;
+    assert_eq!(
+        asked.load(Ordering::Relaxed),
+        3,
+        "the linked post, its reply and its quote"
+    );
+    let values: Vec<String> = posted(&harness)
+        .into_iter()
+        .flat_map(|p| p.field_values)
+        .collect();
+    assert_eq!(values, ["Gemini words", "Gemini words", "Gemini words"]);
+}
+
+#[tokio::test]
+async fn a_gemini_that_is_down_leaves_the_translation_to_the_free_endpoint() {
+    let (service, asked) = with_gemini(gemini_is_down);
+    let harness = harness_with(Arc::new(service), gemini_translator());
+    say(&harness, "https://x.com/jack/status/20").await;
+    assert_eq!(asked.load(Ordering::Relaxed), 3);
+    let values: Vec<String> = posted(&harness)
+        .into_iter()
+        .flat_map(|p| p.field_values)
+        .collect();
+    assert_eq!(
+        values,
+        [
+            "a translated post",
+            "a translated post",
+            "a translated post"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_translate_button_is_answered_by_gemini_first() {
+    let (service, asked) = with_gemini(gemini_says_words);
+    let harness = harness_with(Arc::new(service), gemini_translator());
+    let replies = harness
+        .click(Click::new("linkexpand:translate:*:k"))
+        .await
+        .unwrap();
+    assert_eq!(asked.load(Ordering::Relaxed), 3);
+    assert!(
+        replies.iter().any(|r| r.content.contains("Gemini words")),
+        "{replies:?}"
+    );
+}
+
+/// Pixiv's public JSON for three artworks, and the pictures of them; every other address is down.
+/// It records the `Referer` each picture is fetched with.
+struct PixivService {
+    seen: std::sync::Mutex<Vec<(String, Option<String>)>>,
+}
+
+fn pixiv_body(url: &str) -> Option<&'static str> {
+    let path = url.strip_prefix("https://www.pixiv.net/ajax/illust/")?;
+    match path {
+        "101?lang=ja" => Some(INFO_101),
+        "101/pages?lang=ja" => Some(PAGES_101),
+        "102?lang=ja" => Some(INFO_102),
+        "102/pages?lang=ja" => Some(PAGES_102),
+        "103?lang=ja" => Some(ERROR_103),
+        "104?lang=ja" => Some(INFO_104),
+        "104/pages?lang=ja" => Some(PAGES_104),
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl Get for PixivService {
+    async fn get(&self, url: &str) -> Result<Vec<u8>> {
+        match pixiv_body(url) {
+            Some(body) => Ok(body.as_bytes().to_vec()),
+            None => bail!("down"),
+        }
+    }
+
+    async fn get_media(&self, url: &str, _max: usize, referer: Option<&str>) -> Result<Vec<u8>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((url.to_owned(), referer.map(str::to_owned)));
+        Ok(b"picture".to_vec())
+    }
+}
+
+#[async_trait]
+impl plugin_kit::net::Post for PixivService {
+    async fn post_json(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+        _body: &serde_json::Value,
+    ) -> Result<Vec<u8>> {
+        bail!("the test service has no POST")
+    }
+}
+
+fn pixiv_service() -> Arc<PixivService> {
+    Arc::new(PixivService {
+        seen: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+#[tokio::test]
+async fn a_pixiv_artwork_is_expanded_with_its_pages_fetched_with_the_pixiv_referer() {
+    let service = pixiv_service();
+    let harness = harness_with(service.clone(), Translator::free());
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://www.pixiv.net/artworks/101").await;
+    let all = posted(&harness);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].embeds, 1);
+    assert_eq!(all[0].footers, [Some("❤ 42  🔖 7".to_owned())]);
+    assert_eq!(all[0].files, ["photo-1.png", "photo-2.png"]);
+    assert!(hid_the_original(&harness));
+    let seen = service.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen.iter()
+            .all(|(url, referer)| url.starts_with("https://i.pximg.net/")
+                && referer.as_deref() == Some("https://www.pixiv.net/")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pixiv_artwork_the_service_refuses_is_left_alone() {
+    let harness = harness_with(pixiv_service(), Translator::free());
+    say(&harness, "https://www.pixiv.net/artworks/103").await;
+    assert!(posted(&harness).is_empty());
+    assert!(!hid_the_original(&harness));
+}
+
+#[tokio::test]
+async fn a_pixiv_artwork_for_adults_is_expanded_only_in_an_adult_channel() {
+    let harness = harness_with(pixiv_service(), Translator::free());
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://www.pixiv.net/artworks/102").await;
+    assert!(posted(&harness).is_empty());
+    let adult: Channel = serde_json::from_value(json!({
+        "id": "10", "type": 0, "guild_id": GUILD.to_string(), "name": "adults",
+        "nsfw": true, "permission_overwrites": [],
+    }))
+    .unwrap();
+    let harness = harness_with(pixiv_service(), Translator::free());
+    harness.set_config(json!({"auto_translate": false}));
+    harness
+        .api()
+        .set_channels(Id::new(GUILD), vec![channel(7, &json!([])), adult]);
+    harness
+        .message(Message::new(50, 10).content("https://www.pixiv.net/artworks/102"))
+        .await
+        .unwrap();
+    assert_eq!(posted(&harness).len(), 1);
+}
+
+#[tokio::test]
+async fn a_picture_from_another_host_is_neither_fetched_nor_attached() {
+    let service = pixiv_service();
+    let harness = harness_with(service.clone(), Translator::free());
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://www.pixiv.net/artworks/104").await;
+    let all = posted(&harness);
+    assert_eq!(
+        all[0].files,
+        ["photo-1.png"],
+        "the one from pixiv, numbered after the one dropped"
+    );
+    let seen = service.seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .all(|(url, _)| url.starts_with("https://i.pximg.net/")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_other_forms_of_a_pixiv_link_are_expanded_and_the_switch_turns_them_off() {
+    let harness = harness_with(pixiv_service(), Translator::free());
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://phixiv.net/artworks/101").await;
+    assert_eq!(posted(&harness).len(), 1);
+    harness.set_config(json!({"pixiv_links": false}));
+    say(&harness, "https://www.pixiv.net/artworks/101").await;
+    assert_eq!(posted(&harness).len(), 1, "the switch is off: nothing new");
 }

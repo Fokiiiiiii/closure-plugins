@@ -1,9 +1,10 @@
-//! The links in a message that the bot expands: links to messages of the same server, and posts
-//! on X. A link written as `<https://...>` is left alone: that is how a writer asks for no preview.
+//! The links in a message that are expanded. A provider names its own pattern; what the providers share
+//! is here: each link once, at most `MAX_PER_MESSAGE` of them, and none written as `<…>`, which is how a
+//! writer asks for no preview.
 
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{Captures, Regex};
 
 /// The most links of one kind that are expanded in a single message.
 pub const MAX_PER_MESSAGE: usize = 3;
@@ -16,14 +17,6 @@ static MESSAGE_LINK: LazyLock<Regex> = LazyLock::new(|| {
     .expect("a fixed pattern")
 });
 
-#[allow(clippy::expect_used, reason = "a fixed pattern, compiled by the tests")]
-static X_LINK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?P<open><)?https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/(?P<user>[A-Za-z0-9_]{1,15})/status/(?P<id>\d{1,20})(?P<close>>)?",
-    )
-    .expect("a fixed pattern")
-});
-
 /// A link to a message of a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageLink {
@@ -32,75 +25,61 @@ pub struct MessageLink {
     pub message: u64,
 }
 
-/// A link to a post on X.
+/// A link to a post of a site: the name of its author in the link, and the id of the post.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostLink {
     pub user: String,
     pub id: u64,
 }
 
-fn wrapped(captures: &regex::Captures<'_>) -> bool {
+fn wrapped(captures: &Captures<'_>) -> bool {
     captures.name("open").is_some() && captures.name("close").is_some()
+}
+
+/// The links `parse` reads from the matches of `pattern` in `text`: each once, in order, at most
+/// `MAX_PER_MESSAGE`, and none written as `<…>`.
+#[must_use]
+pub fn scan<T: PartialEq>(
+    pattern: &Regex,
+    text: &str,
+    parse: impl Fn(&Captures<'_>) -> Option<T>,
+) -> Vec<T> {
+    let mut found: Vec<T> = Vec::new();
+    for captures in pattern.captures_iter(text) {
+        if wrapped(&captures) {
+            continue;
+        }
+        let Some(link) = parse(&captures) else {
+            continue;
+        };
+        if !found.contains(&link) {
+            found.push(link);
+        }
+        if found.len() == MAX_PER_MESSAGE {
+            break;
+        }
+    }
+    found
 }
 
 /// The message links in `text`, each once, in order, at most [`MAX_PER_MESSAGE`].
 #[must_use]
 pub fn message_links(text: &str) -> Vec<MessageLink> {
-    let mut found: Vec<MessageLink> = Vec::new();
-    for captures in MESSAGE_LINK.captures_iter(text) {
-        if wrapped(&captures) {
-            continue;
-        }
+    scan(&MESSAGE_LINK, text, |captures| {
         // An id is never 0: a link that says so names nothing, and must not reach an `Id::new`.
         let number = |name: &str| captures[name].parse::<u64>().ok().filter(|id| *id > 0);
-        let (Some(guild), Some(channel), Some(message)) =
-            (number("guild"), number("channel"), number("message"))
-        else {
-            continue;
-        };
-        let link = MessageLink {
-            guild,
-            channel,
-            message,
-        };
-        if !found.contains(&link) {
-            found.push(link);
-        }
-        if found.len() == MAX_PER_MESSAGE {
-            break;
-        }
-    }
-    found
-}
-
-/// The links to posts on X in `text`, each once, in order, at most [`MAX_PER_MESSAGE`].
-#[must_use]
-pub fn post_links(text: &str) -> Vec<PostLink> {
-    let mut found: Vec<PostLink> = Vec::new();
-    for captures in X_LINK.captures_iter(text) {
-        if wrapped(&captures) {
-            continue;
-        }
-        let Some(id) = captures["id"].parse::<u64>().ok().filter(|id| *id > 0) else {
-            continue;
-        };
-        let link = PostLink {
-            user: captures["user"].to_owned(),
-            id,
-        };
-        if !found.contains(&link) {
-            found.push(link);
-        }
-        if found.len() == MAX_PER_MESSAGE {
-            break;
-        }
-    }
-    found
+        Some(MessageLink {
+            guild: number("guild")?,
+            channel: number("channel")?,
+            message: number("message")?,
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::x::post_links;
 
     #[test]
     fn a_link_with_an_id_of_zero_names_nothing() {

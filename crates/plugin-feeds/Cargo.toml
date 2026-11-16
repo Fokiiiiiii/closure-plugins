@@ -1,0 +1,30 @@
+[package]
+name = "plugin-feeds"
+description = "A closure module that posts the new items of feeds (YouTube videos) to a channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fastrand.workspace = true
+closure-core.workspace = true
+closure-sdk.workspace = true
+plugin-kit.workspace = true
+roxmltree.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+twilight-model.workspace = true
+twilight-util.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+closure-i18n.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -7,6 +7,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod links;
+mod model;
+mod pixiv;
+mod provider;
+mod thread;
 mod x;
 
 use std::sync::Arc;
@@ -22,7 +26,8 @@ use closure_sdk::{
     Args, ComponentCx, CoreError, Intents, InteractionReply, Locale, ModuleBuilder, SdkModule,
     Subscription, UserError,
 };
-use plugin_kit::translate;
+use plugin_kit::net::Http;
+use plugin_kit::translator::Translator;
 use plugin_kit::{Quoted, quote_embed};
 use serde::Deserialize;
 use serde_json::json;
@@ -34,6 +39,11 @@ use twilight_model::guild::Permissions;
 use twilight_util::permission_calculator::PermissionCalculator;
 
 use crate::links::MessageLink;
+use crate::model::Post;
+use crate::pixiv::PixivProvider;
+use crate::provider::Provider;
+use crate::thread::{Labels, Thread, pieces};
+use crate::x::XProvider;
 
 pub use plugin_kit::net::{Budget, Fetcher, Get};
 
@@ -74,12 +84,13 @@ enum Layout {
 )]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-struct Config {
+pub(crate) struct Config {
     message_links: bool,
     x_links: bool,
     replied_post: bool,
     quoted_post: bool,
     translate_button: bool,
+    pixiv_links: bool,
     /// Hide the preview Discord made of the link, which the answer repeats.
     hide_original: bool,
     /// Add the post in the language of the server under it, when it is in another one.
@@ -95,6 +106,7 @@ impl Default for Config {
             replied_post: true,
             quoted_post: true,
             translate_button: true,
+            pixiv_links: true,
             hide_original: true,
             auto_translate: true,
             layout: Layout::Embeds,
@@ -210,29 +222,43 @@ async fn quote_of(ctx: &EventContext, source: &MessageInfo, link: &MessageLink) 
     ))
 }
 
+/// Whether the channel `channel_id` is for adults; one that cannot be read is not.
+async fn is_adult(ctx: &EventContext, channel_id: ChannelId) -> bool {
+    matches!(
+        ctx.api.execute(Action::GetChannel { channel_id }).await,
+        Ok(Outcome::Channel(channel)) if channel.nsfw == Some(true)
+    )
+}
+
 /// `post` with the posts it answers, up to the first of the conversation, and the posts it quotes,
 /// one inside the other. What cannot be had (a post that is gone, or private) ends the chain.
-async fn walk(fetch: &dyn Get, post: x::Tweet, replied: bool, quoted: bool) -> x::Thread {
-    let mut thread = x::Thread::new(post);
-    let mut seen: Vec<u64> = status_id(&thread.post.url).into_iter().collect();
+async fn walk(
+    fetch: &dyn Get,
+    provider: &dyn Provider,
+    post: Post,
+    replied: bool,
+    quoted: bool,
+) -> Thread {
+    let mut thread = Thread::new(post);
+    let mut seen: Vec<u64> = vec![thread.post.id];
     if replied {
-        let mut next = thread.post.parent_id();
+        let mut next = thread.post.reply_to;
         while let Some(id) = next {
             if seen.contains(&id) || thread.ancestors.len() >= MAX_ANCESTORS {
                 break;
             }
-            let Ok(parent) = fetch_post(fetch, id).await else {
+            let Ok(parent) = fetch_post(fetch, provider, id).await else {
                 break;
             };
             seen.push(id);
-            next = parent.parent_id();
+            next = parent.reply_to;
             thread.ancestors.insert(0, parent);
         }
     }
     if quoted {
         let mut from = thread.post.clone();
         while thread.quotes.len() < MAX_QUOTES {
-            let Some(id) = from.quote_id() else {
+            let Some(id) = from.quote.as_deref().map(|quote| quote.id) else {
                 break;
             };
             if seen.contains(&id) {
@@ -240,7 +266,7 @@ async fn walk(fetch: &dyn Get, post: x::Tweet, replied: bool, quoted: bool) -> x
             }
             seen.push(id);
             // The post whole, so that it has its counts; what the one before it holds will do.
-            let whole = match fetch_post(fetch, id).await {
+            let whole = match fetch_post(fetch, provider, id).await {
                 Ok(whole) => whole,
                 Err(_) => match from.quote.as_deref() {
                     Some(inside) => inside.clone(),
@@ -254,16 +280,31 @@ async fn walk(fetch: &dyn Get, post: x::Tweet, replied: bool, quoted: bool) -> x
     thread
 }
 
-async fn fetch_post(fetch: &dyn Get, id: u64) -> Result<x::Tweet> {
-    let bytes = fetch
-        .get(&format!("https://api.fxtwitter.com/status/{id}"))
-        .await?;
-    x::parse_tweet(&bytes)
+async fn fetch_post(fetch: &dyn Get, provider: &dyn Provider, id: u64) -> Result<Post> {
+    let bytes = fetch.get(&provider.api_url(id)).await?;
+    let mut post = provider.parse(&bytes)?;
+    if let Some(url) = provider.pages_url(id) {
+        let pages = fetch.get(&url).await?;
+        post.images = provider.parse_pages(&pages)?;
+    }
+    Ok(vetted(post, provider))
 }
 
-fn labels(ctx: &EventContext) -> x::Labels {
+/// The post with only the files that the site's hosts allow, in it and in the post it quotes.
+fn vetted(mut post: Post, provider: &dyn Provider) -> Post {
+    post.images.retain(|url| provider.is_media(url));
+    post.media_referer = post
+        .images
+        .first()
+        .and_then(|url| provider.media_referer(url));
+    post.video = post.video.filter(|url| provider.is_media(url));
+    post.quote = post.quote.map(|quote| Box::new(vetted(*quote, provider)));
+    post
+}
+
+fn labels(ctx: &EventContext) -> Labels {
     let say = |key: &str| ctx.t_in(ctx.locale, key, &Args::new());
-    x::Labels {
+    Labels {
         replied_to: say("linkexpand-replied-to"),
         quoted: say("linkexpand-quoted"),
         reposted_by: say("linkexpand-reposted-by"),
@@ -275,9 +316,10 @@ struct Unit {
     embed: Embed,
     photos: Vec<String>,
     video: Option<String>,
-    link: Option<String>,
     /// Whether this is what the writer linked, and not the post it answers or quotes.
     main: bool,
+    /// The `Referer` the pictures need, see [`Post::media_referer`].
+    referer: Option<&'static str>,
 }
 
 /// The most messages one answer is made of. The button that takes the answer away names the others
@@ -307,7 +349,7 @@ async fn attachments(
     let mut files = Vec::new();
     for (at, url) in unit.photos.iter().enumerate() {
         let room = MAX_FETCHED_BYTES.saturating_sub(*fetched);
-        match fetch.get_large(url, room).await {
+        match fetch.get_media(url, room, unit.referer).await {
             Ok(data) => {
                 *fetched += data.len();
                 files.push(FileUpload {
@@ -448,14 +490,21 @@ const EVENT_CALLS: usize = 30;
 const EVENT_TIME: std::time::Duration = std::time::Duration::from_secs(8);
 
 async fn on_message(
-    fetch: Arc<dyn Get>,
+    http: Arc<dyn Http>,
+    translator: Arc<Translator>,
+    providers: Arc<Vec<Arc<dyn Provider>>>,
     ctx: EventContext,
     event: Event,
 ) -> Result<Flow, ModuleError> {
     // A message with many links, or a long thread of quotes, gets a part of the network and of the
     // time, not all it asks for: the handler's own limit is not met by waiting on the calls.
-    let budget = Budget::new(&*fetch, EVENT_CALLS);
-    if let Ok(result) = tokio::time::timeout(EVENT_TIME, expand(&budget, ctx, event)).await {
+    let budget = Budget::with_http(&*http, EVENT_CALLS);
+    if let Ok(result) = tokio::time::timeout(
+        EVENT_TIME,
+        expand(&budget, &translator, &providers, ctx, event),
+    )
+    .await
+    {
         result
     } else {
         tracing::debug!("a message took too long to expand; it is left alone");
@@ -467,7 +516,13 @@ async fn on_message(
     clippy::too_many_lines,
     reason = "one flow: the links of a message, the posts, the pieces, the answer"
 )]
-async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
+async fn expand(
+    http: &dyn Http,
+    translator: &Translator,
+    providers: &[Arc<dyn Provider>],
+    ctx: EventContext,
+    event: Event,
+) -> Result<Flow, ModuleError> {
     let Event::MessageCreated(message) = &event else {
         return Ok(Flow::Continue);
     };
@@ -493,28 +548,52 @@ async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, 
                     embed,
                     photos: Vec::new(),
                     video: None,
-                    link: None,
                     main: true,
+                    referer: None,
                 }),
                 Err(error) => tracing::debug!(%error, "a message link is not expanded"),
             }
         }
     }
-    let mut threads: Vec<x::Thread> = Vec::new();
+    let mut adult: Option<bool> = None;
+    let mut threads: Vec<Thread> = Vec::new();
     let mut planned = units.len();
-    if config.x_links {
-        for link in links::post_links(&message.content) {
+    for provider in providers
+        .iter()
+        .filter(|provider| provider.enabled(&config))
+    {
+        for link in provider.detect(&message.content) {
             if planned >= cap {
                 break;
             }
-            let tweet = match fetch_post(get, link.id).await {
-                Ok(tweet) => tweet,
+            let post = match fetch_post(http, provider.as_ref(), link.id).await {
+                Ok(post) => post,
                 Err(error) => {
                     tracing::debug!(%error, "a post is not expanded");
                     continue;
                 }
             };
-            let mut thread = walk(get, tweet, config.replied_post, config.quoted_post).await;
+            let mut thread = walk(
+                http,
+                provider.as_ref(),
+                post,
+                config.replied_post,
+                config.quoted_post,
+            )
+            .await;
+            // A post marked for adults is left as its link is, outside a channel for adults.
+            if thread.any_sensitive() {
+                let adults = if let Some(known) = adult {
+                    known
+                } else {
+                    let known = is_adult(&ctx, message.channel_id).await;
+                    adult = Some(known);
+                    known
+                };
+                if !adults {
+                    continue;
+                }
+            }
             // What does not fit goes, from the far ends: the post that was linked stays.
             thread.fit(cap - planned);
             planned += thread.size();
@@ -525,12 +604,12 @@ async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, 
     let limit = text_limit(planned, config.auto_translate);
     let words = labels(&ctx);
     for thread in &threads {
-        for piece in x::pieces(thread, &words, limit) {
+        for piece in pieces(thread, &words, limit) {
             if piece.main {
                 open.get_or_insert_with(|| piece.link.clone());
             }
             let embed = if config.auto_translate {
-                with_translation(get, &ctx, piece.embed, limit).await
+                with_translation(http, translator, &ctx, piece.embed, limit).await
             } else {
                 piece.embed
             };
@@ -538,8 +617,8 @@ async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, 
                 embed,
                 photos: piece.photos,
                 video: piece.video,
-                link: Some(piece.link),
                 main: piece.main,
+                referer: piece.referer,
             });
         }
     }
@@ -548,20 +627,16 @@ async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, 
     }
     let mut translate: Vec<u64> = Vec::new();
     // The button translates what was linked, with what is around it as the click finds it.
-    for id in units
-        .iter()
-        .filter(|unit| unit.main)
-        .filter_map(|unit| unit.link.as_deref().and_then(status_id))
-    {
-        if !translate.contains(&id) {
-            translate.push(id);
+    for thread in &threads {
+        if !translate.contains(&thread.post.id) {
+            translate.push(thread.post.id);
         }
     }
     match config.layout {
         Layout::Chain => {
             send_chain(
                 &ctx,
-                get,
+                http,
                 message,
                 &units,
                 &config,
@@ -573,7 +648,7 @@ async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, 
         Layout::Embeds => {
             send_embeds(
                 &ctx,
-                get,
+                http,
                 message,
                 units,
                 &config,
@@ -602,7 +677,8 @@ async fn expand(get: &dyn Get, ctx: EventContext, event: Event) -> Result<Flow, 
 /// The embed of a post with its translation under it, when the post is in another language than
 /// the server's; a service that does not answer leaves the embed as it is.
 async fn with_translation(
-    fetch: &dyn Get,
+    http: &dyn Http,
+    translator: &Translator,
     ctx: &EventContext,
     mut embed: Embed,
     limit: usize,
@@ -611,7 +687,7 @@ async fn with_translation(
     let Some(text) = embed.description.clone() else {
         return embed;
     };
-    let Ok(done) = translate::translate(fetch, &text, to).await else {
+    let Ok(done) = translator.translate(http, &text, to).await else {
         return embed;
     };
     if done.from.split('-').next() == to.split('-').next() || done.text.trim() == text.trim() {
@@ -624,14 +700,6 @@ async fn with_translation(
         value: plugin_kit::truncate(&done.text, limit),
     });
     embed
-}
-
-fn status_id(link: &str) -> Option<u64> {
-    let (_, tail) = link.rsplit_once("/status/")?;
-    tail.split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
 }
 
 fn to_base36(mut number: u64) -> String {
@@ -650,8 +718,13 @@ fn to_base36(mut number: u64) -> String {
 
 /// Translates the posts of the button and the posts around them, each into the language of whoever
 /// pressed it.
-async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), UserError> {
+async fn translate_click(
+    http: Arc<dyn Http>,
+    translator: Arc<Translator>,
+    cx: ComponentCx,
+) -> Result<(), UserError> {
     let failed = || UserError::message("linkexpand-translate-failed");
+    // shortcut: the button's ids are X's post ids, in base 36; a second site needs a site tag in this data, when it gets a button.
     let ids: Vec<u64> = cx
         .data()
         .split(',')
@@ -666,14 +739,14 @@ async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), Use
     let to = cx.locale().tag();
     // The same share of the network and of the time as a message gets: a thread of quotes does not
     // use up the handler.
-    let budget = Budget::new(&*fetch, EVENT_CALLS);
+    let budget = Budget::with_http(&*http, EVENT_CALLS);
     let work = async {
-        let mut posts: Vec<x::Tweet> = Vec::new();
+        let mut posts: Vec<Post> = Vec::new();
         for id in ids {
-            let Ok(tweet) = fetch_post(&budget, id).await else {
+            let Ok(tweet) = fetch_post(&budget, &XProvider, id).await else {
                 continue;
             };
-            let thread = walk(&budget, tweet, true, true).await;
+            let thread = walk(&budget, &XProvider, tweet, true, true).await;
             posts.extend(thread.ancestors);
             posts.push(thread.post);
             posts.extend(thread.quotes);
@@ -683,13 +756,13 @@ async fn translate_click(fetch: Arc<dyn Get>, cx: ComponentCx) -> Result<(), Use
         let mut embeds = Vec::new();
         for tweet in &posts {
             // A post that cannot be translated is left out; the others still are told.
-            let Ok(done) = translate::translate(&budget, &tweet.text, to).await else {
+            let Ok(done) = translator.translate(&budget, &tweet.text, to).await else {
                 continue;
             };
             let text = format!(
                 "**{} (@{})**\n{}",
                 tweet.author.name,
-                tweet.author.screen_name,
+                tweet.author.handle,
                 plugin_kit::truncate(&done.text, each)
             );
             let embed = closure_sdk::EmbedBuilder::new()
@@ -750,10 +823,29 @@ async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
     Ok(())
 }
 
+/// The sites whose posts are expanded, as the server has them.
+pub(crate) fn default_providers() -> Vec<Arc<dyn Provider>> {
+    vec![Arc::new(XProvider), Arc::new(PixivProvider)]
+}
+
 /// The module, with the network it reaches the services through.
 /// # Errors
 /// The module declaration is refused by the SDK.
-pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
+pub fn builder_with(
+    fetch: Arc<dyn Http>,
+    translator: Arc<Translator>,
+) -> Result<ModuleBuilder, CoreError> {
+    builder_with_sites(fetch, translator, default_providers())
+}
+
+/// The module, with the network it reaches the services through and the sites whose posts it expands.
+/// # Errors
+/// The module declaration is refused by the SDK.
+pub(crate) fn builder_with_sites(
+    fetch: Arc<dyn Http>,
+    translator: Arc<Translator>,
+    providers: Vec<Arc<dyn Provider>>,
+) -> Result<ModuleBuilder, CoreError> {
     let switch = |key: &str| {
         json!({
             "type": "boolean",
@@ -767,6 +859,7 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
         "properties": {
             "message_links": switch("message_links"),
             "x_links": switch("x_links"),
+            "pixiv_links": switch("pixiv_links"),
             "replied_post": switch("replied_post"),
             "quoted_post": switch("quoted_post"),
             "translate_button": switch("translate_button"),
@@ -780,7 +873,9 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
             }
         }
     });
+    let providers = Arc::new(providers);
     let for_message = Arc::clone(&fetch);
+    let for_message_translator = Arc::clone(&translator);
     Ok(
         ModuleBuilder::new("linkexpand", "Link expansion", env!("CARGO_PKG_VERSION"))?
             .capability(closure_sdk::Capability::SendMessages)
@@ -795,16 +890,25 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
                 json!({
                     "message_links": true, "x_links": true, "replied_post": true,
                     "quoted_post": true, "translate_button": true, "hide_original": true,
+                    "pixiv_links": true,
                     "auto_translate": true,
                     "layout": "embeds"
                 }),
             )
             .on(
                 Subscription::new(EventKind::MessageCreated),
-                move |ctx, event| on_message(Arc::clone(&for_message), ctx, event),
+                move |ctx, event| {
+                    on_message(
+                        Arc::clone(&for_message),
+                        Arc::clone(&for_message_translator),
+                        Arc::clone(&providers),
+                        ctx,
+                        event,
+                    )
+                },
             )
             .component("translate", move |cx| {
-                translate_click(Arc::clone(&fetch), cx)
+                translate_click(Arc::clone(&fetch), Arc::clone(&translator), cx)
             })
             .component("delete", delete_click)
             .catalog(Locale::En, EN)
@@ -817,7 +921,14 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {
-    builder_with(Arc::new(Fetcher::new()))?.build()
+    module_with(Arc::new(Translator::free()))
+}
+
+/// The module, translating with `translator`.
+/// # Errors
+/// The module declaration is refused by the SDK.
+pub fn module_with(translator: Arc<Translator>) -> Result<SdkModule, CoreError> {
+    builder_with(Arc::new(Fetcher::new()), translator)?.build()
 }
 
 #[cfg(test)]
