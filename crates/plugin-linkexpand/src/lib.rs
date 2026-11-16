@@ -916,9 +916,70 @@ fn fit(embeds: &mut Vec<Embed>) {
     }
 }
 
-/// All of the answer in one message: an embed for each post, and the pictures of what was linked
-/// attached. A post shown for the sake of another has its first picture in its embed, under its
-/// text, so that it is clear whose it is. The videos come first, as a message of their own.
+/// Posts the pictures of an answer, a message of their own for each ten, before the message that
+/// holds the embeds. The first one that is sent takes the reply, and one that fails is left out.
+async fn send_pictures(
+    ctx: &EventContext,
+    channel_id: ChannelId,
+    reply_to: &mut Option<MessageId>,
+    sent: &mut Vec<MessageId>,
+    messages: Vec<Vec<FileUpload>>,
+) {
+    for files in messages {
+        match post(
+            ctx,
+            channel_id,
+            *reply_to,
+            None,
+            Vec::new(),
+            Vec::new(),
+            files,
+        )
+        .await
+        {
+            Ok(Some(id)) => {
+                sent.push(id);
+                *reply_to = None;
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(?error, "pictures of the answer are not attached"),
+        }
+    }
+}
+
+/// A message of an answer with its embeds and buttons. Pictures that take more than one message go
+/// before it, so that the message with the embeds is the last of the answer.
+async fn post_answer(
+    ctx: &EventContext,
+    channel_id: ChannelId,
+    reply_to: &mut Option<MessageId>,
+    sent: &mut Vec<MessageId>,
+    files: Vec<FileUpload>,
+    embeds: Vec<Embed>,
+    components: Vec<Component>,
+) -> Result<(), ModuleError> {
+    let mut messages = messages_of(files);
+    let attached = if messages.len() > 1 {
+        send_pictures(ctx, channel_id, reply_to, sent, messages).await;
+        Vec::new()
+    } else {
+        messages.pop().unwrap_or_default()
+    };
+    if let Some(id) = post(
+        ctx, channel_id, *reply_to, None, embeds, components, attached,
+    )
+    .await?
+    {
+        sent.push(id);
+        *reply_to = None;
+    }
+    Ok(())
+}
+
+/// All of the answer in one message: an embed for each post, and the buttons under it. The videos
+/// come first, as a message of their own, and the pictures that take more than one message before
+/// it. A post shown for the sake of another has its first picture in its embed, under its text, so
+/// that it is clear whose it is.
 async fn send_embeds(
     ctx: &EventContext,
     fetch: &dyn Get,
@@ -970,41 +1031,17 @@ async fn send_embeds(
         reply_to = None;
     }
     fit(&mut embeds);
-    // The pictures that do not fit in the first message follow it, each message ten at most.
-    let mut messages = messages_of(files).into_iter();
-    let first = messages.next().unwrap_or_default();
     let components = buttons(ctx, config, by, translate, open, message.id);
-    if let Some(id) = post(
+    post_answer(
         ctx,
         message.channel_id,
-        reply_to,
-        None,
+        &mut reply_to,
+        &mut sent,
+        files,
         embeds,
         components,
-        first,
     )
-    .await?
-    {
-        sent.push(id);
-    }
-    for rest in messages {
-        // The answer is posted already, so a message of pictures that fails does not fail it.
-        match post(
-            ctx,
-            message.channel_id,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            rest,
-        )
-        .await
-        {
-            Ok(Some(id)) => sent.push(id),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(?error, "pictures of the answer are not attached"),
-        }
-    }
+    .await?;
     remember_answer(ctx, message.id, &sent).await;
     Ok(())
 }
@@ -1058,43 +1095,21 @@ async fn send_chain(
         // A post's pictures are taken when its message is sent, so one post's are held at a time.
         let mut fetched = 0;
         let (files, _) = attachments(fetch, unit, &mut fetched).await;
-        let mut messages = messages_of(files).into_iter();
         let components = if at + 1 == count {
             buttons(ctx, config, by, translate, open, message.id)
         } else {
             Vec::new()
         };
-        let posted = post(
+        post_answer(
             ctx,
             message.channel_id,
-            reply_to,
-            None,
+            &mut reply_to,
+            &mut sent,
+            files,
             vec![unit.embed.clone()],
             components,
-            messages.next().unwrap_or_default(),
         )
         .await?;
-        reply_to = None;
-        if let Some(id) = posted {
-            sent.push(id);
-        }
-        for rest in messages {
-            match post(
-                ctx,
-                message.channel_id,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                rest,
-            )
-            .await
-            {
-                Ok(Some(id)) => sent.push(id),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(?error, "pictures of a post are not attached"),
-            }
-        }
     }
     remember_answer(ctx, message.id, &sent).await;
     Ok(())

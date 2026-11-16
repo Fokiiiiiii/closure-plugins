@@ -626,7 +626,7 @@ fn delete_button(post: &Posted) -> String {
 }
 
 #[tokio::test]
-async fn a_delete_takes_the_pictures_posted_after_the_first_message_too() {
+async fn a_delete_takes_the_pictures_posted_before_the_answer_too() {
     let harness = harness(Pictures {
         post: post_with(&urls(14), false),
         bytes: one_byte,
@@ -634,21 +634,25 @@ async fn a_delete_takes_the_pictures_posted_after_the_first_message_too() {
     harness.set_config(json!({"auto_translate": false}));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
-    assert_eq!(all.len(), 2, "the answer, then the pictures after it");
+    assert_eq!(
+        all.len(),
+        3,
+        "the pictures in two messages, then the answer"
+    );
     harness
-        .click(Click::new(delete_button(&all[0])).user(50))
+        .click(Click::new(delete_button(&all[2])).user(50))
         .await
         .unwrap();
-    // The harness clicks on a message of its own (900); the answer's two messages are 1 and 2.
+    // The harness clicks on a message of its own (900); the answer's messages are 1, 2 and 3.
     let gone = deleted_messages(&harness);
     assert!(
-        gone.contains(&2),
-        "the pictures after the first message go too: {gone:?}"
+        gone.contains(&1) && gone.contains(&2),
+        "the pictures go too: {gone:?}"
     );
     assert_eq!(
         gone.len(),
-        3,
-        "the two of the answer, and the message the button is on"
+        4,
+        "the three of the answer, and the message the button is on"
     );
 }
 
@@ -661,7 +665,7 @@ async fn a_delete_whose_answer_is_no_longer_stored_takes_only_its_own_message() 
     harness.set_config(json!({"auto_translate": false}));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
-    let button = delete_button(&all[0]);
+    let button = delete_button(&all[2]);
     let key = format!(
         "answer:{}",
         button.rsplit(':').next().unwrap().trim_start_matches('a')
@@ -866,7 +870,7 @@ fn oversized(url: &str) -> usize {
 }
 
 #[tokio::test]
-async fn fourteen_pictures_go_ten_with_the_answer_and_four_in_a_message_after_it() {
+async fn fourteen_pictures_go_ten_then_four_before_the_answer() {
     let harness = harness(Pictures {
         post: post_with(&urls(14), false),
         bytes: one_byte,
@@ -876,12 +880,10 @@ async fn fourteen_pictures_go_ten_with_the_answer_and_four_in_a_message_after_it
     let all = posted(&harness);
     assert_eq!(
         all.len(),
-        2,
-        "the answer, then the pictures that did not fit"
+        3,
+        "the pictures in two messages, then the answer"
     );
     assert_eq!(all[0].files.len(), 10);
-    assert_eq!(all[0].embeds, 1);
-    assert!(!buttons(&all[0]).is_empty());
     assert_eq!(
         all[1].files,
         [
@@ -891,14 +893,19 @@ async fn fourteen_pictures_go_ten_with_the_answer_and_four_in_a_message_after_it
             "photo-14.jpg"
         ]
     );
-    assert_eq!(all[1].embeds, 0);
+    assert_eq!((all[0].embeds, all[1].embeds), (0, 0));
+    assert!(all[0].reply_to.is_some());
     assert!(all[1].reply_to.is_none());
-    assert!(buttons(&all[1]).is_empty());
+    assert!(buttons(&all[0]).is_empty() && buttons(&all[1]).is_empty());
+    assert_eq!(all[2].embeds, 1);
+    assert!(all[2].files.is_empty());
+    assert!(all[2].reply_to.is_none());
+    assert!(!buttons(&all[2]).is_empty());
     assert!(all.iter().all(|post| post.silent));
 }
 
 #[tokio::test]
-async fn twenty_pictures_go_ten_and_ten() {
+async fn twenty_pictures_go_ten_and_ten_before_the_answer() {
     let harness = harness(Pictures {
         post: post_with(&urls(20), false),
         bytes: one_byte,
@@ -906,13 +913,16 @@ async fn twenty_pictures_go_ten_and_ten() {
     harness.set_config(json!({"auto_translate": false}));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
-    assert_eq!(all.len(), 2);
+    assert_eq!(all.len(), 3);
     assert_eq!(all[0].files.len(), 10);
     assert_eq!(all[1].files.len(), 10);
     assert_eq!(
         all[1].files.last().map(String::as_str),
         Some("photo-20.jpg")
     );
+    assert_eq!(all[2].embeds, 1);
+    assert!(all[2].files.is_empty());
+    assert!(!buttons(&all[2]).is_empty());
 }
 
 #[tokio::test]
@@ -924,9 +934,15 @@ async fn a_message_takes_the_pictures_that_fit_its_bytes_and_the_next_one_takes_
     harness.set_config(json!({"auto_translate": false}));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
-    assert_eq!(all.len(), 2);
+    assert_eq!(
+        all.len(),
+        3,
+        "the pictures in two messages, then the answer"
+    );
     assert_eq!(all[0].files.len(), 8, "eight of 2.5 MB make 20 MB");
     assert_eq!(all[1].files, ["photo-9.jpg"]);
+    assert_eq!(all[2].embeds, 1);
+    assert!(all[2].files.is_empty());
 }
 
 #[tokio::test]
@@ -953,19 +969,20 @@ async fn a_message_of_pictures_that_fails_leaves_the_answer_and_the_request_is_h
         bytes: one_byte,
     });
     harness.set_config(json!({"auto_translate": false}));
-    // The second request is the message of the pictures that did not fit.
+    // The second request is the message of the pictures that did not fit in the first.
     harness
         .api()
         .fail_nth(2, DiscordError::Transient("timed out".into()));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
-    assert_eq!(all.len(), 1, "the answer stands");
+    assert_eq!(all.len(), 2, "the pictures that went, then the answer");
     assert_eq!(all[0].files.len(), 10);
-    assert_eq!(all[0].embeds, 1);
+    assert_eq!(all[1].embeds, 1);
+    assert!(!buttons(&all[1]).is_empty());
 }
 
 #[tokio::test]
-async fn in_a_chain_the_pictures_of_a_reply_go_on_in_the_message_after_it() {
+async fn in_a_chain_the_pictures_of_a_reply_go_before_its_message() {
     let harness = harness(Pictures {
         post: post_with(&urls(14), true),
         bytes: one_byte,
@@ -975,14 +992,80 @@ async fn in_a_chain_the_pictures_of_a_reply_go_on_in_the_message_after_it() {
     let all = posted(&harness);
     assert_eq!(
         all.len(),
-        3,
-        "the post replied to, the reply, the pictures after it"
+        4,
+        "the post replied to, the pictures of the reply in two messages, then the reply"
     );
+    assert_eq!(all[0].embeds, 1);
+    assert!(all[0].files.is_empty());
+    assert!(all[0].reply_to.is_some());
     assert_eq!(all[1].files.len(), 10);
-    assert_eq!(all[1].embeds, 1);
     assert_eq!(all[2].files.len(), 4);
-    assert_eq!(all[2].embeds, 0);
-    assert!(all[2].reply_to.is_none());
-    assert!(!buttons(&all[1]).is_empty());
-    assert!(buttons(&all[2]).is_empty());
+    assert_eq!((all[1].embeds, all[2].embeds), (0, 0));
+    assert!(all[1].reply_to.is_none() && all[2].reply_to.is_none());
+    assert_eq!(all[3].embeds, 1);
+    assert!(all[3].files.is_empty());
+    assert!(all[3].reply_to.is_none());
+    assert!(!buttons(&all[3]).is_empty());
+    assert!(buttons(&all[0]).is_empty());
+    assert!(buttons(&all[1]).is_empty() && buttons(&all[2]).is_empty());
+}
+
+#[tokio::test]
+async fn ten_pictures_stay_in_the_answer_message() {
+    let harness = harness(Pictures {
+        post: post_with(&urls(10), false),
+        bytes: one_byte,
+    });
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://x.com/jack/status/20").await;
+    let all = posted(&harness);
+    assert_eq!(
+        all.len(),
+        1,
+        "one message holds the answer and ten pictures"
+    );
+    assert_eq!(all[0].files.len(), 10);
+    assert_eq!(all[0].embeds, 1);
+    assert!(all[0].reply_to.is_some());
+    assert!(!buttons(&all[0]).is_empty());
+}
+
+#[tokio::test]
+async fn a_video_goes_first_then_the_pictures_and_the_answer_last() {
+    let photos: Vec<String> = urls(14)
+        .iter()
+        .map(|url| format!(r#"{{"url":"{url}"}}"#))
+        .collect();
+    let post = format!(
+        r#"{{"tweet":{{"url":"https://x.com/jack/status/20","text":"a video and many pictures",
+        "author":{{"name":"jack","screen_name":"jack"}},
+        "media":{{"photos":[{}],"videos":[{{"url":"https://video.twimg.com/v.mp4"}}]}}}}}}"#,
+        photos.join(",")
+    );
+    let harness = harness(Pictures {
+        post,
+        bytes: one_byte,
+    });
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://x.com/jack/status/20").await;
+    let all = posted(&harness);
+    assert_eq!(
+        all.len(),
+        4,
+        "the video, the pictures in two messages, then the answer"
+    );
+    assert!(
+        all[0]
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("v.mp4"))
+    );
+    assert_eq!(all[0].embeds, 0);
+    assert!(all[0].reply_to.is_some());
+    assert_eq!(all[1].files.len(), 10);
+    assert_eq!(all[2].files.len(), 4);
+    assert!(all[1].reply_to.is_none() && all[2].reply_to.is_none());
+    assert_eq!(all[3].embeds, 1);
+    assert!(all[3].files.is_empty());
+    assert!(!buttons(&all[3]).is_empty());
 }
