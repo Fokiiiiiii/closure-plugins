@@ -12,8 +12,8 @@ use twilight_model::util::Timestamp;
 use twilight_util::builder::embed::{EmbedAuthorBuilder, EmbedBuilder, EmbedFooterBuilder};
 
 const X_COLOR: u32 = 0x1D_9BF0;
-/// Discord shows at most four pictures of one post together.
-const MAX_PHOTOS: usize = 4;
+/// X's limit on the pictures of one post.
+const MAX_PHOTOS: usize = 20;
 
 #[derive(Debug, Deserialize)]
 struct FxResponse {
@@ -463,8 +463,8 @@ mod tests {
     }
 
     #[test]
-    fn at_most_four_pictures_are_taken() {
-        let photos: Vec<String> = (0..6)
+    fn at_most_twenty_pictures_are_taken() {
+        let photos: Vec<String> = (0..25)
             .map(|n| format!(r#"{{"url":"https://pbs.twimg.com/{n}.jpg"}}"#))
             .collect();
         let json = format!(
@@ -477,7 +477,7 @@ mod tests {
             &labels(),
             100,
         );
-        assert_eq!(shown[0].photos.len(), MAX_PHOTOS);
+        assert_eq!(shown[0].photos.len(), 20);
         assert!(shown[0].video.is_none());
     }
 

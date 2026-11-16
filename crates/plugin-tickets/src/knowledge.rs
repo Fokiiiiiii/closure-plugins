@@ -812,6 +812,7 @@ async fn finish_suggestion_job(
                 embeds: batch.to_vec(),
                 reply_to: None,
                 mentions: MentionPolicy::None,
+                silent: false,
             })
             .await
             .is_err()
@@ -972,6 +973,7 @@ pub(crate) async fn send_article(
             embeds,
             reply_to: None,
             mentions: MentionPolicy::None,
+            silent: false,
         })
         .await
         .map_err(|_| ModuleError::other("knowledge article could not be sent"))?;

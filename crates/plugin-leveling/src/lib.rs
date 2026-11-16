@@ -245,6 +245,7 @@ async fn reached(
                 embeds: Vec::new(),
                 reply_to: None,
                 mentions: MentionPolicy::None,
+                silent: false,
             })
             .await;
         if let Err(error) = sent {

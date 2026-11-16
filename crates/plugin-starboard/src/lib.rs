@@ -322,6 +322,7 @@ async fn post(
             embeds: vec![embed],
             reply_to: None,
             mentions: MentionPolicy::None,
+            silent: false,
         })
         .await?;
     if let Outcome::Message(sent) = sent {

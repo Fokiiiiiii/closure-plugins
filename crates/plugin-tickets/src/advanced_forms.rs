@@ -1484,6 +1484,7 @@ pub(crate) async fn send_form_answers(
                 embeds: message_embeds,
                 reply_to: None,
                 mentions: MentionPolicy::None,
+                silent: false,
             })
             .await
             .map_err(|error| crate::failed(&error))?;

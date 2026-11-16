@@ -12,7 +12,7 @@ mod x;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use closure_core::action::{Action, FileUpload, MAX_FILES, Outcome, Reason};
+use closure_core::action::{Action, FileUpload, MAX_FILES, MAX_UPLOAD_BYTES, Outcome, Reason};
 use closure_core::error::ModuleError;
 use closure_core::event::{ChannelId, Event, EventKind, MessageId, MessageInfo, RoleId};
 use closure_core::module::EventContext;
@@ -283,8 +283,10 @@ struct Unit {
 /// The most messages one answer is made of. The button that takes the answer away names the others
 /// in its `custom_id`, which has room for three ids besides its own.
 const MAX_UNITS: usize = 4;
-/// The most bytes of files in one message: Discord's limit, with room to spare.
-const MAX_FILES_BYTES: usize = 9_000_000;
+/// The most bytes of files in one message: the limit that closure-core checks before a post.
+const MAX_FILES_BYTES: usize = MAX_UPLOAD_BYTES;
+/// The most bytes of pictures taken before they are sent: two messages' worth.
+const MAX_FETCHED_BYTES: usize = 2 * MAX_FILES_BYTES;
 
 fn extension_of(url: &str) -> &str {
     let name = url.split('?').next().unwrap_or(url);
@@ -295,17 +297,19 @@ fn extension_of(url: &str) -> &str {
 }
 
 /// The pictures of a unit as files, and the address of its video, which is posted as a link.
-/// `room` is what a message can still carry in files, and is used up by what is attached.
+/// `fetched` is the bytes of pictures taken for the answer so far, and no more than
+/// `MAX_FETCHED_BYTES` are taken in all.
 async fn attachments(
     fetch: &dyn Get,
     unit: &Unit,
-    room: &mut usize,
+    fetched: &mut usize,
 ) -> (Vec<FileUpload>, Option<String>) {
     let mut files = Vec::new();
     for (at, url) in unit.photos.iter().enumerate() {
-        match fetch.get_large(url, *room).await {
+        let room = MAX_FETCHED_BYTES.saturating_sub(*fetched);
+        match fetch.get_large(url, room).await {
             Ok(data) => {
-                *room -= data.len();
+                *fetched += data.len();
                 files.push(FileUpload {
                     filename: format!("photo-{}.{}", at + 1, extension_of(url)),
                     data,
@@ -320,6 +324,84 @@ async fn attachments(
     (files, player)
 }
 
+/// The files in messages of their own: ten at most in each, and `MAX_FILES_BYTES` of them
+/// together. A file larger than a message takes is left out, with a warning.
+fn messages_of(files: Vec<FileUpload>) -> Vec<Vec<FileUpload>> {
+    let mut messages: Vec<Vec<FileUpload>> = Vec::new();
+    let mut bytes = 0;
+    for file in files {
+        let size = file.data.len();
+        if size > MAX_FILES_BYTES {
+            tracing::warn!(filename = %file.filename, "a picture is larger than a message takes");
+            continue;
+        }
+        match messages.last_mut() {
+            Some(message) if message.len() < MAX_FILES && bytes + size <= MAX_FILES_BYTES => {
+                message.push(file);
+            }
+            _ => {
+                messages.push(vec![file]);
+                bytes = 0;
+            }
+        }
+        bytes += size;
+    }
+    messages
+}
+
+/// How long a delete button can take an answer away: the list of its messages is kept this long.
+const ANSWER_TTL: std::time::Duration = std::time::Duration::from_hours(7 * 24);
+/// The data of a delete button whose answer is in storage; the data of older buttons is ids, never this.
+const ANSWER_DATA: char = 'a';
+
+fn answer_key(request: u64) -> String {
+    format!("answer:{request}")
+}
+
+/// Keeps the ids of the answer's messages under the link's message, for its delete button.
+async fn remember_answer(ctx: &EventContext, request: MessageId, sent: &[MessageId]) {
+    let ids: Vec<u64> = sent.iter().map(|id| id.get()).collect();
+    if let Err(error) = ctx
+        .store()
+        .set_for(&answer_key(request.get()), &ids, ANSWER_TTL)
+        .await
+    {
+        tracing::warn!(
+            ?error,
+            "the answer's messages are not kept; its delete button takes only its own message"
+        );
+    }
+}
+
+/// The messages a delete button takes away besides its own. A new button names its answer in
+/// storage; when that list has expired, nothing else goes.
+async fn answer_messages(cx: &ComponentCx, data: &str, own: MessageId) -> Vec<MessageId> {
+    let ids: Vec<u64> = match data.strip_prefix(ANSWER_DATA) {
+        Some(request) => {
+            let Ok(request) = request.parse::<u64>() else {
+                return Vec::new();
+            };
+            match cx.store().get::<Vec<u64>>(&answer_key(request)).await {
+                Ok(stored) => stored.unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(?error, "the answer's messages cannot be read");
+                    Vec::new()
+                }
+            }
+        }
+        None => data
+            .split(',')
+            .filter_map(|id| id.parse::<u64>().ok())
+            .filter(|id| *id > 0)
+            .take(MAX_UNITS - 1)
+            .collect(),
+    };
+    ids.into_iter()
+        .filter(|id| *id > 0 && *id != own.get())
+        .map(MessageId::new)
+        .collect()
+}
+
 /// The buttons under the last message of the answer.
 fn buttons(
     ctx: &EventContext,
@@ -327,7 +409,7 @@ fn buttons(
     posted_by: closure_core::event::UserId,
     translate: &[u64],
     open: Option<&str>,
-    earlier: &[MessageId],
+    answer: MessageId,
 ) -> Vec<Component> {
     let say = |key: &str| ctx.t_in(ctx.locale, key, &Args::new());
     let mut row = Vec::new();
@@ -344,11 +426,10 @@ fn buttons(
     if let Some(link) = open {
         row.push(ui::link_button(say("linkexpand-open"), link));
     }
-    // Whoever posted the link can take the whole answer away again.
-    let ids: Vec<String> = earlier.iter().map(ToString::to_string).collect();
+    // Whoever posted the link can take the whole answer away again; its messages are in storage.
     let delete = CustomId::new("delete")
         .only_for(posted_by)
-        .data(ids.join(","));
+        .data(format!("{ANSWER_DATA}{answer}"));
     row.push(ui::button(
         ButtonStyle::Danger,
         say("linkexpand-delete"),
@@ -651,18 +732,16 @@ async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
     let click = cx.click();
     let reason = Reason::new(cx.t("linkexpand-delete-reason", &Args::new()))
         .map_err(|_| UserError::message("linkexpand-translate-failed"))?;
-    // The messages before this one are named in the button; they may be gone already.
-    for id in cx
-        .data()
-        .split(',')
-        .filter_map(|id| id.parse::<u64>().ok())
-        .filter(|id| *id > 0)
-        .take(MAX_UNITS - 1)
-    {
-        let _ = cx
+    // The other messages of the answer go first; they may be gone already.
+    let data = cx.data();
+    for id in answer_messages(&cx, &data, click.message_id).await {
+        if let Err(error) = cx
             .api()
-            .delete_message(click.channel_id, MessageId::new(id), reason.clone())
-            .await;
+            .delete_message(click.channel_id, id, reason.clone())
+            .await
+        {
+            tracing::warn!(?error, "a message of the answer is not deleted");
+        }
     }
     cx.api()
         .delete_message(click.channel_id, click.message_id, reason)
@@ -708,6 +787,7 @@ pub fn builder_with(fetch: Arc<dyn Get>) -> Result<ModuleBuilder, CoreError> {
             .capability(closure_sdk::Capability::ReadMessages)
             .capability(closure_sdk::Capability::ReadGuild)
             .capability(closure_sdk::Capability::ManageMessages)
+            .capability(closure_sdk::Capability::Storage)
             .capability(closure_sdk::Capability::RespondToInteractions)
             .intents(Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT)
             .config(
@@ -764,6 +844,8 @@ async fn post(
             embeds,
             components,
             files,
+            // The user's own message already notifies; the answer to it must not ping again.
+            silent: true,
         })
         .await?;
     Ok(match posted {
@@ -847,12 +929,12 @@ async fn send_embeds(
     open: Option<&str>,
 ) -> Result<(), ModuleError> {
     let mut files = Vec::new();
-    let mut room = MAX_FILES_BYTES;
+    let mut fetched = 0;
     let mut videos: Vec<String> = Vec::new();
     let mut embeds = Vec::new();
     for mut unit in units {
         if unit.main {
-            let (more, video) = attachments(fetch, &unit, &mut room).await;
+            let (more, video) = attachments(fetch, &unit, &mut fetched).await;
             files.extend(more);
             videos.extend(video);
         } else {
@@ -877,29 +959,53 @@ async fn send_embeds(
         embeds.push(unit.embed);
     }
     let by = message.author.id;
-    // The videos come first, as a message of their own; the message with the buttons names it.
-    let mut earlier: Vec<MessageId> = Vec::new();
+    // The videos come first, as a message of their own; the answer keeps every message it sends.
+    let mut sent: Vec<MessageId> = Vec::new();
     // The first message of the answer replies to the link; the others do not reply at all.
     let mut reply_to = Some(message.id);
     if !videos.is_empty()
         && let Some(id) = post_videos(ctx, message, reply_to, videos, Vec::new()).await?
     {
-        earlier.push(id);
+        sent.push(id);
         reply_to = None;
     }
-    // Discord takes ten files in a message: what is over is left out, not the whole answer.
-    files.truncate(MAX_FILES);
     fit(&mut embeds);
-    post(
+    // The pictures that do not fit in the first message follow it, each message ten at most.
+    let mut messages = messages_of(files).into_iter();
+    let first = messages.next().unwrap_or_default();
+    let components = buttons(ctx, config, by, translate, open, message.id);
+    if let Some(id) = post(
         ctx,
         message.channel_id,
         reply_to,
         None,
         embeds,
-        buttons(ctx, config, by, translate, open, &earlier),
-        files,
+        components,
+        first,
     )
-    .await?;
+    .await?
+    {
+        sent.push(id);
+    }
+    for rest in messages {
+        // The answer is posted already, so a message of pictures that fails does not fail it.
+        match post(
+            ctx,
+            message.channel_id,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            rest,
+        )
+        .await
+        {
+            Ok(Some(id)) => sent.push(id),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(?error, "pictures of the answer are not attached"),
+        }
+    }
+    remember_answer(ctx, message.id, &sent).await;
     Ok(())
 }
 
@@ -938,13 +1044,7 @@ async fn send_chain(
     } else {
         units.iter().collect()
     };
-    let mut posts = Vec::new();
-    let mut videos: Vec<String> = Vec::new();
-    for unit in units {
-        let (files, video) = attachments(fetch, unit, &mut MAX_FILES_BYTES.clone()).await;
-        videos.extend(video);
-        posts.push((unit, files));
-    }
+    let videos: Vec<String> = units.iter().filter_map(|unit| unit.video.clone()).collect();
     let mut reply_to = Some(message.id);
     let mut sent: Vec<MessageId> = Vec::new();
     if !videos.is_empty()
@@ -953,10 +1053,14 @@ async fn send_chain(
         reply_to = None;
         sent.push(id);
     }
-    let count = posts.len();
-    for (at, (unit, files)) in posts.into_iter().enumerate() {
+    let count = units.len();
+    for (at, unit) in units.into_iter().enumerate() {
+        // A post's pictures are taken when its message is sent, so one post's are held at a time.
+        let mut fetched = 0;
+        let (files, _) = attachments(fetch, unit, &mut fetched).await;
+        let mut messages = messages_of(files).into_iter();
         let components = if at + 1 == count {
-            buttons(ctx, config, by, translate, open, &sent)
+            buttons(ctx, config, by, translate, open, message.id)
         } else {
             Vec::new()
         };
@@ -967,13 +1071,31 @@ async fn send_chain(
             None,
             vec![unit.embed.clone()],
             components,
-            files,
+            messages.next().unwrap_or_default(),
         )
         .await?;
         reply_to = None;
         if let Some(id) = posted {
             sent.push(id);
         }
+        for rest in messages {
+            match post(
+                ctx,
+                message.channel_id,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                rest,
+            )
+            .await
+            {
+                Ok(Some(id)) => sent.push(id),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(?error, "pictures of a post are not attached"),
+            }
+        }
     }
+    remember_answer(ctx, message.id, &sent).await;
     Ok(())
 }

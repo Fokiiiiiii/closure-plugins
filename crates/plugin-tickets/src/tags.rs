@@ -274,6 +274,7 @@ async fn send_tag_by_id(cx: CommandCx, id: &str, require_alias: bool) -> Result<
                 embeds,
                 reply_to: None,
                 mentions: MentionPolicy::None,
+                silent: false,
             })
             .await
             .map_err(|error| super::failed(&error))?;

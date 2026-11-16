@@ -2108,6 +2108,7 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
                 button(ctx, "close", ButtonStyle::Danger, "tickets-close-button"),
             ])],
             files: Vec::new(),
+            silent: false,
         })
         .await;
     if let Err(error) = welcome {
@@ -2124,6 +2125,7 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
                 embeds: message,
                 components: Vec::new(),
                 files: Vec::new(),
+                silent: false,
             })
             .await;
         if let Err(error) = posted {
@@ -2155,6 +2157,7 @@ async fn announce_ticket(ctx: &EventContext, channel: ChannelId, ticket: &Ticket
             embeds: Vec::new(),
             reply_to: None,
             mentions: MentionPolicy::Roles(staff),
+            silent: false,
         })
         .await;
     if config.close_after_days > 0 {
@@ -2316,6 +2319,7 @@ async fn post_ticket_message_quote(
                 embeds,
                 components: Vec::new(),
                 files: Vec::new(),
+                silent: false,
             })
             .await
         {
@@ -3982,6 +3986,7 @@ async fn post_close_request_message(
                 ),
             ])],
             files: Vec::new(),
+            silent: false,
         })
         .await?;
     if let Err(error) = ctx
@@ -3992,6 +3997,7 @@ async fn post_close_request_message(
             embeds: Vec::new(),
             reply_to: None,
             mentions: MentionPolicy::Users(vec![UserId::new(opener)]),
+            silent: false,
         })
         .await
     {
@@ -4435,6 +4441,7 @@ async fn panel(cx: CommandCx, args: PanelArgs) -> Result<(), UserError> {
                 embeds: panel_embeds.clone(),
                 components: pages[*page_index].clone(),
                 files: Vec::new(),
+                silent: false,
             })
             .await;
         if let Err(error) = result {
@@ -5737,6 +5744,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
                     button(ctx, "close", ButtonStyle::Danger, "tickets-close-button"),
                 ])],
                 files: Vec::new(),
+                silent: false,
             })
             .await;
         let mut answers_need_retry = false;
@@ -5767,6 +5775,7 @@ async fn create_ticket<I: InteractionRef + 'static>(
                 embeds: Vec::new(),
                 reply_to: None,
                 mentions: MentionPolicy::Roles(staff),
+                silent: false,
             })
             .await;
         if config.close_after_days > 0 {
@@ -7709,6 +7718,7 @@ async fn prepare_history(
                     filename: format!("ticket-{:04}.txt", closing.ticket.number),
                     data: log_copy_text.into_bytes(),
                 }],
+                silent: false,
             })
             .await;
         history.log_copy_message = match posted {
@@ -7789,6 +7799,7 @@ async fn update_exit_survey_archive(
             embeds: existing.embeds,
             components,
             files: Vec::new(),
+            silent: false,
         })
         .await
     {
@@ -8864,6 +8875,7 @@ async fn claim(cx: ComponentCx) -> Result<(), UserError> {
                         embeds: Vec::new(),
                         reply_to: None,
                         mentions: MentionPolicy::None,
+                        silent: false,
                     })
                     .await
                     .map_err(|e| failed(&e))?;
@@ -8986,6 +8998,7 @@ async fn set_claim(cx: CommandCx, claimed_by: Option<UserId>) -> Result<(), User
                         embeds: Vec::new(),
                         reply_to: None,
                         mentions: MentionPolicy::None,
+                        silent: false,
                     })
                     .await
                 {
@@ -10192,6 +10205,7 @@ async fn resume_reply_send(
                 embeds: Vec::new(),
                 reply_to: None,
                 mentions: MentionPolicy::None,
+                silent: false,
             })
             .await
         {

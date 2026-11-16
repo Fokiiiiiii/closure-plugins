@@ -228,6 +228,7 @@ async fn finish(
                 embeds: vec![embed_of(&giveaway.prize, text)?],
                 components: Vec::new(),
                 files: Vec::new(),
+                silent: false,
             })
             .await;
         if let Err(error) = edited {
@@ -270,6 +271,7 @@ async fn finish(
                         .map(|id| closure_core::event::UserId::new(*id))
                         .collect(),
                 ),
+                silent: false,
             })
             .await;
         if let Err(error) = told {
@@ -369,6 +371,7 @@ async fn start(cx: CommandCx, args: Start) -> Result<(), UserError> {
             embeds: vec![embed_of(&giveaway.prize, text).map_err(|e| failed(&e))?],
             components: vec![enter_button(ctx)],
             files: Vec::new(),
+            silent: false,
         })
         .await
         .map_err(|e| failed(&e))?;

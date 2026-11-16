@@ -2633,6 +2633,10 @@ pub(super) async fn change_member(cx: CommandCx, user: UserId, add: bool) -> Res
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flow: read the waiting tickets and answer them"
+)]
 pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let channel = cx.invocation().channel_id;
@@ -2720,6 +2724,7 @@ pub(super) async fn waiting(cx: CommandCx, args: WaitingArgs) -> Result<(), User
                             embeds: Vec::new(),
                             reply_to: None,
                             mentions: MentionPolicy::None,
+                            silent: false,
                         })
                         .await
                 {
