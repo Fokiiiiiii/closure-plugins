@@ -217,7 +217,7 @@ impl Fetcher {
         for (name, value) in headers {
             if FORWARDED_HEADERS
                 .iter()
-                .any(|allowed| name.eq_ignore_ascii_case(*allowed))
+                .any(|allowed| name.eq_ignore_ascii_case(allowed))
             {
                 builder = builder.header(*name, *value);
             }
