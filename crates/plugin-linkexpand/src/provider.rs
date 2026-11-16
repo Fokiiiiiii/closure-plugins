@@ -44,6 +44,12 @@ pub(crate) trait Provider: Send + Sync {
         None
     }
 
+    /// The headers the request for `url` is sent with, when the site needs the operator's session
+    /// for it. Only the addresses the session belongs to get one.
+    fn request_headers(&self, _url: &str) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
     /// The hosts of the site's pictures and video: the only files that are fetched or linked.
     fn media_hosts(&self) -> &'static [&'static str];
 

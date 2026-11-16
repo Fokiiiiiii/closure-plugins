@@ -16,14 +16,21 @@ pub fn modules() -> Result<Vec<Arc<dyn Module>>> {
 }
 
 /// The same list, for a host that hands the operator's settings to the plugins. The translating
-/// plugins share the translator the settings ask for.
+/// plugins share the translator the settings ask for, and Pixiv reads adult artworks with the
+/// operator's session when the settings give one.
 ///
 /// # Errors
 /// A module declaration is refused by the SDK.
 pub fn modules_with(settings: &OperatorSettings) -> Result<Vec<Arc<dyn Module>>> {
     let translator = Arc::new(plugin_kit::translator::from_settings(settings));
+    let pixiv_session = settings
+        .secret("pixiv_session")
+        .map(plugin_kit::translator::ApiKey::from_secret);
     Ok(vec![
-        Arc::new(plugin_linkexpand::module_with(Arc::clone(&translator))?),
+        Arc::new(plugin_linkexpand::module_with(
+            Arc::clone(&translator),
+            pixiv_session,
+        )?),
         Arc::new(plugin_starboard::module()?),
         Arc::new(plugin_leveling::module()?),
         Arc::new(plugin_translate::module_with(translator)?),

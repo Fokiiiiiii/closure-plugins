@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Error, Result, bail};
 use closure_core::operator_settings::OperatorSettings;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -23,7 +23,8 @@ const OUTPUT_ALLOWANCE: usize = 20;
 const RATE_LIMITS_IN_A_ROW: u32 = 2;
 const PAUSE: Duration = Duration::from_secs(60);
 
-/// A Gemini API key. It is never printed, so it cannot reach a log or an error.
+/// A secret a service is sent: a Gemini API key, or a session cookie. It is never printed, so it
+/// cannot reach a log or an error.
 #[derive(Clone)]
 pub struct ApiKey(String);
 
@@ -31,6 +32,18 @@ impl ApiKey {
     #[must_use]
     pub fn new(key: impl Into<String>) -> Self {
         Self(key.into())
+    }
+
+    /// The secret of the operator's settings.
+    #[must_use]
+    pub fn from_secret(secret: &SecretString) -> Self {
+        Self::new(secret.expose_secret())
+    }
+
+    /// The secret itself, for the one request that sends it; never for a log or an error.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
     }
 
     fn is_blank(&self) -> bool {

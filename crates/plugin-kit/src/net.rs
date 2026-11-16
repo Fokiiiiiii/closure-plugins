@@ -21,6 +21,8 @@ const MAX_BYTES: usize = 256 * 1024;
 /// How long a picture or a video may take.
 const LARGE_TIMEOUT: Duration = Duration::from_secs(20);
 const AGENT: &str = "closure-plugins (https://github.com/Fokiiiiiii/closure-plugins)";
+/// The only headers a service is sent on request: a session cookie, for the services that need one.
+const FORWARDED_HEADERS: &[&str] = &["cookie"];
 
 /// Where the module reads a page from; a test puts its own in place of the network.
 #[async_trait]
@@ -47,6 +49,14 @@ pub trait Get: Send + Sync {
     /// The file is out of reach, slow, or larger than `max`.
     async fn get_media(&self, url: &str, max: usize, _referer: Option<&str>) -> Result<Vec<u8>> {
         self.get_large(url, max).await
+    }
+
+    /// The body of `url`, sent with `headers`. Only the headers in [`FORWARDED_HEADERS`] are sent;
+    /// the default sends none and reads as [`Get::get`].
+    /// # Errors
+    /// As [`Get::get`].
+    async fn get_with_headers(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Vec<u8>> {
+        self.get(url).await
     }
 }
 
@@ -149,6 +159,11 @@ impl Get for Budget<'_> {
         self.spend()?;
         self.get_inner().get_media(url, max, referer).await
     }
+
+    async fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>> {
+        self.spend()?;
+        self.get_inner().get_with_headers(url, headers).await
+    }
 }
 
 #[async_trait]
@@ -191,12 +206,21 @@ impl Fetcher {
         max: usize,
         within: Duration,
         referer: Option<&str>,
+        headers: &[(&str, &str)],
     ) -> Result<Vec<u8>> {
         let mut builder = hyper::Request::get(url)
             .header("user-agent", AGENT)
             .header("accept", "*/*");
         if let Some(referer) = referer {
             builder = builder.header("referer", referer);
+        }
+        for (name, value) in headers {
+            if FORWARDED_HEADERS
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(*allowed))
+            {
+                builder = builder.header(*name, *value);
+            }
         }
         let request = builder.body(Full::new(Bytes::new()))?;
         self.send(request, max, within).await
@@ -234,15 +258,19 @@ impl Fetcher {
 #[async_trait]
 impl Get for Fetcher {
     async fn get(&self, url: &str) -> Result<Vec<u8>> {
-        self.fetch(url, MAX_BYTES, TIMEOUT, None).await
+        self.fetch(url, MAX_BYTES, TIMEOUT, None, &[]).await
     }
 
     async fn get_large(&self, url: &str, max: usize) -> Result<Vec<u8>> {
-        self.fetch(url, max, LARGE_TIMEOUT, None).await
+        self.fetch(url, max, LARGE_TIMEOUT, None, &[]).await
     }
 
     async fn get_media(&self, url: &str, max: usize, referer: Option<&str>) -> Result<Vec<u8>> {
-        self.fetch(url, max, LARGE_TIMEOUT, referer).await
+        self.fetch(url, max, LARGE_TIMEOUT, referer, &[]).await
+    }
+
+    async fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>> {
+        self.fetch(url, MAX_BYTES, TIMEOUT, None, headers).await
     }
 }
 
@@ -295,6 +323,20 @@ mod budget_tests {
         assert!(budget.get_large("b", 10).await.is_ok());
         assert!(budget.get("c").await.is_err());
         assert_eq!(inner.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_budget_spends_a_call_on_a_get_with_headers() {
+        let inner = Counting(AtomicUsize::new(0));
+        let budget = Budget::new(&inner, 1);
+        assert!(
+            budget
+                .get_with_headers("a", &[("cookie", "x=1")])
+                .await
+                .is_ok()
+        );
+        assert!(budget.get_with_headers("b", &[]).await.is_err());
+        assert_eq!(inner.0.load(Ordering::Relaxed), 1);
     }
 
     struct Both(AtomicUsize);

@@ -27,7 +27,7 @@ use closure_sdk::{
     Subscription, UserError,
 };
 use plugin_kit::net::Http;
-use plugin_kit::translator::Translator;
+use plugin_kit::translator::{ApiKey, Translator};
 use plugin_kit::{Quoted, quote_embed};
 use serde::Deserialize;
 use serde_json::json;
@@ -281,13 +281,23 @@ async fn walk(
 }
 
 async fn fetch_post(fetch: &dyn Get, provider: &dyn Provider, id: u64) -> Result<Post> {
-    let bytes = fetch.get(&provider.api_url(id)).await?;
+    let bytes = fetch_from(fetch, provider, &provider.api_url(id)).await?;
     let mut post = provider.parse(&bytes)?;
     if let Some(url) = provider.pages_url(id) {
-        let pages = fetch.get(&url).await?;
+        let pages = fetch_from(fetch, provider, &url).await?;
         post.images = provider.parse_pages(&pages)?;
     }
     Ok(vetted(post, provider))
+}
+
+/// The body of `url`, sent with the headers the site needs for it.
+async fn fetch_from(fetch: &dyn Get, provider: &dyn Provider, url: &str) -> Result<Vec<u8>> {
+    let headers = provider.request_headers(url);
+    let pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    fetch.get_with_headers(url, &pairs).await
 }
 
 /// The post with only the files that the site's hosts allow, in it and in the post it quotes.
@@ -823,9 +833,12 @@ async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
     Ok(())
 }
 
-/// The sites whose posts are expanded, as the server has them.
-pub(crate) fn default_providers() -> Vec<Arc<dyn Provider>> {
-    vec![Arc::new(XProvider), Arc::new(PixivProvider)]
+/// The sites whose posts are expanded, as the server has them; Pixiv gets the operator's session.
+pub(crate) fn default_providers(pixiv_session: Option<ApiKey>) -> Vec<Arc<dyn Provider>> {
+    vec![
+        Arc::new(XProvider),
+        Arc::new(PixivProvider::new(pixiv_session)),
+    ]
 }
 
 /// The module, with the network it reaches the services through.
@@ -835,7 +848,7 @@ pub fn builder_with(
     fetch: Arc<dyn Http>,
     translator: Arc<Translator>,
 ) -> Result<ModuleBuilder, CoreError> {
-    builder_with_sites(fetch, translator, default_providers())
+    builder_with_sites(fetch, translator, default_providers(None))
 }
 
 /// The module, with the network it reaches the services through and the sites whose posts it expands.
@@ -921,14 +934,23 @@ pub(crate) fn builder_with_sites(
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {
-    module_with(Arc::new(Translator::free()))
+    module_with(Arc::new(Translator::free()), None)
 }
 
-/// The module, translating with `translator`.
+/// The module, translating with `translator`, and reading the adult artworks of Pixiv with
+/// `pixiv_session` when it is given.
 /// # Errors
 /// The module declaration is refused by the SDK.
-pub fn module_with(translator: Arc<Translator>) -> Result<SdkModule, CoreError> {
-    builder_with(Arc::new(Fetcher::new()), translator)?.build()
+pub fn module_with(
+    translator: Arc<Translator>,
+    pixiv_session: Option<ApiKey>,
+) -> Result<SdkModule, CoreError> {
+    builder_with_sites(
+        Arc::new(Fetcher::new()),
+        translator,
+        default_providers(pixiv_session),
+    )?
+    .build()
 }
 
 #[cfg(test)]

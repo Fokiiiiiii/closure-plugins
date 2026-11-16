@@ -20,8 +20,9 @@ use crate::builder_with;
 use crate::builder_with_sites;
 use crate::links::{MAX_PER_MESSAGE, PostLink};
 use crate::model::Post;
+use crate::pixiv::PixivProvider;
 use crate::pixiv::fixtures::{
-    ERROR_103, INFO_101, INFO_102, INFO_104, PAGES_101, PAGES_102, PAGES_104,
+    ERROR_103, INFO_101, INFO_102, INFO_104, NULL_URLS_105, PAGES_101, PAGES_102, PAGES_104,
 };
 use crate::provider::Provider;
 use serde::Deserialize;
@@ -175,7 +176,16 @@ fn gemini_translator() -> Translator {
 }
 
 fn harness_with(service: Arc<dyn Http>, translator: Translator) -> Harness {
-    let harness = Harness::new(builder_with(service, Arc::new(translator)).unwrap()).unwrap();
+    harness_of(builder_with(service, Arc::new(translator)).unwrap())
+}
+
+/// The module with `providers` in place of the default sites, its network being `service`.
+fn harness_with_sites(service: Arc<dyn Http>, providers: Vec<Arc<dyn Provider>>) -> Harness {
+    harness_of(builder_with_sites(service, Arc::new(Translator::free()), providers).unwrap())
+}
+
+fn harness_of(builder: closure_sdk::ModuleBuilder) -> Harness {
+    let harness = Harness::new(builder).unwrap();
     let guild: GuildId = Id::new(GUILD);
     harness.api().set_channels(
         guild,
@@ -1508,4 +1518,155 @@ async fn the_other_forms_of_a_pixiv_link_are_expanded_and_the_switch_turns_them_
     harness.set_config(json!({"pixiv_links": false}));
     say(&harness, "https://www.pixiv.net/artworks/101").await;
     assert_eq!(posted(&harness).len(), 1, "the switch is off: nothing new");
+}
+
+/// The session cookie the tests of the operator's session use.
+const SESSION: &str = "PHPSESSID=1_session7";
+
+/// Pixiv as a visitor with the session sees it: the adult artwork 102 is answered only with the
+/// cookie, and artwork 105 is answered without its pictures. It records the cookie of each JSON
+/// request, and the address of each picture.
+struct SessionService {
+    cookies: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    pictures: std::sync::Mutex<Vec<String>>,
+}
+
+fn session_body(url: &str, cookie: Option<&str>) -> Option<&'static str> {
+    let path = url.strip_prefix("https://www.pixiv.net/ajax/illust/")?;
+    let signed_in = cookie == Some(SESSION);
+    Some(match path {
+        "101?lang=ja" => INFO_101,
+        "101/pages?lang=ja" => PAGES_101,
+        "102?lang=ja" if signed_in => INFO_102,
+        "102/pages?lang=ja" if signed_in => PAGES_102,
+        "105?lang=ja" => NULL_URLS_105,
+        "102?lang=ja" | "102/pages?lang=ja" => ERROR_103,
+        _ => return None,
+    })
+}
+
+#[async_trait]
+impl Get for SessionService {
+    async fn get(&self, url: &str) -> Result<Vec<u8>> {
+        self.get_with_headers(url, &[]).await
+    }
+
+    async fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>> {
+        let cookie = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            .map(|(_, value)| (*value).to_owned());
+        self.cookies
+            .lock()
+            .unwrap()
+            .push((url.to_owned(), cookie.clone()));
+        match session_body(url, cookie.as_deref()) {
+            Some(body) => Ok(body.as_bytes().to_vec()),
+            None => bail!("down"),
+        }
+    }
+
+    async fn get_media(&self, url: &str, _max: usize, _referer: Option<&str>) -> Result<Vec<u8>> {
+        self.pictures.lock().unwrap().push(url.to_owned());
+        Ok(b"picture".to_vec())
+    }
+}
+
+#[async_trait]
+impl plugin_kit::net::Post for SessionService {
+    async fn post_json(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+        _body: &serde_json::Value,
+    ) -> Result<Vec<u8>> {
+        bail!("the test service has no POST")
+    }
+}
+
+fn session_service() -> Arc<SessionService> {
+    Arc::new(SessionService {
+        cookies: std::sync::Mutex::new(Vec::new()),
+        pictures: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+fn session_providers(session: Option<&str>) -> Vec<Arc<dyn Provider>> {
+    vec![Arc::new(PixivProvider::new(
+        session.map(|value| ApiKey::new(value)),
+    ))]
+}
+
+/// Posts `content` from a channel for adults, the only one where an adult artwork is expanded.
+async fn say_in_adult_channel(harness: &Harness, content: &str) {
+    let adult: Channel = serde_json::from_value(json!({
+        "id": "10", "type": 0, "guild_id": GUILD.to_string(), "name": "adults",
+        "nsfw": true, "permission_overwrites": [],
+    }))
+    .unwrap();
+    harness
+        .api()
+        .set_channels(Id::new(GUILD), vec![channel(7, &json!([])), adult]);
+    harness
+        .message(Message::new(50, 10).content(content))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_session_cookie_goes_to_the_pixiv_json_and_no_picture_gets_it() {
+    let service = session_service();
+    let harness = harness_with_sites(service.clone(), session_providers(Some("1_session7")));
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://www.pixiv.net/artworks/101").await;
+    assert_eq!(posted(&harness)[0].files, ["photo-1.png", "photo-2.png"]);
+    let cookies = service.cookies.lock().unwrap().clone();
+    assert_eq!(cookies.len(), 2, "the artwork and its pages");
+    assert!(
+        cookies.iter().all(|(url, cookie)| {
+            url.starts_with("https://www.pixiv.net/ajax/") && cookie.as_deref() == Some(SESSION)
+        }),
+        "the session goes to the pixiv JSON only"
+    );
+    let pictures = service.pictures.lock().unwrap().clone();
+    assert_eq!(pictures.len(), 2);
+    assert!(
+        pictures
+            .iter()
+            .all(|url| url.starts_with("https://i.pximg.net/"))
+    );
+}
+
+#[tokio::test]
+async fn without_a_session_no_cookie_is_sent_and_an_adult_artwork_is_not_expanded() {
+    let service = session_service();
+    let harness = harness_with_sites(service.clone(), session_providers(None));
+    harness.set_config(json!({"auto_translate": false}));
+    say_in_adult_channel(&harness, "https://www.pixiv.net/artworks/102").await;
+    assert!(posted(&harness).is_empty());
+    let cookies = service.cookies.lock().unwrap().clone();
+    assert!(!cookies.is_empty());
+    assert!(cookies.iter().all(|(_, cookie)| cookie.is_none()));
+}
+
+#[tokio::test]
+async fn an_adult_artwork_is_expanded_with_the_session_only_in_an_adult_channel() {
+    let harness = harness_with_sites(session_service(), session_providers(Some("1_session7")));
+    harness.set_config(json!({"auto_translate": false}));
+    say(&harness, "https://www.pixiv.net/artworks/102").await;
+    assert!(
+        posted(&harness).is_empty(),
+        "not in a channel for everybody"
+    );
+    say_in_adult_channel(&harness, "https://www.pixiv.net/artworks/102").await;
+    assert_eq!(posted(&harness).len(), 1);
+}
+
+#[tokio::test]
+async fn an_artwork_answered_without_its_pictures_is_left_alone_and_does_not_panic() {
+    let harness = harness_with_sites(session_service(), session_providers(Some("1_session7")));
+    harness.set_config(json!({"auto_translate": false}));
+    say_in_adult_channel(&harness, "https://www.pixiv.net/artworks/105").await;
+    assert!(posted(&harness).is_empty());
+    assert!(!hid_the_original(&harness));
 }
