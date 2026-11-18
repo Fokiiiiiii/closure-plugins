@@ -10,7 +10,7 @@ use closure_core::action::{Action, MentionPolicy};
 use closure_core::error::DiscordError;
 use closure_sdk::testing::{Harness, Invocation};
 use closure_sdk::{CommandOptionValue, Level};
-use plugin_kit::net::{Get, Http, Post};
+use plugin_kit::net::{Get, Post};
 use twilight_model::channel::Channel;
 use twilight_model::guild::Permissions;
 use twilight_model::id::Id;
@@ -98,8 +98,7 @@ fn feeds(fake: &Arc<Fake>) -> Arc<Feeds> {
 }
 
 fn feeds_with(fake: &Arc<Fake>, settings: FeedSettings) -> Arc<Feeds> {
-    let http: Arc<dyn Http> = Arc::clone(fake);
-    Feeds::new(http, settings, None)
+    Feeds::new(Arc::clone(fake), settings, None)
 }
 
 fn channel_json() -> Channel {
