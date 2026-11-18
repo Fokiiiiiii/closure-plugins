@@ -1,10 +1,10 @@
 //! How each kind of feed is read: where it is, what its target is, and the items it has now.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use plugin_kit::net::Get;
 
 use crate::model::Kind;
-use crate::{rss, youtube};
+use crate::{rss, twitch, youtube};
 
 /// One thing a feed has: what is posted for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,18 +21,20 @@ pub enum Source {
     Reddit,
     /// X and Pixiv, read through the `RSSHub` the operator runs: the kind and that address.
     RssHub(Kind, String),
+    /// Twitch, read through the Helix API with the operator's app credentials.
+    Twitch,
 }
 
 impl Source {
-    /// The source that reads `kind` here; none when the kind is not supported, or when it needs an
-    /// `RSSHub` and none is set.
+    /// The source that reads `kind` here; none when the kind is not supported, when it needs an
+    /// `RSSHub` and none is set, or when it is Twitch and `twitch_ready` is false.
     #[must_use]
-    pub fn of(kind: Kind, rsshub: Option<&str>) -> Option<Self> {
+    pub fn of(kind: Kind, rsshub: Option<&str>, twitch_ready: bool) -> Option<Self> {
         match kind {
             Kind::YouTube => Some(Self::YouTube),
             Kind::Reddit => Some(Self::Reddit),
             Kind::X | Kind::Pixiv => rsshub.map(|base| Self::RssHub(kind, base.to_owned())),
-            Kind::Twitch => None,
+            Kind::Twitch => twitch_ready.then_some(Self::Twitch),
         }
     }
 
@@ -44,6 +46,7 @@ impl Source {
             Self::Reddit => reddit_name(text),
             Self::RssHub(Kind::Pixiv, _) => pixiv_id(text),
             Self::RssHub(_, _) => x_handle(text),
+            Self::Twitch => twitch_login(text),
         }
     }
 
@@ -55,6 +58,7 @@ impl Source {
             Self::Reddit => format!("https://www.reddit.com/r/{target}/new/.rss"),
             Self::RssHub(Kind::Pixiv, base) => format!("{base}/pixiv/user/{target}"),
             Self::RssHub(_, base) => format!("{base}/twitter/user/{target}"),
+            Self::Twitch => twitch::streams_url(target),
         }
     }
 
@@ -67,6 +71,7 @@ impl Source {
         match self {
             Self::YouTube => youtube::parse_feed(&body),
             Self::Reddit | Self::RssHub(..) => rss::parse(&body),
+            Self::Twitch => bail!("a Twitch feed is read with its credentials"),
         }
     }
 }
@@ -89,6 +94,21 @@ pub fn rsshub_base(setting: Option<&str>) -> Option<String> {
         "rsshub_base_url is not an https address; the X and Pixiv feeds stay unsupported"
     );
     None
+}
+
+/// The Twitch login a moderator typed (`name` or a twitch.tv link), in lower case.
+fn twitch_login(text: &str) -> Option<String> {
+    let text = text.trim();
+    let name = if let Some(link) = text.strip_prefix("https://") {
+        let host = link.strip_prefix("www.").unwrap_or(link);
+        host.strip_prefix("twitch.tv/")?
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+    } else {
+        text
+    };
+    is_word(name, 4, 25).then(|| name.to_ascii_lowercase())
 }
 
 /// Letters, digits and `_`, `min` to `max` bytes long.
@@ -213,16 +233,35 @@ mod tests {
     }
 
     #[test]
-    fn x_and_pixiv_need_rsshub_and_twitch_is_never_supported() {
+    fn x_and_pixiv_need_rsshub_and_twitch_needs_its_credentials() {
         let host = "https://rsshub.example.org";
-        assert_eq!(Source::of(Kind::X, None), None);
-        assert_eq!(Source::of(Kind::Pixiv, None), None);
-        assert_eq!(Source::of(Kind::Twitch, Some(host)), None);
+        assert_eq!(Source::of(Kind::X, None, false), None);
+        assert_eq!(Source::of(Kind::Pixiv, None, false), None);
+        assert_eq!(Source::of(Kind::Twitch, Some(host), false), None);
+        assert_eq!(Source::of(Kind::Twitch, None, true), Some(Source::Twitch));
         assert_eq!(
-            Source::of(Kind::X, Some(host)),
+            Source::of(Kind::X, Some(host), false),
             Some(Source::RssHub(Kind::X, host.to_owned()))
         );
-        assert_eq!(Source::of(Kind::Reddit, None), Some(Source::Reddit));
+        assert_eq!(Source::of(Kind::Reddit, None, false), Some(Source::Reddit));
+    }
+
+    #[test]
+    fn a_twitch_login_is_read_from_its_name_or_link_in_lower_case() {
+        assert_eq!(twitch_login("Some_One1").as_deref(), Some("some_one1"));
+        assert_eq!(twitch_login(" someone ").as_deref(), Some("someone"));
+        assert_eq!(
+            twitch_login("https://www.twitch.tv/Someone/videos").as_deref(),
+            Some("someone")
+        );
+        assert_eq!(
+            twitch_login("https://twitch.tv/someone?x=1").as_deref(),
+            Some("someone")
+        );
+        assert_eq!(twitch_login("abc"), None);
+        assert_eq!(twitch_login("this_name_is_far_too_long_x"), None);
+        assert_eq!(twitch_login("bad-name"), None);
+        assert_eq!(twitch_login("https://example.org/someone"), None);
     }
 
     #[test]

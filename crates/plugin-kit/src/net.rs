@@ -22,8 +22,9 @@ const MAX_BYTES: usize = 256 * 1024;
 const LARGE_TIMEOUT: Duration = Duration::from_secs(20);
 const AGENT: &str = "closure-plugins (https://github.com/Fokiiiiiii/closure-plugins)";
 /// The only headers a service is sent on request: a session cookie, for the services that need one,
-/// and the user agent that a site's embed fixer answers a crawler with.
-const FORWARDED_HEADERS: &[&str] = &["cookie", "user-agent"];
+/// the user agent that a site's embed fixer answers a crawler with, and the bearer token and client
+/// id of the Twitch app. A caller sends those only to its own service.
+const FORWARDED_HEADERS: &[&str] = &["cookie", "user-agent", "authorization", "client-id"];
 
 /// Where the module reads a page from; a test puts its own in place of the network.
 #[async_trait]

@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use plugin_kit::net::Get;
+use plugin_kit::net::Http;
 
 use crate::FeedSettings;
 use crate::model::Kind;
 use crate::source::{Item, Source, rsshub_base};
+use crate::twitch::{Twitch, TwitchCredentials};
 
 /// The shortest interval between two looks, whatever the operator sets.
 const MIN_INTERVAL_SECS: u64 = 60;
@@ -52,10 +53,12 @@ type Cache = HashMap<(Kind, String), (i64, Vec<Item>)>;
 
 /// The network the feeds are read through, and what was read recently.
 pub struct Feeds {
-    get: Arc<dyn Get>,
+    http: Arc<dyn Http>,
     settings: FeedSettings,
     /// The validated `RSSHub` address, when one is set.
     rsshub: Option<String>,
+    /// The Twitch app, when the operator set one up.
+    twitch: Option<Twitch>,
     /// What was read, and when. Kept for half an interval; one entry per feed watched.
     cache: Mutex<Cache>,
     bucket: Mutex<Bucket>,
@@ -71,12 +74,17 @@ impl std::fmt::Debug for Feeds {
 
 impl Feeds {
     #[must_use]
-    pub fn new(get: Arc<dyn Get>, settings: FeedSettings) -> Arc<Self> {
+    pub fn new(
+        http: Arc<dyn Http>,
+        settings: FeedSettings,
+        twitch: Option<TwitchCredentials>,
+    ) -> Arc<Self> {
         let rsshub = rsshub_base(settings.rsshub_base_url.as_deref());
         Arc::new(Self {
-            get,
+            http,
             settings,
             rsshub,
+            twitch: twitch.map(Twitch::new),
             cache: Mutex::new(HashMap::new()),
             bucket: Mutex::new(Bucket {
                 tokens: READS_PER_SECOND,
@@ -104,7 +112,7 @@ impl Feeds {
     /// The source that reads a kind of feed here; none when the kind is not supported.
     #[must_use]
     pub fn source(&self, kind: Kind) -> Option<Source> {
-        Source::of(kind, self.rsshub.as_deref())
+        Source::of(kind, self.rsshub.as_deref(), self.twitch.is_some())
     }
 
     /// The items of a feed, newest first, read now unless it was read lately.
@@ -130,10 +138,11 @@ impl Feeds {
         if !lock(&self.bucket).take(now) {
             return Err(FetchError::Throttled);
         }
-        let items = source
-            .read(&*self.get, target)
-            .await
-            .map_err(|error| FetchError::Failed(format!("{error:#}")))?;
+        let read = match (&source, &self.twitch) {
+            (Source::Twitch, Some(twitch)) => twitch.read(&*self.http, now, target).await,
+            _ => source.read(&*self.http, target).await,
+        };
+        let items = read.map_err(|error| FetchError::Failed(format!("{error:#}")))?;
         lock(&self.cache).insert(key, (now, items.clone()));
         Ok(items)
     }
@@ -144,7 +153,7 @@ fn fresh(cache: &Cache, key: &(Kind, String), now: i64, fresh_for: i64) -> Optio
     (now.saturating_sub(*read_at) < fresh_for).then(|| items.clone())
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic while a lock is held leaves plain data behind; it is still good to read.
     mutex
         .lock()

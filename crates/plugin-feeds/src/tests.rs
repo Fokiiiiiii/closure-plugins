@@ -10,7 +10,7 @@ use closure_core::action::{Action, MentionPolicy};
 use closure_core::error::DiscordError;
 use closure_sdk::testing::{Harness, Invocation};
 use closure_sdk::{CommandOptionValue, Level};
-use plugin_kit::net::Get;
+use plugin_kit::net::{Get, Http, Post};
 use twilight_model::channel::Channel;
 use twilight_model::guild::Permissions;
 use twilight_model::id::Id;
@@ -46,6 +46,18 @@ impl Fake {
 
     fn urls(&self) -> Vec<String> {
         self.urls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Post for Fake {
+    async fn post_json(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+        _body: &serde_json::Value,
+    ) -> anyhow::Result<Vec<u8>> {
+        bail!("the feed test does not post")
     }
 }
 
@@ -86,8 +98,8 @@ fn feeds(fake: &Arc<Fake>) -> Arc<Feeds> {
 }
 
 fn feeds_with(fake: &Arc<Fake>, settings: FeedSettings) -> Arc<Feeds> {
-    let get: Arc<dyn Get> = Arc::clone(fake) as Arc<dyn Get>;
-    Feeds::new(get, settings)
+    let http: Arc<dyn Http> = Arc::clone(fake);
+    Feeds::new(http, settings, None)
 }
 
 fn channel_json() -> Channel {
@@ -424,6 +436,14 @@ async fn the_mention_is_the_chosen_role_only() {
         panic!("only the role may be mentioned: {sent:?}");
     };
     assert_eq!(roles, &vec![Id::new(WATCH_ROLE)]);
+}
+
+#[tokio::test]
+async fn twitch_is_refused_without_its_credentials() {
+    let fake = fake(&["v1"]);
+    let harness = harness(&feeds(&fake));
+    let _ = harness.invoke(add_kind("twitch", "someone")).await;
+    assert!(subscriptions(&harness).await.is_empty());
 }
 
 #[tokio::test]

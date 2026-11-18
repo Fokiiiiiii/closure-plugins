@@ -12,6 +12,7 @@ pub mod poll;
 pub mod post;
 pub mod rss;
 pub mod source;
+pub mod twitch;
 pub mod youtube;
 
 #[cfg(test)]
@@ -27,6 +28,7 @@ use plugin_kit::net::Fetcher;
 use crate::commands::{Add, Of};
 use crate::feeds::Feeds;
 use crate::poll::POLL;
+use crate::twitch::TwitchCredentials;
 
 const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
@@ -97,15 +99,19 @@ pub fn builder_with(feeds: &Arc<Feeds>) -> Result<ModuleBuilder, CoreError> {
     )
 }
 
+/// The Twitch app is set only when both its client id and its secret are given.
 /// # Errors
 /// The module declaration is refused by the SDK.
-pub fn module_with(settings: FeedSettings) -> Result<SdkModule, CoreError> {
-    builder_with(&Feeds::new(Arc::new(Fetcher::new()), settings))?.build()
+pub fn module_with(
+    settings: FeedSettings,
+    twitch: Option<TwitchCredentials>,
+) -> Result<SdkModule, CoreError> {
+    builder_with(&Feeds::new(Arc::new(Fetcher::new()), settings, twitch))?.build()
 }
 
 /// The module with the default settings.
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {
-    module_with(FeedSettings::default())
+    module_with(FeedSettings::default(), None)
 }

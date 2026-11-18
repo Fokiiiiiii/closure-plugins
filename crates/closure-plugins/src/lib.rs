@@ -38,7 +38,10 @@ pub fn modules_with(settings: &OperatorSettings) -> Result<Vec<Arc<dyn Module>>>
         Arc::new(plugin_translate::module_with(translator)?),
         Arc::new(plugin_giveaway::module()?),
         Arc::new(plugin_tickets::module()?),
-        Arc::new(plugin_feeds::module_with(feed_settings(settings))?),
+        Arc::new(plugin_feeds::module_with(
+            feed_settings(settings),
+            twitch_credentials(settings),
+        )?),
     ])
 }
 
@@ -52,6 +55,32 @@ fn linkexpand_settings(settings: &OperatorSettings) -> plugin_linkexpand::Linkex
             None
         })
         .unwrap_or_default()
+}
+
+/// The Twitch app of the operator's secrets. Both the client id and the secret are needed; one of
+/// them alone is logged without its value, and Twitch feeds stay unsupported.
+fn twitch_credentials(
+    settings: &OperatorSettings,
+) -> Option<plugin_feeds::twitch::TwitchCredentials> {
+    let client_id = settings
+        .secret("twitch_client_id")
+        .map(plugin_kit::translator::ApiKey::from_secret);
+    let client_secret = settings
+        .secret("twitch_client_secret")
+        .map(plugin_kit::translator::ApiKey::from_secret);
+    match (client_id, client_secret) {
+        (Some(client_id), Some(client_secret)) => Some(plugin_feeds::twitch::TwitchCredentials {
+            client_id,
+            client_secret,
+        }),
+        (None, None) => None,
+        _ => {
+            tracing::warn!(
+                "the Twitch settings need both twitch_client_id and twitch_client_secret; Twitch feeds stay unsupported"
+            );
+            None
+        }
+    }
 }
 
 /// The feeds section of the operator's file. A section that does not fit is logged without its
