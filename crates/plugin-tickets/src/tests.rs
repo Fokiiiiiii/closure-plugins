@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use chrono::{Datelike, Timelike, Utc};
-
 use closure_core::action::{Action, MentionPolicy, OverwriteTarget};
 use closure_core::event::{ChannelId, Event, GuildId, MessageId, UserInfo};
 use closure_core::storage::MAX_VALUE_BYTES;
@@ -41,6 +39,10 @@ const HERE: u64 = 5;
 const PANEL_STAFF_ROLE: u64 = 33;
 const OTHER_PANEL_STAFF_ROLE: u64 = 34;
 const PANEL_LOG: u64 = 9;
+
+fn utc_now() -> jiff::Zoned {
+    jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC)
+}
 
 fn harness() -> Harness {
     let harness = Harness::new(builder().unwrap()).unwrap();
@@ -2088,7 +2090,7 @@ async fn closed_hours_do_not_reserve_a_ticket_or_create_a_channel() {
     ];
     let harness = harness();
     let day =
-        WEEKDAYS[usize::try_from((Utc::now().weekday().num_days_from_monday() + 2) % 7).unwrap()];
+        WEEKDAYS[usize::try_from((utc_now().weekday().to_monday_zero_offset() + 2) % 7).unwrap()];
     harness.set_config(json!({
         "staff_roles": [STAFF_ROLE.to_string()],
         "timezone": "UTC",
@@ -2223,10 +2225,11 @@ async fn named_panel_hours_use_the_panel_timezone_override() {
         "sunday",
     ];
     let harness = harness();
-    let timezone: chrono_tz::Tz = "America/Los_Angeles".parse().unwrap();
-    let local = Utc::now().with_timezone(&timezone);
-    let minute = u16::try_from(local.hour() * 60 + local.minute()).unwrap();
-    let weekday = local.weekday().num_days_from_monday();
+    let timezone = jiff::tz::TimeZone::get("America/Los_Angeles").unwrap();
+    let local = utc_now().with_time_zone(timezone);
+    let minute =
+        u16::from(local.hour().unsigned_abs()) * 60 + u16::from(local.minute().unsigned_abs());
+    let weekday = local.weekday().to_monday_zero_offset();
     let (day, start_minute, end_minute) = if minute < 60 {
         ((weekday + 6) % 7, 1440 - (60 - minute), minute + 60)
     } else if minute >= 1380 {
@@ -4644,9 +4647,10 @@ async fn form_submission_after_hours_close_does_not_create_a_ticket() {
         "sunday",
     ];
     let harness = harness();
-    let now = Utc::now();
-    let day = WEEKDAYS[usize::try_from(now.weekday().num_days_from_monday()).unwrap()];
-    let current_minute = now.hour() * 60 + now.minute();
+    let now = utc_now();
+    let day = WEEKDAYS[usize::try_from(now.weekday().to_monday_zero_offset()).unwrap()];
+    let current_minute =
+        u32::from(now.hour().unsigned_abs()) * 60 + u32::from(now.minute().unsigned_abs());
     let end_minute = (current_minute + 2).min(1_440);
     let questions = vec!["What happened?".to_owned()];
     let config_json = json!({
@@ -4722,7 +4726,7 @@ async fn a_changed_hours_config_requires_a_new_form() {
     let shown = harness.click(press("open", MEMBER)).await.unwrap();
     assert_eq!(shown[0].kind, ReplyKind::Modal);
     let custom_id = form_submit_id("", MEMBER, &default_form_config(&questions));
-    let day = WEEKDAYS[usize::try_from(Utc::now().weekday().num_days_from_monday()).unwrap()];
+    let day = WEEKDAYS[usize::try_from(utc_now().weekday().to_monday_zero_offset()).unwrap()];
     harness.set_config(json!({
         "staff_roles": [STAFF_ROLE.to_string()],
         "questions": questions,

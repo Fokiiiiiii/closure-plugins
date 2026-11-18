@@ -11,8 +11,7 @@ repository.workspace = true
 [dependencies]
 closure-core.workspace = true
 closure-sdk.workspace = true
-chrono.workspace = true
-chrono-tz.workspace = true
+jiff.workspace = true
 plugin-kit.workspace = true
 unicode-normalization = "0.1.25"
 serde.workspace = true

@@ -1,5 +1,4 @@
-use chrono::{DateTime, Datelike, Timelike, Utc};
-use chrono_tz::Tz;
+use jiff::{Timestamp, tz::TimeZone};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -15,7 +14,7 @@ pub(crate) enum Weekday {
 }
 
 impl Weekday {
-    fn from_monday_index(index: u32) -> Result<Self, &'static str> {
+    fn from_monday_index(index: i8) -> Result<Self, &'static str> {
         match index {
             0 => Ok(Self::Monday),
             1 => Ok(Self::Tuesday),
@@ -126,7 +125,7 @@ pub(crate) fn is_open(
     for (index, interval) in days.iter().enumerate() {
         if let Some((start_minute, end_minute)) = interval {
             let weekday =
-                Weekday::from_monday_index(u32::try_from(index).map_err(|_| "invalid weekday")?)?;
+                Weekday::from_monday_index(i8::try_from(index).map_err(|_| "invalid weekday")?)?;
             windows.push(Window::new(weekday, *start_minute, *end_minute)?);
         }
     }
@@ -149,9 +148,12 @@ pub(crate) fn is_open_for_panel(
     windows: &[Window],
     unix_seconds: i64,
 ) -> Result<bool, &'static str> {
-    let timezone = timezone.parse::<Tz>().map_err(|_| "invalid timezone")?;
-    let utc =
-        DateTime::<Utc>::from_timestamp(unix_seconds, 0).ok_or("unix timestamp out of range")?;
+    // jiff matches zone names case-insensitively; the exact match keeps the old behavior
+    let zone = TimeZone::get(timezone)
+        .ok()
+        .filter(|zone| zone.iana_name() == Some(timezone))
+        .ok_or("invalid timezone")?;
+    let utc = Timestamp::from_second(unix_seconds).map_err(|_| "unix timestamp out of range")?;
     if !windows
         .iter()
         .any(|window| window.panel.as_deref() == panel)
@@ -159,10 +161,11 @@ pub(crate) fn is_open_for_panel(
         return Ok(true);
     }
 
-    let local = utc.with_timezone(&timezone);
-    let weekday = Weekday::from_monday_index(local.weekday().num_days_from_monday())?;
+    let local = utc.to_zoned(zone);
+    let weekday = Weekday::from_monday_index(local.weekday().to_monday_zero_offset())?;
     let previous_day = weekday.previous();
-    let minute = local.hour() * 60 + local.minute();
+    let minute =
+        u32::from(local.hour().unsigned_abs()) * 60 + u32::from(local.minute().unsigned_abs());
 
     Ok(windows.iter().any(|window| {
         if window.panel.as_deref() != panel {
@@ -187,9 +190,10 @@ mod tests {
     use super::*;
 
     fn seconds(value: &str) -> i64 {
-        DateTime::parse_from_rfc3339(value)
+        value
+            .parse::<Timestamp>()
             .expect("valid RFC 3339 test timestamp")
-            .timestamp()
+            .as_second()
     }
 
     fn schedule(day: usize, start: u16, end: u16) -> [Option<(u16, u16)>; 7] {
