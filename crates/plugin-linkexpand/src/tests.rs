@@ -916,14 +916,15 @@ impl Provider for Dummy {
             .filter_map(|id| id.parse().ok())
             .map(|id| PostLink {
                 user: "fake".into(),
+                path: String::new(),
                 id,
             })
             .take(MAX_PER_MESSAGE)
             .collect()
     }
 
-    fn api_url(&self, id: u64) -> String {
-        format!("https://api.fake.example/post/{id}")
+    fn api_url(&self, link: &PostLink) -> String {
+        format!("https://api.fake.example/post/{}", link.id)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Post> {
@@ -1667,4 +1668,49 @@ async fn an_artwork_answered_without_its_pictures_is_left_alone_and_does_not_pan
     say_in_adult_channel(&harness, "https://www.pixiv.net/artworks/105").await;
     assert!(posted(&harness).is_empty());
     assert!(!hid_the_original(&harness));
+}
+
+/// A Reddit post as its embed fixer answers a crawler: the tags of its page.
+const REDDIT_PAGE: &str = r#"<meta property="og:title" content="A post"><meta property="og:description" content="words &amp; more">"#;
+
+fn reddit_site(url: &str) -> Option<&'static str> {
+    if url.starts_with("https://fixer.example/r/rust/comments/abc123") {
+        Some(REDDIT_PAGE)
+    } else {
+        None
+    }
+}
+
+fn reddit_providers() -> Vec<Arc<dyn Provider>> {
+    let proxies =
+        std::collections::BTreeMap::from([("reddit".to_owned(), "fixer.example".to_owned())]);
+    crate::opengraph::providers(&proxies)
+}
+
+#[tokio::test]
+async fn a_reddit_post_is_marked_for_adults_so_it_is_expanded_only_in_an_adult_channel() {
+    let plain = harness_with_sites(Arc::new(Fake(reddit_site)), reddit_providers());
+    plain.api().add_channel(Id::new(5), Some(Id::new(GUILD)));
+    plain
+        .message(Message::new(50, 5).content("https://reddit.com/r/rust/comments/abc123/"))
+        .await
+        .unwrap();
+    assert!(posted(&plain).is_empty());
+
+    let harness = harness_with_sites(Arc::new(Fake(reddit_site)), reddit_providers());
+    let adult: Channel = serde_json::from_value(json!({
+        "id": "10", "type": 0, "guild_id": GUILD.to_string(), "name": "adults",
+        "nsfw": true, "permission_overwrites": [],
+    }))
+    .unwrap();
+    harness
+        .api()
+        .set_channels(Id::new(GUILD), vec![channel(7, &json!([])), adult]);
+    harness
+        .message(Message::new(50, 10).content("https://reddit.com/r/rust/comments/abc123/"))
+        .await
+        .unwrap();
+    let all = posted(&harness);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].embeds, 1);
 }

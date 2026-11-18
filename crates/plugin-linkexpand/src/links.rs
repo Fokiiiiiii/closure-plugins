@@ -30,6 +30,8 @@ pub struct MessageLink {
 pub struct PostLink {
     pub user: String,
     pub id: u64,
+    /// For a site whose posts have no id: the path that the link names.
+    pub path: String,
 }
 
 fn wrapped(captures: &Captures<'_>) -> bool {

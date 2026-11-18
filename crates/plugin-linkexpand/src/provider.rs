@@ -16,8 +16,20 @@ pub(crate) trait Provider: Send + Sync {
     /// The posts linked in `text`, at most `MAX_PER_MESSAGE` of them.
     fn detect(&self, text: &str) -> Vec<PostLink>;
 
-    /// The address the service answers for the post `id` from.
-    fn api_url(&self, id: u64) -> String;
+    /// The address the service answers for the post the link names.
+    fn api_url(&self, link: &PostLink) -> String;
+
+    /// The address the post is shown at, when the service's answer does not name it. The author is
+    /// shown at the same address.
+    fn post_url(&self, _link: &PostLink) -> Option<String> {
+        None
+    }
+
+    /// Whether the translate button is shown under the posts of the site: the button reads a post by
+    /// its X id.
+    fn translatable(&self) -> bool {
+        true
+    }
 
     /// The post in the service's answer.
     ///

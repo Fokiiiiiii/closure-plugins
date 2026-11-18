@@ -41,8 +41,8 @@ impl Provider for XProvider {
         post_links(text)
     }
 
-    fn api_url(&self, id: u64) -> String {
-        format!("https://api.fxtwitter.com/status/{id}")
+    fn api_url(&self, link: &PostLink) -> String {
+        format!("https://api.fxtwitter.com/status/{}", link.id)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Post> {
@@ -209,6 +209,7 @@ pub fn post_links(text: &str) -> Vec<PostLink> {
         let id = captures["id"].parse::<u64>().ok().filter(|id| *id > 0)?;
         Some(PostLink {
             user: captures["user"].to_owned(),
+            path: String::new(),
             id,
         })
     })

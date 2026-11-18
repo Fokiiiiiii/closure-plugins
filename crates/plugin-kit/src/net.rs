@@ -21,8 +21,9 @@ const MAX_BYTES: usize = 256 * 1024;
 /// How long a picture or a video may take.
 const LARGE_TIMEOUT: Duration = Duration::from_secs(20);
 const AGENT: &str = "closure-plugins (https://github.com/Fokiiiiiii/closure-plugins)";
-/// The only headers a service is sent on request: a session cookie, for the services that need one.
-const FORWARDED_HEADERS: &[&str] = &["cookie"];
+/// The only headers a service is sent on request: a session cookie, for the services that need one,
+/// and the user agent that a site's embed fixer answers a crawler with.
+const FORWARDED_HEADERS: &[&str] = &["cookie", "user-agent"];
 
 /// Where the module reads a page from; a test puts its own in place of the network.
 #[async_trait]
@@ -208,9 +209,13 @@ impl Fetcher {
         referer: Option<&str>,
         headers: &[(&str, &str)],
     ) -> Result<Vec<u8>> {
-        let mut builder = hyper::Request::get(url)
-            .header("user-agent", AGENT)
-            .header("accept", "*/*");
+        let agent_given = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"));
+        let mut builder = hyper::Request::get(url).header("accept", "*/*");
+        if !agent_given {
+            builder = builder.header("user-agent", AGENT);
+        }
         if let Some(referer) = referer {
             builder = builder.header("referer", referer);
         }

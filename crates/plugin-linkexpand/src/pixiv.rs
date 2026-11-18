@@ -68,8 +68,8 @@ impl Provider for PixivProvider {
         post_links(text)
     }
 
-    fn api_url(&self, id: u64) -> String {
-        format!("https://www.pixiv.net/ajax/illust/{id}?lang=ja")
+    fn api_url(&self, link: &PostLink) -> String {
+        format!("https://www.pixiv.net/ajax/illust/{}?lang=ja", link.id)
     }
 
     fn pages_url(&self, id: u64) -> Option<String> {
@@ -111,6 +111,7 @@ pub fn post_links(text: &str) -> Vec<PostLink> {
         let id = captures["id"].parse::<u64>().ok().filter(|id| *id > 0)?;
         Some(PostLink {
             user: String::new(),
+            path: String::new(),
             id,
         })
     })

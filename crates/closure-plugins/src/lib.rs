@@ -23,6 +23,7 @@ pub fn modules() -> Result<Vec<Arc<dyn Module>>> {
 /// A module declaration is refused by the SDK.
 pub fn modules_with(settings: &OperatorSettings) -> Result<Vec<Arc<dyn Module>>> {
     let translator = Arc::new(plugin_kit::translator::from_settings(settings));
+    let linkexpand = linkexpand_settings(settings);
     let pixiv_session = settings
         .secret("pixiv_session")
         .map(plugin_kit::translator::ApiKey::from_secret);
@@ -30,6 +31,7 @@ pub fn modules_with(settings: &OperatorSettings) -> Result<Vec<Arc<dyn Module>>>
         Arc::new(plugin_linkexpand::module_with(
             Arc::clone(&translator),
             pixiv_session,
+            &linkexpand.proxies,
         )?),
         Arc::new(plugin_starboard::module()?),
         Arc::new(plugin_leveling::module()?),
@@ -38,6 +40,18 @@ pub fn modules_with(settings: &OperatorSettings) -> Result<Vec<Arc<dyn Module>>>
         Arc::new(plugin_tickets::module()?),
         Arc::new(plugin_feeds::module_with(feed_settings(settings))?),
     ])
+}
+
+/// The linkexpand section of the operator's file. A section that does not fit is logged without its
+/// values, and the defaults are used.
+fn linkexpand_settings(settings: &OperatorSettings) -> plugin_linkexpand::LinkexpandSettings {
+    settings
+        .plugin_section::<plugin_linkexpand::LinkexpandSettings>("linkexpand")
+        .unwrap_or_else(|_| {
+            tracing::warn!("the linkexpand settings do not fit; using the defaults");
+            None
+        })
+        .unwrap_or_default()
 }
 
 /// The feeds section of the operator's file. A section that does not fit is logged without its
@@ -98,6 +112,28 @@ mod tests {
                 plugin_feeds::FeedSettings::default()
             );
         }
+    }
+
+    #[test]
+    fn the_linkexpand_proxies_are_read_from_the_yaml_file() {
+        let yaml =
+            "plugins:\n  linkexpand:\n    proxies:\n      instagram: ddinstagram.example.org\n";
+        let proxies = linkexpand_settings(&settings("proxies", yaml)).proxies;
+        assert_eq!(
+            proxies.get("instagram").map(String::as_str),
+            Some("ddinstagram.example.org")
+        );
+        assert!(!proxies.contains_key("reddit"));
+    }
+
+    #[test]
+    fn a_linkexpand_section_that_does_not_fit_falls_back_to_the_defaults() {
+        let yaml = "plugins:\n  linkexpand:\n    proxies: nope\n";
+        assert!(
+            linkexpand_settings(&settings("linkmisfit", yaml))
+                .proxies
+                .is_empty()
+        );
     }
 
     #[test]

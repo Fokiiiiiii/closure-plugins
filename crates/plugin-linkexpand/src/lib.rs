@@ -2,17 +2,20 @@
 //!
 //! A link to a message of the same server is answered with a quote, only when its author may read that channel.
 //! A link to a post on X is answered with its text and pictures, through the `FxTwitter` service.
+//! A link to a Reddit or Instagram post is answered through the embed fixer the operator names for it.
 //! A link written as `<https://...>` is left alone.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod links;
 mod model;
+mod opengraph;
 mod pixiv;
 mod provider;
 mod thread;
 mod x;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -38,7 +41,7 @@ use twilight_model::channel::{Channel, Message};
 use twilight_model::guild::Permissions;
 use twilight_util::permission_calculator::PermissionCalculator;
 
-use crate::links::MessageLink;
+use crate::links::{MessageLink, PostLink};
 use crate::model::Post;
 use crate::pixiv::PixivProvider;
 use crate::provider::Provider;
@@ -46,6 +49,14 @@ use crate::thread::{Labels, Thread, pieces};
 use crate::x::XProvider;
 
 pub use plugin_kit::net::{Budget, Fetcher, Get};
+
+/// The operator's settings for this module, from the `linkexpand` section of the file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LinkexpandSettings {
+    /// The host of the embed fixer for each site, by the site's key: `reddit` and `instagram`.
+    pub proxies: BTreeMap<String, String>,
+}
 
 const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
@@ -91,6 +102,8 @@ pub(crate) struct Config {
     quoted_post: bool,
     translate_button: bool,
     pixiv_links: bool,
+    reddit_links: bool,
+    instagram_links: bool,
     /// Hide the preview Discord made of the link, which the answer repeats.
     hide_original: bool,
     /// Add the post in the language of the server under it, when it is in another one.
@@ -107,6 +120,8 @@ impl Default for Config {
             quoted_post: true,
             translate_button: true,
             pixiv_links: true,
+            reddit_links: true,
+            instagram_links: true,
             hide_original: true,
             auto_translate: true,
             layout: Layout::Embeds,
@@ -247,7 +262,7 @@ async fn walk(
             if seen.contains(&id) || thread.ancestors.len() >= MAX_ANCESTORS {
                 break;
             }
-            let Ok(parent) = fetch_post(fetch, provider, id).await else {
+            let Ok(parent) = fetch_post(fetch, provider, &by_id(id)).await else {
                 break;
             };
             seen.push(id);
@@ -266,7 +281,7 @@ async fn walk(
             }
             seen.push(id);
             // The post whole, so that it has its counts; what the one before it holds will do.
-            let whole = match fetch_post(fetch, provider, id).await {
+            let whole = match fetch_post(fetch, provider, &by_id(id)).await {
                 Ok(whole) => whole,
                 Err(_) => match from.quote.as_deref() {
                     Some(inside) => inside.clone(),
@@ -280,14 +295,27 @@ async fn walk(
     thread
 }
 
-async fn fetch_post(fetch: &dyn Get, provider: &dyn Provider, id: u64) -> Result<Post> {
-    let bytes = fetch_from(fetch, provider, &provider.api_url(id)).await?;
+async fn fetch_post(fetch: &dyn Get, provider: &dyn Provider, link: &PostLink) -> Result<Post> {
+    let bytes = fetch_from(fetch, provider, &provider.api_url(link)).await?;
     let mut post = provider.parse(&bytes)?;
-    if let Some(url) = provider.pages_url(id) {
+    if let Some(url) = provider.post_url(link) {
+        post.author.profile.clone_from(&url);
+        post.url = url;
+    }
+    if let Some(url) = provider.pages_url(link.id) {
         let pages = fetch_from(fetch, provider, &url).await?;
         post.images = provider.parse_pages(&pages)?;
     }
     Ok(vetted(post, provider))
+}
+
+/// A link that names a post by its id, as X and Pixiv do.
+fn by_id(id: u64) -> PostLink {
+    PostLink {
+        user: String::new(),
+        id,
+        path: String::new(),
+    }
 }
 
 /// The body of `url`, sent with the headers the site needs for it.
@@ -567,6 +595,7 @@ async fn expand(
     }
     let mut adult: Option<bool> = None;
     let mut threads: Vec<Thread> = Vec::new();
+    let mut translate: Vec<u64> = Vec::new();
     let mut planned = units.len();
     for provider in providers
         .iter()
@@ -576,7 +605,7 @@ async fn expand(
             if planned >= cap {
                 break;
             }
-            let post = match fetch_post(http, provider.as_ref(), link.id).await {
+            let post = match fetch_post(http, provider.as_ref(), &link).await {
                 Ok(post) => post,
                 Err(error) => {
                     tracing::debug!(%error, "a post is not expanded");
@@ -607,6 +636,10 @@ async fn expand(
             // What does not fit goes, from the far ends: the post that was linked stays.
             thread.fit(cap - planned);
             planned += thread.size();
+            // The button translates what was linked, with what is around it as the click finds it.
+            if provider.translatable() && !translate.contains(&thread.post.id) {
+                translate.push(thread.post.id);
+            }
             threads.push(thread);
         }
     }
@@ -634,13 +667,6 @@ async fn expand(
     }
     if units.is_empty() {
         return Ok(Flow::Continue);
-    }
-    let mut translate: Vec<u64> = Vec::new();
-    // The button translates what was linked, with what is around it as the click finds it.
-    for thread in &threads {
-        if !translate.contains(&thread.post.id) {
-            translate.push(thread.post.id);
-        }
     }
     match config.layout {
         Layout::Chain => {
@@ -753,7 +779,7 @@ async fn translate_click(
     let work = async {
         let mut posts: Vec<Post> = Vec::new();
         for id in ids {
-            let Ok(tweet) = fetch_post(&budget, &XProvider, id).await else {
+            let Ok(tweet) = fetch_post(&budget, &XProvider, &by_id(id)).await else {
                 continue;
             };
             let thread = walk(&budget, &XProvider, tweet, true, true).await;
@@ -834,11 +860,16 @@ async fn delete_click(cx: ComponentCx) -> Result<(), UserError> {
 }
 
 /// The sites whose posts are expanded, as the server has them; Pixiv gets the operator's session.
-pub(crate) fn default_providers(pixiv_session: Option<ApiKey>) -> Vec<Arc<dyn Provider>> {
-    vec![
+pub(crate) fn default_providers(
+    pixiv_session: Option<ApiKey>,
+    proxies: &BTreeMap<String, String>,
+) -> Vec<Arc<dyn Provider>> {
+    let mut providers: Vec<Arc<dyn Provider>> = vec![
         Arc::new(XProvider),
         Arc::new(PixivProvider::new(pixiv_session)),
-    ]
+    ];
+    providers.extend(opengraph::providers(proxies));
+    providers
 }
 
 /// The module, with the network it reaches the services through.
@@ -848,7 +879,7 @@ pub fn builder_with(
     fetch: Arc<dyn Http>,
     translator: Arc<Translator>,
 ) -> Result<ModuleBuilder, CoreError> {
-    builder_with_sites(fetch, translator, default_providers(None))
+    builder_with_sites(fetch, translator, default_providers(None, &BTreeMap::new()))
 }
 
 /// The module, with the network it reaches the services through and the sites whose posts it expands.
@@ -873,6 +904,8 @@ pub(crate) fn builder_with_sites(
             "message_links": switch("message_links"),
             "x_links": switch("x_links"),
             "pixiv_links": switch("pixiv_links"),
+            "reddit_links": switch("reddit_links"),
+            "instagram_links": switch("instagram_links"),
             "replied_post": switch("replied_post"),
             "quoted_post": switch("quoted_post"),
             "translate_button": switch("translate_button"),
@@ -903,7 +936,7 @@ pub(crate) fn builder_with_sites(
                 json!({
                     "message_links": true, "x_links": true, "replied_post": true,
                     "quoted_post": true, "translate_button": true, "hide_original": true,
-                    "pixiv_links": true,
+                    "pixiv_links": true, "reddit_links": true, "instagram_links": true,
                     "auto_translate": true,
                     "layout": "embeds"
                 }),
@@ -934,21 +967,23 @@ pub(crate) fn builder_with_sites(
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module() -> Result<SdkModule, CoreError> {
-    module_with(Arc::new(Translator::free()), None)
+    module_with(Arc::new(Translator::free()), None, &BTreeMap::new())
 }
 
 /// The module, translating with `translator`, and reading the adult artworks of Pixiv with
-/// `pixiv_session` when it is given.
+/// `pixiv_session` when it is given, and Reddit and Instagram links through the embed fixers in
+/// `proxies`.
 /// # Errors
 /// The module declaration is refused by the SDK.
 pub fn module_with(
     translator: Arc<Translator>,
     pixiv_session: Option<ApiKey>,
+    proxies: &BTreeMap<String, String>,
 ) -> Result<SdkModule, CoreError> {
     builder_with_sites(
         Arc::new(Fetcher::new()),
         translator,
-        default_providers(pixiv_session),
+        default_providers(pixiv_session, proxies),
     )?
     .build()
 }
