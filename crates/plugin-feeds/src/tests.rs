@@ -98,7 +98,8 @@ fn feeds(fake: &Arc<Fake>) -> Arc<Feeds> {
 }
 
 fn feeds_with(fake: &Arc<Fake>, settings: FeedSettings) -> Arc<Feeds> {
-    Feeds::new(Arc::clone(fake), settings, None)
+    let http = Arc::clone(fake);
+    Feeds::new(http, settings, None)
 }
 
 fn channel_json() -> Channel {
