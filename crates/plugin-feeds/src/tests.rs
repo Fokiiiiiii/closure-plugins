@@ -32,6 +32,7 @@ struct Fake {
     body: Mutex<Vec<u8>>,
     reads: AtomicUsize,
     failing: AtomicBool,
+    urls: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -42,11 +43,16 @@ impl Fake {
     fn reads(&self) -> usize {
         self.reads.load(Ordering::Relaxed)
     }
+
+    fn urls(&self) -> Vec<String> {
+        self.urls.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl Get for Fake {
-    async fn get(&self, _url: &str) -> anyhow::Result<Vec<u8>> {
+    async fn get(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        self.urls.lock().unwrap().push(url.to_owned());
         self.reads.fetch_add(1, Ordering::Relaxed);
         if self.failing.load(Ordering::Relaxed) {
             bail!("the feed is down");
@@ -76,8 +82,12 @@ fn fake(ids: &[&str]) -> Arc<Fake> {
 }
 
 fn feeds(fake: &Arc<Fake>) -> Arc<Feeds> {
+    feeds_with(fake, FeedSettings::default())
+}
+
+fn feeds_with(fake: &Arc<Fake>, settings: FeedSettings) -> Arc<Feeds> {
     let get: Arc<dyn Get> = Arc::clone(fake) as Arc<dyn Get>;
-    Feeds::new(get, FeedSettings::default())
+    Feeds::new(get, settings)
 }
 
 fn channel_json() -> Channel {
@@ -115,9 +125,13 @@ fn url() -> String {
 }
 
 fn add(target: &str) -> Invocation {
+    add_kind("youtube", target)
+}
+
+fn add_kind(kind: &str, target: &str) -> Invocation {
     Invocation::new("feed")
         .subcommand("add")
-        .option("kind", text("youtube"))
+        .option("kind", text(kind))
         .option("target", text(target))
         .channel(CHANNEL)
         .roles([ADMIN_ROLE])
@@ -211,7 +225,7 @@ async fn only_a_moderator_adds_and_a_bad_target_or_kind_is_refused() {
         .invoke(
             Invocation::new("feed")
                 .subcommand("add")
-                .option("kind", text("reddit"))
+                .option("kind", text("twitch"))
                 .option("target", text("r/rust"))
                 .channel(CHANNEL)
                 .roles([ADMIN_ROLE]),
@@ -410,6 +424,44 @@ async fn the_mention_is_the_chosen_role_only() {
         panic!("only the role may be mentioned: {sent:?}");
     };
     assert_eq!(roles, &vec![Id::new(WATCH_ROLE)]);
+}
+
+#[tokio::test]
+async fn x_and_pixiv_are_refused_until_the_operator_sets_rsshub() {
+    let fake = fake(&["v1"]);
+    let harness = harness(&feeds(&fake));
+    let _ = harness.invoke(add_kind("x", "@someone")).await;
+    let _ = harness.invoke(add_kind("pixiv", "12345")).await;
+    assert!(subscriptions(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_x_feed_is_read_through_the_configured_rsshub() {
+    let fake = fake(&["v1"]);
+    let settings = FeedSettings {
+        rsshub_base_url: Some("https://rsshub.example.org/".to_owned()),
+        ..FeedSettings::default()
+    };
+    let harness = harness(&feeds_with(&fake, settings));
+    harness.invoke(add_kind("x", "@Someone")).await.unwrap();
+    let subscription = only(&harness).await;
+    assert_eq!(subscription.kind, Kind::X);
+    assert_eq!(subscription.target, "someone");
+    harness.run_due_jobs().await;
+    let wanted = "https://rsshub.example.org/twitter/user/someone".to_owned();
+    assert!(fake.urls().contains(&wanted), "{:?}", fake.urls());
+}
+
+#[tokio::test]
+async fn a_subreddit_is_read_from_its_new_feed() {
+    let fake = fake(&["v1"]);
+    let harness = harness(&feeds(&fake));
+    harness.invoke(add_kind("reddit", "r/Rust")).await.unwrap();
+    let subscription = only(&harness).await;
+    assert_eq!(subscription.target, "rust");
+    harness.run_due_jobs().await;
+    let wanted = "https://www.reddit.com/r/rust/new/.rss".to_owned();
+    assert!(fake.urls().contains(&wanted), "{:?}", fake.urls());
 }
 
 #[test]

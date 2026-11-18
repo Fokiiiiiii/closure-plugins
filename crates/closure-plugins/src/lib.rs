@@ -115,6 +115,17 @@ mod tests {
     }
 
     #[test]
+    fn the_rsshub_address_is_read_from_the_yaml_file() {
+        let yaml = "plugins:\n  feeds:\n    rsshub_base_url: https://rsshub.example.org\n";
+        assert_eq!(
+            feed_settings(&settings("rsshub", yaml))
+                .rsshub_base_url
+                .as_deref(),
+            Some("https://rsshub.example.org")
+        );
+    }
+
+    #[test]
     fn the_linkexpand_proxies_are_read_from_the_yaml_file() {
         let yaml =
             "plugins:\n  linkexpand:\n    proxies:\n      instagram: ddinstagram.example.org\n";

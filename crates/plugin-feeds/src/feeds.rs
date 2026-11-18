@@ -8,7 +8,7 @@ use plugin_kit::net::Get;
 
 use crate::FeedSettings;
 use crate::model::Kind;
-use crate::source::{Item, Source};
+use crate::source::{Item, Source, rsshub_base};
 
 /// The shortest interval between two looks, whatever the operator sets.
 const MIN_INTERVAL_SECS: u64 = 60;
@@ -54,6 +54,8 @@ type Cache = HashMap<(Kind, String), (i64, Vec<Item>)>;
 pub struct Feeds {
     get: Arc<dyn Get>,
     settings: FeedSettings,
+    /// The validated `RSSHub` address, when one is set.
+    rsshub: Option<String>,
     /// What was read, and when. Kept for half an interval; one entry per feed watched.
     cache: Mutex<Cache>,
     bucket: Mutex<Bucket>,
@@ -70,9 +72,11 @@ impl std::fmt::Debug for Feeds {
 impl Feeds {
     #[must_use]
     pub fn new(get: Arc<dyn Get>, settings: FeedSettings) -> Arc<Self> {
+        let rsshub = rsshub_base(settings.rsshub_base_url.as_deref());
         Arc::new(Self {
             get,
             settings,
+            rsshub,
             cache: Mutex::new(HashMap::new()),
             bucket: Mutex::new(Bucket {
                 tokens: READS_PER_SECOND,
@@ -97,6 +101,12 @@ impl Feeds {
         i64::try_from(self.interval_secs_u64()).unwrap_or(i64::MAX)
     }
 
+    /// The source that reads a kind of feed here; none when the kind is not supported.
+    #[must_use]
+    pub fn source(&self, kind: Kind) -> Option<Source> {
+        Source::of(kind, self.rsshub.as_deref())
+    }
+
     /// The items of a feed, newest first, read now unless it was read lately.
     ///
     /// # Errors
@@ -107,7 +117,7 @@ impl Feeds {
         kind: Kind,
         target: &str,
     ) -> Result<Vec<Item>, FetchError> {
-        let Some(source) = Source::of(kind) else {
+        let Some(source) = self.source(kind) else {
             return Err(FetchError::Failed(
                 "this kind of feed is not supported".into(),
             ));

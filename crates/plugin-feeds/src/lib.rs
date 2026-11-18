@@ -10,6 +10,7 @@ pub mod feeds;
 pub mod model;
 pub mod poll;
 pub mod post;
+pub mod rss;
 pub mod source;
 pub mod youtube;
 
@@ -32,16 +33,22 @@ const JA: &str = include_str!("../locales/ja.ftl");
 const PERMISSION: &str = "feeds.manage";
 
 /// The operator's settings for this module, from the `plugins.feeds` section of the settings file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FeedSettings {
     /// Seconds between two looks at one feed; at least 60.
     pub interval_secs: u64,
+    /// The `RSSHub` that X and Pixiv feeds are read through, an `https://` address. Unset means
+    /// those feeds are not supported.
+    pub rsshub_base_url: Option<String>,
 }
 
 impl Default for FeedSettings {
     fn default() -> Self {
-        Self { interval_secs: 300 }
+        Self {
+            interval_secs: 300,
+            rsshub_base_url: None,
+        }
     }
 }
 

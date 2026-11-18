@@ -13,7 +13,6 @@ use crate::feeds::{Feeds, FetchError};
 use crate::model::{self, Kind, MAX_PER_GUILD, MAX_PER_KIND, Subscription};
 use crate::poll::{POLL, Poll};
 use crate::post::{Access, bot_can_post, send};
-use crate::source::Source;
 
 /// The most subscriptions read from the store for one command.
 const LIST_LIMIT: usize = 1000;
@@ -25,7 +24,8 @@ pub struct Add {
     /// What kind of feed: youtube, reddit, twitch, x or pixiv.
     #[arg(max_length = 20)]
     kind: String,
-    /// The feed: a channel id (UC...) or a link to the channel.
+    /// The feed: a `YouTube` channel id (UC...) or its link, a subreddit (r/name), an X user name,
+    /// or a Pixiv user id.
     #[arg(max_length = 200)]
     target: String,
     /// Where the new items are posted; this channel when left out.
@@ -68,12 +68,12 @@ pub async fn add(feeds: Arc<Feeds>, cx: CommandCx, args: Add) -> Result<(), User
     let Some(kind) = Kind::parse(&args.kind) else {
         return cx.reply_private_t("feed-unknown-kind", &Args::new()).await;
     };
-    let Some(source) = Source::of(kind) else {
+    let Some(source) = feeds.source(kind) else {
         let args = Args::new().with("kind", kind.name());
         return cx.reply_private_t("feed-unsupported-kind", &args).await;
     };
     let Some(target) = source.target(&args.target) else {
-        let key = if args.target.trim().starts_with('@') {
+        let key = if kind == Kind::YouTube && args.target.trim().starts_with('@') {
             "feed-handle-unsupported"
         } else {
             "feed-bad-target"

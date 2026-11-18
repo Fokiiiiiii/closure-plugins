@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>rust</title>
+  <link rel="self" href="https://www.reddit.com/r/rust/new/.rss"/>
+  <entry>
+    <id>t3_abc123</id>
+    <link href="https://www.reddit.com/r/rust/comments/abc123/this_week_in_rust/"/>
+    <title>This Week in Rust</title>
+    <author><name>someone</name></author>
+    <updated>2026-11-17T10:00:00+00:00</updated>
+  </entry>
+  <entry>
+    <id>t3_def456</id>
+    <link rel="alternate" href="https://www.reddit.com/r/rust/comments/def456/second_post/"/>
+    <title>Second post</title>
+    <updated>2026-11-16T10:00:00+00:00</updated>
+  </entry>
+</feed>

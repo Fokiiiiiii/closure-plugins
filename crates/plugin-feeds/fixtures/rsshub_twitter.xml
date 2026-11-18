@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Twitter @someone</title>
+    <link>https://twitter.com/someone</link>
+    <item>
+      <title>Hello world</title>
+      <link>https://twitter.com/someone/status/1001</link>
+      <guid isPermaLink="false">https://twitter.com/someone/status/1001</guid>
+    </item>
+    <item>
+      <title>No link here</title>
+    </item>
+    <item>
+      <title>Only a guid</title>
+      <guid isPermaLink="false">2002</guid>
+    </item>
+  </channel>
+</rss>
