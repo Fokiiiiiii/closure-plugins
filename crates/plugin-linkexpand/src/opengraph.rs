@@ -334,10 +334,9 @@ fn tag_end(bytes: &[u8], from: usize) -> Option<usize> {
     for (at, &byte) in bytes.iter().enumerate().skip(from) {
         match quote {
             Some(open) if byte == open => quote = None,
-            Some(_) => {}
             None if byte == b'"' || byte == b'\'' => quote = Some(byte),
             None if byte == b'>' => return Some(at),
-            None => {}
+            _ => {}
         }
     }
     None
@@ -385,19 +384,16 @@ fn attributes(tag: &str) -> Vec<(String, String)> {
             continue;
         }
         at = advance(bytes, at + 1, |byte| byte.is_ascii_whitespace());
-        let value = match bytes.get(at) {
-            Some(&quote @ (b'"' | b'\'')) => {
-                let start = at + 1;
-                at = advance(bytes, start, |byte| byte != quote);
-                let value = tag.get(start..at).unwrap_or_default();
-                at = (at + 1).min(bytes.len());
-                value
-            }
-            _ => {
-                let start = at;
-                at = advance(bytes, start, |byte| !byte.is_ascii_whitespace());
-                tag.get(start..at).unwrap_or_default()
-            }
+        let value = if let Some(&quote @ (b'"' | b'\'')) = bytes.get(at) {
+            let start = at + 1;
+            at = advance(bytes, start, |byte| byte != quote);
+            let value = tag.get(start..at).unwrap_or_default();
+            at = (at + 1).min(bytes.len());
+            value
+        } else {
+            let start = at;
+            at = advance(bytes, start, |byte| !byte.is_ascii_whitespace());
+            tag.get(start..at).unwrap_or_default()
         };
         found.push((name, decode(value)));
     }
@@ -420,15 +416,12 @@ fn decode(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(rest.get(..at).unwrap_or_default());
         rest = rest.get(at..).unwrap_or_default();
-        match entity(rest) {
-            Some((decoded, used)) => {
-                out.push(decoded);
-                rest = rest.get(used..).unwrap_or_default();
-            }
-            None => {
-                out.push('&');
-                rest = rest.get(1..).unwrap_or_default();
-            }
+        if let Some((decoded, used)) = entity(rest) {
+            out.push(decoded);
+            rest = rest.get(used..).unwrap_or_default();
+        } else {
+            out.push('&');
+            rest = rest.get(1..).unwrap_or_default();
         }
     }
     out.push_str(rest);
