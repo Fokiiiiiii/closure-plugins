@@ -369,6 +369,86 @@ async fn a_moderator_changes_experience_and_a_member_cannot() {
     assert_eq!(xp(&harness, 50).await, 0);
 }
 
+fn gave_role(harness: &Harness, user: u64, role: u64) -> bool {
+    harness.actions().iter().any(|a| {
+        matches!(a, Action::AddRole { user_id, role_id, .. }
+            if user_id.get() == user && role_id.get() == role)
+    })
+}
+
+#[tokio::test]
+async fn a_message_gives_a_number_in_a_range_when_a_largest_amount_is_set() {
+    let harness = harness(&json!({
+        "xp_per_message": 15, "xp_per_message_max": 25, "cooldown_seconds": 0, "announce": false,
+    }));
+    let (mut seen, mut total) = (std::collections::BTreeSet::new(), 0);
+    for _ in 0..40 {
+        say(&harness, 50, 5).await;
+        let now = xp(&harness, 50).await;
+        seen.insert(now - total);
+        total = now;
+    }
+    assert!(seen.iter().all(|gain| (15..=25).contains(gain)), "{seen:?}");
+    assert!(seen.len() > 1, "{seen:?}");
+}
+
+#[tokio::test]
+async fn the_square_curve_puts_a_level_at_a_hundred_times_its_square() {
+    let harness = harness(&json!({
+        "curve": "square", "xp_per_message": 899, "cooldown_seconds": 0, "announce": false,
+        "rewards": [{"level": 3, "role": REWARD_ROLE.to_string()}],
+    }));
+    say(&harness, 50, 5).await;
+    assert!(!rewarded(&harness, 50), "899 is level 2, as 900 is level 3");
+    say(&harness, 50, 5).await;
+    assert!(rewarded(&harness, 50), "1798 is past level 3");
+}
+
+#[tokio::test]
+async fn a_reward_comes_with_its_companion_role() {
+    let harness = harness(&json!({
+        "xp_per_message": 100, "cooldown_seconds": 0, "announce": false,
+        "rewards": [{"level": 1, "role": REWARD_ROLE.to_string(), "companion": "11"}],
+    }));
+    say(&harness, 50, 5).await;
+    assert!(rewarded(&harness, 50));
+    assert!(gave_role(&harness, 50, 11));
+}
+
+#[tokio::test]
+async fn experience_from_voice_gives_a_role_when_its_total_is_reached() {
+    let harness = harness(&json!({
+        "voice_xp_per_minute": 2, "announce": false,
+        "voice_rewards": [{"xp": 10, "role": REWARD_ROLE.to_string(), "companion": "11"}],
+    }));
+    sit(&harness, 50, 5, 4).await;
+    assert!(!rewarded(&harness, 50), "8 is not 10");
+    sit(&harness, 50, 5, 1).await;
+    assert!(rewarded(&harness, 50));
+    assert!(gave_role(&harness, 50, 11));
+    assert_eq!(harness.store().score("voice-xp", 50).await.unwrap(), 10);
+}
+
+#[tokio::test]
+async fn setting_experience_can_set_the_voice_total_and_give_what_it_reaches() {
+    let harness = harness(&json!({
+        "curve": "square", "announce": false,
+        "rewards": [{"level": 2, "role": REWARD_ROLE.to_string()}],
+        "voice_rewards": [{"xp": 500, "role": "12"}],
+    }));
+    let set = Invocation::new("xp")
+        .subcommand("set")
+        .option("user", user(50))
+        .option("amount", CommandOptionValue::Integer(400))
+        .option("voice", CommandOptionValue::Integer(500))
+        .roles([MODERATOR])
+        .user(70);
+    harness.invoke(set).await.unwrap();
+    assert_eq!(xp(&harness, 50).await, 400);
+    assert!(rewarded(&harness, 50), "400 is level 2 on the square curve");
+    assert!(gave_role(&harness, 50, 12), "500 from voice");
+}
+
 #[test]
 fn both_catalogs_define_the_same_messages() {
     assert_eq!(

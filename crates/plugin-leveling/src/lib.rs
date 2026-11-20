@@ -22,7 +22,7 @@ use closure_sdk::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::rules::{Progress, bar, grouped, progress};
+use crate::rules::{Curve, Progress, bar, grouped, progress};
 
 const EN: &str = include_str!("../locales/en.ftl");
 const JA: &str = include_str!("../locales/ja.ftl");
@@ -38,12 +38,18 @@ const BAR_WIDTH: usize = 12;
 #[serde(deny_unknown_fields, default)]
 struct Config {
     xp_per_message: u32,
+    /// With this, each message gives a number from `xp_per_message` up to it.
+    xp_per_message_max: Option<u32>,
+    /// How experience turns into levels.
+    curve: Curve,
     cooldown_seconds: u32,
     ignored_channels: Vec<String>,
     announce: bool,
     /// Where level-ups are announced; the channel of the message when none.
     announce_channel: Option<String>,
     rewards: Vec<Reward>,
+    /// Roles given when the experience from voice reaches a total.
+    voice_rewards: Vec<VoiceReward>,
     /// Experience for each minute in a voice channel; none when 0.
     voice_xp_per_minute: u32,
     /// The roles that make experience worth more or less; the best of the member's counts.
@@ -58,11 +64,14 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             xp_per_message: 20,
+            xp_per_message_max: None,
+            curve: Curve::Standard,
             cooldown_seconds: 60,
             ignored_channels: Vec::new(),
             announce: true,
             announce_channel: None,
             rewards: Vec::new(),
+            voice_rewards: Vec::new(),
             voice_xp_per_minute: 5,
             role_multipliers: Vec::new(),
             channel_multipliers: Vec::new(),
@@ -76,6 +85,17 @@ impl Default for Config {
 struct Reward {
     level: u32,
     role: String,
+    /// A role given and kept together with `role`.
+    companion: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceReward {
+    /// The experience from voice that gives the role.
+    xp: u64,
+    role: String,
+    companion: Option<String>,
 }
 
 /// A percentage of the experience: 100 is as it is, 0 gives none.
@@ -131,6 +151,8 @@ impl Config {
 }
 
 const XP: &str = "xp";
+/// The name of the score that holds the experience a member has had from voice.
+const VOICE: &str = "voice-xp";
 /// The name of the score that holds when a member came into the voice channel they are in.
 const SINCE: &str = "voice-since";
 /// How many members the cooldowns remember before the ones that may get experience again are
@@ -223,7 +245,10 @@ async fn reached(
     total: u64,
     here: Option<ChannelId>,
 ) -> Result<(), ModuleError> {
-    let (old, new) = (progress(before).level, progress(total).level);
+    let (old, new) = (
+        progress(before, config.curve).level,
+        progress(total, config.curve).level,
+    );
     if new <= old {
         return Ok(());
     }
@@ -265,6 +290,8 @@ async fn reached(
         if let Err(error) = ctx.api.add_role(ctx.guild_id, user, role, reason).await {
             tracing::debug!(?error, "could not give a reward");
             gave_all = false;
+        } else {
+            give_companion(ctx, user, reward.companion.as_deref()).await?;
         }
     }
     // The earlier roles go only when the new one is on: a member is never left with none.
@@ -331,6 +358,71 @@ async fn take_earlier_rewards_away(
     Ok(())
 }
 
+/// The companion role of a reward goes on with it; a failure is only noted, as the reward is on.
+async fn give_companion(
+    ctx: &EventContext,
+    user: UserId,
+    companion: Option<&str>,
+) -> Result<(), ModuleError> {
+    let Some(role) = companion.and_then(snowflake).map(RoleId::new) else {
+        return Ok(());
+    };
+    let reason = Reason::new(ctx.t_in(ctx.locale, "leveling-reward-reason", &Args::new()))?;
+    if let Err(error) = ctx.api.add_role(ctx.guild_id, user, role, reason).await {
+        tracing::debug!(?error, "could not give a companion role");
+    }
+    Ok(())
+}
+
+/// Gives the roles of the voice rewards that a total went past: `before` is below them, `total` at
+/// or above.
+async fn voice_reached(
+    ctx: &EventContext,
+    config: &Config,
+    user: UserId,
+    before: u64,
+    total: u64,
+) -> Result<(), ModuleError> {
+    for reward in config
+        .voice_rewards
+        .iter()
+        .filter(|r| r.xp > before && r.xp <= total)
+    {
+        let Some(role) = snowflake(&reward.role).map(RoleId::new) else {
+            continue;
+        };
+        let reason = Reason::new(ctx.t_in(ctx.locale, "leveling-reward-reason", &Args::new()))?;
+        match ctx.api.add_role(ctx.guild_id, user, role, reason).await {
+            Ok(_) => give_companion(ctx, user, reward.companion.as_deref()).await?,
+            Err(error) => tracing::debug!(?error, "could not give a voice reward"),
+        }
+    }
+    Ok(())
+}
+
+/// Adds experience from voice to the total of voice, which the voice rewards go by.
+async fn count_voice(
+    ctx: &EventContext,
+    config: &Config,
+    user: UserId,
+    gain: u64,
+) -> Result<(), ModuleError> {
+    if gain == 0 {
+        return Ok(());
+    }
+    let delta = i64::try_from(gain).unwrap_or(i64::MAX);
+    let new = ctx
+        .store()
+        .score_add(VOICE, user.get(), delta)
+        .await
+        .map_err(|e| stored(&e))?;
+    let total = u64::try_from(new.min(MAX_TOTAL)).unwrap_or(0);
+    let before = u64::try_from(new.saturating_sub(delta))
+        .unwrap_or(0)
+        .min(total);
+    voice_reached(ctx, config, user, before, total).await
+}
+
 async fn on_message(
     cooldowns: Arc<Cooldowns>,
     ctx: EventContext,
@@ -350,9 +442,11 @@ async fn on_message(
     if !cooldowns.take(ctx.guild_id.get(), message.author.id.get(), ctx.now(), wait) {
         return Ok(Flow::Continue);
     }
-    let gain = u64::from(config.xp_per_message)
-        * config.percent(&message.author_roles, message.channel_id)
-        / 100;
+    let low = u64::from(config.xp_per_message);
+    let high = u64::from(config.xp_per_message_max.unwrap_or(config.xp_per_message)).max(low);
+    // The id of the message stands for the dice: as good as random, and nothing to keep.
+    let rolled = low + message.id.get() % (high - low + 1);
+    let gain = rolled * config.percent(&message.author_roles, message.channel_id) / 100;
     award(
         &ctx,
         &config,
@@ -403,7 +497,8 @@ async fn settle(
         * u64::from(config.voice_xp_per_minute)
         * config.percent(&roles, channel)
         / 100;
-    award(ctx, config, user, gain, None).await
+    award(ctx, config, user, gain, None).await?;
+    count_voice(ctx, config, user, gain).await
 }
 
 async fn on_voice(ctx: EventContext, event: Event) -> Result<Flow, ModuleError> {
@@ -449,6 +544,16 @@ struct UserAmount {
 }
 
 #[derive(CommandArgs)]
+struct SetXp {
+    /// The member.
+    user: UserId,
+    /// The experience the member has afterwards.
+    amount: i64,
+    /// The experience from voice the member has afterwards; as it is when left out.
+    voice: Option<i64>,
+}
+
+#[derive(CommandArgs)]
 struct OneUser {
     /// The member.
     user: UserId,
@@ -465,12 +570,13 @@ async fn rank(cx: CommandCx, args: RankArgs) -> Result<(), UserError> {
 async fn member_rank(cx: CommandCx, user: Option<UserId>) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let user = user.unwrap_or(cx.user().id);
+    let config: Config = cx.config()?;
     let mine = experience(ctx, user).await.map_err(|e| failed(&e))?;
     let Progress {
         level,
         into,
         needed,
-    } = progress(mine);
+    } = progress(mine, config.curve);
     // The place and the number of members come from the index, not from reading the members.
     let above = ctx
         .store()
@@ -515,6 +621,8 @@ async fn leaderboard(cx: CommandCx) -> Result<(), UserError> {
     if all.is_empty() {
         return cx.reply_private_t("leveling-empty", &Args::new()).await;
     }
+    let config: Config = cx.config()?;
+    let curve = config.curve;
     let lines: Vec<String> = all
         .iter()
         .enumerate()
@@ -523,7 +631,7 @@ async fn leaderboard(cx: CommandCx) -> Result<(), UserError> {
             format!(
                 "{}. <@{user}>  ·  Lv {}  ·  {} XP",
                 at + 1,
-                progress(xp).level,
+                progress(xp, curve).level,
                 grouped(xp)
             )
         })
@@ -543,7 +651,12 @@ async fn leaderboard(cx: CommandCx) -> Result<(), UserError> {
 }
 
 /// Puts `user` at `total` (clamped to what is allowed) and says so.
-async fn put(cx: &CommandCx, user: UserId, total: i64) -> Result<(), UserError> {
+async fn put(
+    cx: &CommandCx,
+    user: UserId,
+    total: i64,
+    voice: Option<i64>,
+) -> Result<(), UserError> {
     let ctx = cx.ctx();
     let config: Config = cx.config()?;
     let before = experience(ctx, user).await.map_err(|e| failed(&e))?;
@@ -556,12 +669,33 @@ async fn put(cx: &CommandCx, user: UserId, total: i64) -> Result<(), UserError> 
     reached(ctx, &config, user, before, total, None)
         .await
         .map_err(|e| failed(&e))?;
+    if let Some(voice) = voice {
+        let voice = voice.clamp(0, MAX_TOTAL);
+        let had = ctx
+            .store()
+            .score(VOICE, user.get())
+            .await
+            .map_err(|e| failed(&e))?;
+        ctx.store()
+            .score_put(VOICE, user.get(), voice)
+            .await
+            .map_err(|e| failed(&e))?;
+        voice_reached(
+            ctx,
+            &config,
+            user,
+            u64::try_from(had).unwrap_or(0),
+            u64::try_from(voice).unwrap_or(0),
+        )
+        .await
+        .map_err(|e| failed(&e))?;
+    }
     cx.reply_private_t(
         "leveling-set",
         &Args::new()
             .with("user", format!("<@{user}>"))
             .with("xp", grouped(total))
-            .with("level", u64::from(progress(total).level)),
+            .with("level", u64::from(progress(total, config.curve).level)),
     )
     .await
 }
@@ -601,17 +735,17 @@ async fn xp_add(cx: CommandCx, args: UserAmount) -> Result<(), UserError> {
         &Args::new()
             .with("user", format!("<@{user}>"))
             .with("xp", grouped(total))
-            .with("level", u64::from(progress(total).level)),
+            .with("level", u64::from(progress(total, config.curve).level)),
     )
     .await
 }
 
-async fn xp_set(cx: CommandCx, args: UserAmount) -> Result<(), UserError> {
-    put(&cx, args.user, args.amount).await
+async fn xp_set(cx: CommandCx, args: SetXp) -> Result<(), UserError> {
+    put(&cx, args.user, args.amount, args.voice).await
 }
 
 async fn xp_reset(cx: CommandCx, args: OneUser) -> Result<(), UserError> {
-    put(&cx, args.user, 0).await
+    put(&cx, args.user, 0, Some(0)).await
 }
 
 /// # Errors
@@ -630,6 +764,16 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             "xp_per_message": {
                 "type": "integer", "minimum": 1, "maximum": 1000,
                 "description": "config-leveling-xp_per_message",
+                "x-ui": { "level": "basic" }
+            },
+            "xp_per_message_max": {
+                "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 1000 }, { "type": "null" }],
+                "description": "config-leveling-xp_per_message_max",
+                "x-ui": { "level": "basic" }
+            },
+            "curve": {
+                "type": "string", "enum": ["standard", "square"],
+                "description": "config-leveling-curve",
                 "x-ui": { "level": "basic" }
             },
             "cooldown_seconds": {
@@ -700,10 +844,26 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     "required": ["level", "role"],
                     "properties": {
                         "level": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                        "role": snowflake
-                    }
-                }
-            }
+                          "role": snowflake.clone(),
+                          "companion": { "anyOf": [snowflake.clone(), { "type": "null" }] }
+                      }
+                  }
+              },
+              "voice_rewards": {
+                  "type": "array", "maxItems": 25,
+                  "description": "config-leveling-voice_rewards",
+                  "x-ui": { "level": "basic" },
+                  "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["xp", "role"],
+                      "properties": {
+                          "xp": { "type": "integer", "minimum": 1, "maximum": 1000000000 },
+                          "role": snowflake.clone(),
+                          "companion": { "anyOf": [snowflake, { "type": "null" }] }
+                      }
+                  }
+              }
         }
     });
     Ok(
@@ -727,7 +887,8 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
             .config(
                 schema,
                 json!({
-                    "xp_per_message": 20, "cooldown_seconds": 60, "ignored_channels": [],
+                    "xp_per_message": 20, "xp_per_message_max": null, "curve": "standard",
+                    "voice_rewards": [], "cooldown_seconds": 60, "ignored_channels": [],
                     "announce": true, "announce_channel": null, "rewards": [],
                     "voice_xp_per_minute": 5, "role_multipliers": [], "channel_multipliers": [],
                     "replace_rewards": false
@@ -744,7 +905,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                     Command::<UserAmount>::new("add")
                         .requires("leveling.manage")
                         .handler(xp_add),
-                    Command::<UserAmount>::new("set")
+                    Command::<SetXp>::new("set")
                         .requires("leveling.manage")
                         .handler(xp_set),
                     Command::<OneUser>::new("reset")
