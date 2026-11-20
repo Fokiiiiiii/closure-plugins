@@ -427,7 +427,7 @@ async fn experience_from_voice_gives_a_role_when_its_total_is_reached() {
     assert!(rewarded(&harness, 50));
     assert!(gave_role(&harness, 50, 11));
     assert_eq!(
-        u64::try_from(harness.store().score("voice-xp", 50).await.unwrap()).unwrap(),
+        u64::try_from(harness.store().score("voice-xp", 50_u64).await.unwrap()).unwrap(),
         10
     );
 }
