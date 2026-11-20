@@ -393,7 +393,7 @@ async fn voice_reached(
         };
         let reason = Reason::new(ctx.t_in(ctx.locale, "leveling-reward-reason", &Args::new()))?;
         match ctx.api.add_role(ctx.guild_id, user, role, reason).await {
-            Ok(_) => give_companion(ctx, user, reward.companion.as_deref()).await?,
+            Ok(()) => give_companion(ctx, user, reward.companion.as_deref()).await?,
             Err(error) => tracing::debug!(?error, "could not give a voice reward"),
         }
     }
@@ -858,7 +858,7 @@ pub fn builder() -> Result<ModuleBuilder, CoreError> {
                       "additionalProperties": false,
                       "required": ["xp", "role"],
                       "properties": {
-                          "xp": { "type": "integer", "minimum": 1, "maximum": 1000000000 },
+                          "xp": { "type": "integer", "minimum": 1, "maximum": 1_000_000_000 },
                           "role": snowflake.clone(),
                           "companion": { "anyOf": [snowflake, { "type": "null" }] }
                       }
