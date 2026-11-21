@@ -514,7 +514,9 @@ fn command_descriptions_fit_what_discord_accepts() {
                 key = name;
             }
             if let Some(text) = line.trim_start().strip_prefix(".description =")
-                && key.starts_with(["command-", "subcommand-", "option-"])
+                && ["command-", "subcommand-", "option-"]
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
             {
                 let length = text.trim().chars().count();
                 assert!(
