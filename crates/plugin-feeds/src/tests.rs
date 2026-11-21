@@ -501,3 +501,27 @@ fn the_last_seen_list_keeps_the_newest_fifty() {
     assert_eq!(seen[0], "v10");
     assert_eq!(seen[49], "v59");
 }
+
+/// Discord refuses a command whose description is over 100 characters, and the bot cannot start then.
+#[test]
+fn command_descriptions_fit_what_discord_accepts() {
+    for (language, catalog) in [("en", crate::EN), ("ja", crate::JA)] {
+        let mut key = "";
+        for line in catalog.lines() {
+            if let Some((name, _)) = line.split_once(" =")
+                && !line.starts_with(' ')
+            {
+                key = name;
+            }
+            if let Some(text) = line.trim_start().strip_prefix(".description =")
+                && key.starts_with(["command-", "subcommand-", "option-"])
+            {
+                let length = text.trim().chars().count();
+                assert!(
+                    (1..=100).contains(&length),
+                    "{language} {key}: {length} characters"
+                );
+            }
+        }
+    }
+}
