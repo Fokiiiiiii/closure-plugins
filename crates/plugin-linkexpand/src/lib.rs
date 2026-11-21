@@ -123,7 +123,7 @@ impl Default for Config {
             reddit_links: true,
             instagram_links: true,
             hide_original: true,
-            auto_translate: true,
+            auto_translate: false,
             layout: Layout::Embeds,
         }
     }
@@ -937,7 +937,7 @@ pub(crate) fn builder_with_sites(
                     "message_links": true, "x_links": true, "replied_post": true,
                     "quoted_post": true, "translate_button": true, "hide_original": true,
                     "pixiv_links": true, "reddit_links": true, "instagram_links": true,
-                    "auto_translate": true,
+                    "auto_translate": false,
                     "layout": "embeds"
                 }),
             )
