@@ -1,6 +1,6 @@
 module-description = メッセージに経験値を与え、レベルとロール報酬、ランキングを提供します。
 command-rank = rank
-    .description = メンバーのレベルと経験値、または経験値の多いメンバーを表示します
+    .description = メンバーのレベル、または上位メンバー
 option-rank-user = user
     .description = メンバー（省略すると自分）
 command-xp = xp
