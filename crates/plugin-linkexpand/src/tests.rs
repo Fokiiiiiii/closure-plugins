@@ -462,6 +462,7 @@ async fn a_reply_and_a_quote_are_messages_of_their_own_each_answering_the_one_be
 #[tokio::test]
 async fn by_default_the_posts_are_the_embeds_of_one_message_named_for_what_they_are() {
     let harness = harness(Fake(thread));
+    harness.set_config(json!({"auto_translate": true}));
     say(&harness, "https://x.com/jack/status/20").await;
     let all = posted(&harness);
     assert_eq!(
@@ -1333,6 +1334,7 @@ fn with_gemini(gemini: fn() -> Result<Vec<u8>>) -> (WithGemini, Arc<AtomicUsize>
 async fn a_post_is_translated_by_gemini_first_for_each_of_its_posts() {
     let (service, asked) = with_gemini(gemini_says_words);
     let harness = harness_with(Arc::new(service), gemini_translator());
+    harness.set_config(json!({"auto_translate": true}));
     say(&harness, "https://x.com/jack/status/20").await;
     assert_eq!(
         asked.load(Ordering::Relaxed),
@@ -1350,6 +1352,7 @@ async fn a_post_is_translated_by_gemini_first_for_each_of_its_posts() {
 async fn a_gemini_that_is_down_leaves_the_translation_to_the_free_endpoint() {
     let (service, asked) = with_gemini(gemini_is_down);
     let harness = harness_with(Arc::new(service), gemini_translator());
+    harness.set_config(json!({"auto_translate": true}));
     say(&harness, "https://x.com/jack/status/20").await;
     assert_eq!(asked.load(Ordering::Relaxed), 3);
     let values: Vec<String> = posted(&harness)
